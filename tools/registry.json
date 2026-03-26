@@ -1,0 +1,49 @@
+{
+  "version": "1",
+  "servers": [
+    {
+      "id": "builtin-web-search",
+      "name": "Web Search",
+      "description": "Search the web with DuckDuckGo and fetch page content",
+      "transport": "stdio",
+      "command": "python",
+      "args": ["${TOOLS_DIR}/builtin/web_search.py"],
+      "builtin": true,
+      "enabled": true,
+      "icon": "Search"
+    },
+    {
+      "id": "builtin-calculator",
+      "name": "Calculator",
+      "description": "Safe mathematical evaluation and unit conversions",
+      "transport": "stdio",
+      "command": "python",
+      "args": ["${TOOLS_DIR}/builtin/calculator.py"],
+      "builtin": true,
+      "enabled": true,
+      "icon": "Calculator"
+    },
+    {
+      "id": "builtin-file-ops",
+      "name": "File Operations",
+      "description": "Read, write, list, and delete files in the workspace",
+      "transport": "stdio",
+      "command": "python",
+      "args": ["${TOOLS_DIR}/builtin/file_ops.py"],
+      "builtin": true,
+      "enabled": true,
+      "icon": "FolderOpen"
+    },
+    {
+      "id": "builtin-code-runner",
+      "name": "Code Runner",
+      "description": "Execute Python snippets and shell commands in a sandbox",
+      "transport": "stdio",
+      "command": "python",
+      "args": ["${TOOLS_DIR}/builtin/code_runner.py"],
+      "builtin": true,
+      "enabled": true,
+      "icon": "Terminal"
+    }
+  ]
+}

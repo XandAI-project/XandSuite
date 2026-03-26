@@ -1,0 +1,39 @@
+# Environment
+.env.local
+.env.*.local
+
+# Node
+node_modules/
+dist/
+.npm
+
+# Rust build artifacts
+src-tauri/target/
+src-tauri/gen/
+
+# Logs
+*.log
+npm-debug.log*
+
+# IDE
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Tauri build output
+src-tauri/WixUI_InstallDir.wxs
+
+# App data (user data should not be committed)
+*.db
+*.db-shm
+*.db-wal
+models/
+*.gguf

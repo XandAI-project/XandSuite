@@ -1,0 +1,108 @@
+[package]
+name = "xandsuite"
+version = "0.1.0"
+description = "XandSuite - Local LLM Desktop Application"
+authors = ["XandNet"]
+edition = "2021"
+
+[lib]
+name = "xandsuite_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tauri-plugin-shell = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-http = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-process = "2"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP client (native-tls ensures HTTPS works on Windows out of the box)
+reqwest = { version = "0.12", features = ["json", "stream", "native-tls"] }
+
+# HuggingFace Hub - model downloading
+hf-hub = { version = "0.5", features = ["tokio"] }
+
+# SQLite - app state, chat history, flow definitions
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# MongoDB connector
+mongodb = "3"
+
+# SQL connector (PostgreSQL + MySQL)
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "mysql", "sqlite"] }
+
+# PDF parsing
+pdf-extract = "0.7"
+
+# CSV parsing
+csv = "1"
+
+# UUID generation
+uuid = { version = "1", features = ["v4"] }
+
+# Date/time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Vector store for RAG
+oasysdb = "0.4"
+
+# String processing / chunking
+regex = "1"
+
+# Channels for streaming
+futures = "0.3"
+async-stream = "0.3"
+
+# URL parsing
+url = "2"
+urlencoding = "2"
+
+# File paths
+dirs = "5"
+
+# Archive extraction for llama-server binary download
+zip = { version = "2", default-features = false, features = ["deflate"] }
+flate2 = "1"
+tar = "0.4"
+
+# llama-cpp-2 - local LLM inference (requires cmake + C++ toolchain)
+# Enable with: cargo build --features local-llm
+llama-cpp-2 = { version = "0.1", optional = true, features = ["sampler"] }
+scraper = "0.26.0"
+base64 = "0.22"
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = "3"
+
+[features]
+# Enable real local LLM inference via llama-cpp-2 (requires cmake + MSVC/clang)
+local-llm = ["dep:llama-cpp-2"]
+# GPU acceleration (only effective when local-llm is enabled)
+cuda = []
+vulkan = []
+
+# Conditional compilation for platform-specific builds
+[target.'cfg(target_os = "windows")'.dependencies]
+[target.'cfg(target_os = "linux")'.dependencies]

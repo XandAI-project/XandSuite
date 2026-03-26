@@ -1,0 +1,167 @@
+use tauri::{AppHandle, Emitter, State};
+use tokio::sync::mpsc;
+
+use crate::models::{DownloadProgress, HfModel};
+use crate::state::AppState;
+
+// chrono is available via the crate-level dependency
+
+#[tauri::command]
+pub async fn list_hf_models(
+    search: Option<String>,
+    limit: Option<u32>,
+    state: State<'_, AppState>,
+) -> Result<Vec<HfModel>, String> {
+    let cache_dir = state.data_dir.join("cache");
+    let api_token = state.settings.lock().unwrap().hf_api_token.clone();
+    let scraper = crate::hf::HfScraper::new(api_token.clone());
+    let lim = limit.unwrap_or(50);
+
+    // When searching, always hit the API for accurate results
+    let use_cache = search.is_none();
+
+    if use_cache {
+        if let Ok(Some(cache)) = scraper.load_cache(&cache_dir).await {
+            // Invalidate cache if models have no gguf_files (stale cache from
+            // before full=true was added) or if cache is older than 6 hours
+            let cache_valid = cache.models.iter().any(|m| !m.gguf_files.is_empty());
+            let cache_fresh = chrono::DateTime::parse_from_rfc3339(&cache.last_updated)
+                .map(|t| {
+                    let age = chrono::Utc::now().signed_duration_since(t.with_timezone(&chrono::Utc));
+                    age.num_hours() < 6
+                })
+                .unwrap_or(false);
+
+            if cache_valid && cache_fresh {
+                let mut models = cache.models;
+                let downloader = crate::hf::HfDownloader::new(
+                    state.data_dir.join("models"),
+                    api_token,
+                );
+                for model in &mut models {
+                    model.is_downloaded = model.gguf_files.iter().any(|f| {
+                        downloader.is_downloaded(&model.id, &f.filename)
+                    });
+                }
+                return Ok(models.into_iter().take(lim as usize).collect());
+            }
+        }
+    }
+
+    let models = scraper
+        .fetch_gguf_models(lim, search.as_deref())
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Only save cache for non-search requests
+    if search.is_none() {
+        let _ = scraper.save_cache(&cache_dir, &models).await;
+    }
+
+    Ok(models)
+}
+
+#[tauri::command]
+pub async fn refresh_hf_models(state: State<'_, AppState>) -> Result<usize, String> {
+    let cache_dir = state.data_dir.join("cache");
+    let api_token = state.settings.lock().unwrap().hf_api_token.clone();
+    let scraper = crate::hf::HfScraper::new(api_token);
+    let models = scraper.fetch_gguf_models(100, None).await.map_err(|e| e.to_string())?;
+    let count = models.len();
+    scraper.save_cache(&cache_dir, &models).await.map_err(|e| e.to_string())?;
+    Ok(count)
+}
+
+#[tauri::command]
+pub async fn download_model(
+    app: AppHandle,
+    model_id: String,
+    filename: String,
+    url: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let models_dir = state.data_dir.join("models");
+    let api_token = state.settings.lock().unwrap().hf_api_token.clone();
+
+    let (progress_tx, mut progress_rx) = mpsc::channel::<DownloadProgress>(64);
+
+    let mid = model_id.clone();
+    let fname = filename.clone();
+    let dl = crate::hf::HfDownloader::new(models_dir, api_token);
+
+    tokio::spawn(async move {
+        match dl.download_model(&mid, &fname, &url, progress_tx).await {
+            Ok(path) => log::info!("Downloaded model to {:?}", path),
+            Err(e) => log::error!("Download failed: {}", e),
+        }
+    });
+
+    tokio::spawn(async move {
+        while let Some(progress) = progress_rx.recv().await {
+            let _ = app.emit("download_progress", &progress);
+        }
+    });
+
+    Ok(format!("Download started for {}", filename))
+}
+
+#[tauri::command]
+pub fn list_downloaded_models(state: State<'_, AppState>) -> Result<Vec<serde_json::Value>, String> {
+    let models_dir = state.data_dir.join("models");
+    let downloader = crate::hf::HfDownloader::new(models_dir, None);
+    let downloaded = downloader.list_downloaded_models();
+
+    let result = downloaded
+        .into_iter()
+        .map(|(model_id, filename)| {
+            let path = downloader.get_model_path(&model_id, &filename);
+            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            serde_json::json!({
+                "model_id": model_id,
+                "filename": filename,
+                "path": path.to_string_lossy(),
+                "size_bytes": size
+            })
+        })
+        .collect();
+
+    Ok(result)
+}
+
+#[tauri::command]
+pub async fn delete_model(
+    model_id: String,
+    filename: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let models_dir = state.data_dir.join("models");
+    let downloader = crate::hf::HfDownloader::new(models_dir, None);
+    downloader.delete_model(&model_id, &filename).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn load_model(model_path: String, state: State<'_, AppState>) -> Result<(), String> {
+    state.engine.load_local(model_path).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn connect_remote_server(
+    server_url: String,
+    api_key: Option<String>,
+    model_name: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<bool, String> {
+    let engine = crate::engine::remote::RemoteEngine::new(
+        server_url.clone(), api_key.clone(), model_name.clone(),
+    );
+    let is_alive = engine.test_connection().await.map_err(|e| e.to_string())?;
+    if is_alive {
+        state.engine.connect_remote(server_url, api_key, model_name).map_err(|e| e.to_string())?;
+    }
+    Ok(is_alive)
+}
+
+#[tauri::command]
+pub async fn is_engine_loaded(state: State<'_, AppState>) -> Result<bool, String> {
+    Ok(state.engine.is_loaded().await)
+}
