@@ -2,6 +2,7 @@
 
 mod agent;
 mod code_runner;
+mod coding;
 mod commands;
 mod db;
 mod engine;
@@ -21,6 +22,7 @@ use tokio::sync::Mutex as TokioMutex;
 use tauri::Manager;
 
 use crate::agent::AgentRuntime;
+use crate::coding::CodingRuntime;
 use crate::db::AppDb;
 use crate::engine::EngineManager;
 use crate::models::AppSettings;
@@ -86,6 +88,13 @@ pub fn run() {
             let agent_runtime = Arc::new(AgentRuntime::new(
                 db.clone(),
                 workspace_dir,
+                max_iter,
+                timeout_secs,
+            ));
+
+            // Initialize coding runtime
+            let coding_runtime = Arc::new(CodingRuntime::new(
+                db.clone(),
                 max_iter,
                 timeout_secs,
             ));
@@ -178,6 +187,7 @@ pub fn run() {
                 engine,
                 rag,
                 agent_runtime,
+                coding_runtime,
                 settings,
                 server,
                 skills,
@@ -194,6 +204,7 @@ pub fn run() {
             commands::chat::delete_conversation,
             commands::chat::truncate_conversation,
             commands::chat::send_message,
+            commands::chat::save_message_tool_steps,
             commands::models::list_hf_models,
             commands::models::refresh_hf_models,
             commands::models::download_model,
@@ -245,6 +256,27 @@ pub fn run() {
             commands::artifacts::delete_artifact,
             commands::artifacts::update_artifact,
             commands::attachments::read_attachment,
+            commands::coding::create_coding_session,
+            commands::coding::list_coding_sessions,
+            commands::coding::get_coding_session,
+            commands::coding::update_coding_session,
+            commands::coding::delete_coding_session,
+            commands::coding::send_coding_message,
+            commands::coding::cancel_coding_session,
+            commands::coding::select_coding_project,
+            commands::coding::list_coding_directory,
+            commands::coding::read_coding_file,
+            commands::coding::get_coding_plan,
+            commands::memory::list_memory_entries,
+            commands::memory::delete_memory_entry,
+            commands::memory::clear_memory_entries,
+            commands::comfyui::list_comfyui_workflows,
+            commands::comfyui::save_comfyui_workflow,
+            commands::comfyui::delete_comfyui_workflow,
+            commands::gallery::list_gallery_images,
+            commands::gallery::list_all_gallery_images,
+            commands::gallery::delete_gallery_image,
+            commands::gallery::save_upload_to_gallery,
         ])
         .run(tauri::generate_context!())
         .expect("error while running XandSuite");

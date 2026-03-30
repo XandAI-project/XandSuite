@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Save, Loader2, Download, CheckCircle2 } from "lucide-react";
+import { Save, Loader2, Download, CheckCircle2, Plus, Trash2, Pencil, ChevronDown, ChevronRight } from "lucide-react";
 import { invoke } from "@/lib/tauri";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -7,7 +7,7 @@ import { Progress } from "@/components/ui/progress";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { useServerStore } from "@/stores/serverStore";
 import { cn } from "@/lib/utils";
-import type { AppSettings } from "@/lib/tauri";
+import type { AppSettings, ComfyWorkflow } from "@/lib/tauri";
 
 export function SettingsView() {
   const [settings, setSettings] = useState<AppSettings | null>(null);
@@ -451,6 +451,91 @@ export function SettingsView() {
             </Field>
           </Section>
 
+          {/* Image Generation */}
+          <Section title="Image Generation (ComfyUI)">
+            <Field
+              label="ComfyUI URL"
+              description="Base URL of a running ComfyUI instance. Leave empty to disable image generation."
+            >
+              <Input
+                placeholder="http://localhost:8188"
+                value={settings.comfyui_url || ""}
+                onChange={(e) => update("comfyui_url", e.target.value || null)}
+              />
+            </Field>
+            {settings.comfyui_url && (
+              <>
+                {/* Model type selector */}
+                <Field
+                  label="Model Type"
+                  description="Which loader ComfyUI uses for your model. Auto-detect checks checkpoints/ first, then diffusion_models/."
+                >
+                  <select
+                    className="w-full bg-secondary border border-border rounded px-3 py-1.5 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+                    value={settings.comfyui_model_type || "auto"}
+                    onChange={(e) =>
+                      update("comfyui_model_type", e.target.value === "auto" ? null : e.target.value)
+                    }
+                  >
+                    <option value="auto">Auto-detect</option>
+                    <option value="checkpoint">Checkpoint (models/checkpoints/)</option>
+                    <option value="unet">Diffusion Model (models/diffusion_models/)</option>
+                  </select>
+                </Field>
+
+                {/* Model name */}
+                <Field
+                  label="Model filename"
+                  description={
+                    settings.comfyui_model_type === "unet"
+                      ? "Filename in models/diffusion_models/ (e.g. z_image_turbo_bf16.safetensors). Leave blank to auto-pick the first available."
+                      : settings.comfyui_model_type === "checkpoint"
+                      ? "Filename in models/checkpoints/ (e.g. v1-5-pruned-emaonly.safetensors). Leave blank to auto-pick the first available."
+                      : "Model filename — auto-detected from checkpoints/ then diffusion_models/ when left blank."
+                  }
+                >
+                  <Input
+                    placeholder="Leave blank to auto-detect"
+                    value={settings.comfyui_model || ""}
+                    onChange={(e) => update("comfyui_model", e.target.value || null)}
+                  />
+                </Field>
+
+                {/* CLIP + VAE fields — only shown for UNETLoader models */}
+                {settings.comfyui_model_type === "unet" && (
+                  <>
+                    <Field
+                      label="CLIP model"
+                      description="Filename in models/clip/ (e.g. clip_l.safetensors). Leave blank to auto-pick the first available."
+                    >
+                      <Input
+                        placeholder="Leave blank to auto-detect"
+                        value={settings.comfyui_clip_name || ""}
+                        onChange={(e) => update("comfyui_clip_name", e.target.value || null)}
+                      />
+                    </Field>
+                    <Field
+                      label="VAE model"
+                      description="Filename in models/vae/ (e.g. ae.safetensors). Leave blank to auto-pick the first available."
+                    >
+                      <Input
+                        placeholder="Leave blank to auto-detect"
+                        value={settings.comfyui_vae_name || ""}
+                        onChange={(e) => update("comfyui_vae_name", e.target.value || null)}
+                      />
+                    </Field>
+                  </>
+                )}
+
+                <p className="text-xs text-emerald-400">
+                  Image generation enabled — the AI can now call{" "}
+                  <code className="font-mono">generate_image</code> when you ask for visuals.
+                </p>
+                <ComfyWorkflowManager />
+              </>
+            )}
+          </Section>
+
           {/* VLM / Multimodal */}
           <Section title="Vision / Multimodal (VLM)">
             <Field
@@ -500,6 +585,24 @@ export function SettingsView() {
             </Field>
           </Section>
 
+          {/* Memory */}
+          <Section title="Memory">
+            <Field
+              label="Enable conversation memory"
+              description="Automatically extract and recall key facts from your conversations."
+            >
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  className="w-4 h-4 accent-primary"
+                  checked={settings.memory_enabled ?? true}
+                  onChange={(e) => update("memory_enabled", e.target.checked)}
+                />
+                <span className="text-sm">Enable conversation memory</span>
+              </label>
+            </Field>
+          </Section>
+
           {/* App info */}
           <Section title="About">
             <div className="text-sm text-muted-foreground space-y-1">
@@ -510,6 +613,201 @@ export function SettingsView() {
           </Section>
         </div>
       </ScrollArea>
+    </div>
+  );
+}
+
+// ── ComfyUI Workflow Manager ──────────────────────────────────────────────────
+
+const PLACEHOLDER_HELP = `Export your workflow from ComfyUI using "Save (API format)".
+Then replace values in the JSON with these placeholders:
+
+  __POSITIVE_PROMPT__  → the AI's image prompt
+  __NEGATIVE_PROMPT__  → negative prompt
+  __SEED__             → random seed
+  __STEPS__            → number of steps
+  __WIDTH__            → image width
+  __HEIGHT__           → image height
+
+Example: find the text node and change its "text" value to __POSITIVE_PROMPT__`;
+
+interface WorkflowForm {
+  id: string | null;
+  name: string;
+  description: string;
+  workflow_json: string;
+}
+
+const emptyForm = (): WorkflowForm => ({ id: null, name: "", description: "", workflow_json: "" });
+
+function ComfyWorkflowManager() {
+  const [workflows, setWorkflows] = useState<ComfyWorkflow[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [form, setForm] = useState<WorkflowForm | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [helpOpen, setHelpOpen] = useState(false);
+
+  const load = () => {
+    setLoading(true);
+    invoke<ComfyWorkflow[]>("list_comfyui_workflows")
+      .then(setWorkflows)
+      .catch(console.error)
+      .finally(() => setLoading(false));
+  };
+
+  useEffect(() => { load(); }, []);
+
+  const handleSave = async () => {
+    if (!form) return;
+    setError(null);
+    if (!form.name.trim()) { setError("Name is required."); return; }
+    if (!form.workflow_json.trim()) { setError("Workflow JSON is required."); return; }
+    try {
+      JSON.parse(form.workflow_json);
+    } catch {
+      setError("Invalid JSON — please paste valid ComfyUI API-format workflow JSON.");
+      return;
+    }
+    setSaving(true);
+    try {
+      await invoke("save_comfyui_workflow", {
+        payload: {
+          id: form.id ?? undefined,
+          name: form.name.trim(),
+          description: form.description.trim() || null,
+          workflow_json: form.workflow_json.trim(),
+        },
+      });
+      setForm(null);
+      load();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleDelete = async (id: string) => {
+    if (!confirm("Delete this workflow?")) return;
+    await invoke("delete_comfyui_workflow", { id }).catch(console.error);
+    load();
+  };
+
+  return (
+    <div className="space-y-3 pt-1">
+      {/* Header */}
+      <div className="flex items-center justify-between">
+        <span className="text-sm font-medium">Custom Workflows</span>
+        {!form && (
+          <Button size="sm" variant="outline" onClick={() => setForm(emptyForm())}>
+            <Plus className="w-3 h-3 mr-1" /> Add Workflow
+          </Button>
+        )}
+      </div>
+
+      {/* Help block */}
+      <div className="rounded-md border border-border bg-secondary/20 text-xs">
+        <button
+          className="flex w-full items-center gap-1.5 px-3 py-2 text-muted-foreground hover:text-foreground transition-colors"
+          onClick={() => setHelpOpen((v) => !v)}
+        >
+          {helpOpen ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
+          How to use placeholder tokens
+        </button>
+        {helpOpen && (
+          <pre className="px-3 pb-3 text-[10px] font-mono whitespace-pre-wrap text-muted-foreground leading-relaxed">
+            {PLACEHOLDER_HELP}
+          </pre>
+        )}
+      </div>
+
+      {/* Workflow list */}
+      {loading ? (
+        <div className="flex items-center gap-2 text-xs text-muted-foreground py-2">
+          <Loader2 className="w-3 h-3 animate-spin" /> Loading…
+        </div>
+      ) : workflows.length === 0 && !form ? (
+        <p className="text-xs text-muted-foreground italic">
+          No custom workflows yet. Add one to let the AI pick it by name.
+        </p>
+      ) : (
+        <div className="space-y-2">
+          {workflows.map((wf) => (
+            <div
+              key={wf.id}
+              className="flex items-start justify-between gap-2 rounded-md border border-border bg-secondary/20 px-3 py-2"
+            >
+              <div className="min-w-0">
+                <p className="text-sm font-medium truncate">{wf.name}</p>
+                {wf.description && (
+                  <p className="text-xs text-muted-foreground truncate">{wf.description}</p>
+                )}
+              </div>
+              <div className="flex shrink-0 gap-1">
+                <button
+                  className="p-1 rounded hover:bg-white/10 text-muted-foreground hover:text-foreground transition-colors"
+                  title="Edit"
+                  onClick={() =>
+                    setForm({
+                      id: wf.id,
+                      name: wf.name,
+                      description: wf.description ?? "",
+                      workflow_json: wf.workflow_json,
+                    })
+                  }
+                >
+                  <Pencil className="w-3.5 h-3.5" />
+                </button>
+                <button
+                  className="p-1 rounded hover:bg-red-500/20 text-muted-foreground hover:text-red-400 transition-colors"
+                  title="Delete"
+                  onClick={() => handleDelete(wf.id)}
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Add / Edit form */}
+      {form && (
+        <div className="rounded-md border border-primary/30 bg-primary/5 p-3 space-y-3">
+          <p className="text-xs font-semibold text-primary">
+            {form.id ? "Edit Workflow" : "New Workflow"}
+          </p>
+          <div className="space-y-2">
+            <Input
+              placeholder="Name (e.g. Portrait)"
+              value={form.name}
+              onChange={(e) => setForm((f) => f && { ...f, name: e.target.value })}
+            />
+            <Input
+              placeholder="Description (optional)"
+              value={form.description}
+              onChange={(e) => setForm((f) => f && { ...f, description: e.target.value })}
+            />
+            <textarea
+              className="w-full rounded-md border border-input bg-background text-foreground text-[11px] font-mono px-3 py-2 min-h-[160px] resize-y placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+              placeholder={'Paste ComfyUI API-format workflow JSON here…\nUse __POSITIVE_PROMPT__ etc. as placeholders.'}
+              value={form.workflow_json}
+              onChange={(e) => setForm((f) => f && { ...f, workflow_json: e.target.value })}
+            />
+          </div>
+          {error && <p className="text-xs text-destructive">{error}</p>}
+          <div className="flex gap-2">
+            <Button size="sm" onClick={handleSave} disabled={saving}>
+              {saving && <Loader2 className="w-3 h-3 mr-1 animate-spin" />}
+              {form.id ? "Update" : "Save"}
+            </Button>
+            <Button size="sm" variant="outline" onClick={() => { setForm(null); setError(null); }}>
+              Cancel
+            </Button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

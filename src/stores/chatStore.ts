@@ -1,7 +1,9 @@
 import { create } from "zustand";
 import { invoke } from "../lib/tauri";
 import { listen } from "@tauri-apps/api/event";
-import type { Conversation, ConversationSummary, Message } from "../lib/tauri";
+import type { Conversation, ConversationSummary, Message, ImageMeta } from "../lib/tauri";
+import { useSkillsStore } from "./skillsStore";
+import { readFile } from "@tauri-apps/plugin-fs";
 
 interface ChatStore {
   conversations: ConversationSummary[];
@@ -125,14 +127,44 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       return imageExts.has(ext);
     };
 
-    // Separate image paths (stored as full paths for thumbnail reloading) from
-    // text attachments (stored as basenames for display only).
+    // Separate image paths from text attachments.
     const imagePaths = attachments?.filter(isImage) ?? [];
     const textAttachments = attachments?.filter((p) => !isImage(p)) ?? [];
     const attachmentNames = textAttachments.map((p) => p.replace(/\\/g, "/").split("/").pop() ?? p);
 
     const metaAttachments = attachmentNames.length ? attachmentNames : undefined;
-    const metaImages = imagePaths.length ? imagePaths : undefined;
+
+    // Read image files as base64 for immediate display and DB persistence.
+    const extToMime: Record<string, string> = {
+      jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png",
+      gif: "image/gif", webp: "image/webp", bmp: "image/bmp",
+    };
+    let metaImages: ImageMeta[] | undefined;
+    if (imagePaths.length > 0) {
+      const results = await Promise.all(
+        imagePaths.map(async (p): Promise<ImageMeta | null> => {
+          try {
+            const bytes = await readFile(p);
+            const ext = p.replace(/\\/g, "/").split(".").pop()?.toLowerCase() ?? "jpeg";
+            const mime = extToMime[ext] ?? "image/jpeg";
+            // Convert Uint8Array → base64 without btoa (handles large files)
+            let b64 = "";
+            const CHUNK = 8192;
+            const arr = new Uint8Array(bytes);
+            for (let i = 0; i < arr.length; i += CHUNK) {
+              b64 += String.fromCharCode(...arr.subarray(i, i + CHUNK));
+            }
+            b64 = btoa(b64);
+            const filename = p.replace(/\\/g, "/").split("/").pop() ?? p;
+            return { filename, mime, data: b64 };
+          } catch {
+            return null;
+          }
+        })
+      );
+      const valid = results.filter((r): r is ImageMeta => r !== null);
+      if (valid.length > 0) metaImages = valid;
+    }
 
     const userMsg: Message = {
       id: crypto.randomUUID(),
@@ -287,7 +319,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     });
 
     try {
-      await invoke("send_message", {
+      const assistantMsgId = await invoke<string>("send_message", {
         conversationId: conv.id,
         content,
         useRag,
@@ -295,6 +327,17 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         useSkills,
         attachments: attachments ?? [],
       });
+
+      // Persist any tool steps that were collected during this response.
+      // By the time invoke() resolves, the done:true event has already fired,
+      // so activeToolSteps is fully populated.
+      const { activeToolSteps } = useSkillsStore.getState();
+      if (activeToolSteps.length > 0 && assistantMsgId) {
+        invoke("save_message_tool_steps", {
+          messageId: assistantMsgId,
+          toolStepsJson: JSON.stringify(activeToolSteps),
+        }).catch((e) => console.warn("Failed to save tool steps:", e));
+      }
     } catch (e) {
       set({ isStreaming: false, isThinking: false, error: String(e) });
       unlistenToken?.();

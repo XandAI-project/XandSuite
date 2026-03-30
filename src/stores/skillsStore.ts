@@ -31,6 +31,12 @@ interface SkillsStore {
   skillsEnabled: boolean;
   /** Tool call steps for the current streaming message */
   activeToolSteps: ToolStep[];
+  /**
+   * Snapshot of tool steps from the last completed response.
+   * Persists after streaming ends so the final message can still render
+   * tool cards (e.g. generated images).  Cleared on the next send.
+   */
+  completedToolSteps: ToolStep[];
   isLoading: boolean;
   error: string | null;
 
@@ -40,6 +46,9 @@ interface SkillsStore {
   removeMcpServer: (serverId: string) => Promise<void>;
   reloadBuiltins: () => Promise<void>;
   toggleSkills: () => void;
+  /** Snapshot activeToolSteps into completedToolSteps (called when streaming ends). */
+  snapshotCompletedSteps: () => void;
+  /** Clear both active and completed tool steps (called on new send or conv change). */
   clearToolSteps: () => void;
   clearError: () => void;
 }
@@ -56,9 +65,7 @@ export interface AddServerRequest {
   icon?: string;
 }
 
-// Global listeners for tool-call events (set up once)
-let toolCallUnlisten: (() => void) | null = null;
-let toolResultUnlisten: (() => void) | null = null;
+// Global listeners for tool-call events (set up once, kept for potential cleanup)
 
 export const useSkillsStore = create<SkillsStore>((set, get) => {
   // Set up event listeners immediately
@@ -75,7 +82,7 @@ export const useSkillsStore = create<SkillsStore>((set, get) => {
         },
       ],
     }));
-  }).then((fn) => { toolCallUnlisten = fn; });
+  });
 
   listen<ToolResultEvent>("chat_tool_result", (event) => {
     const p = event.payload;
@@ -86,13 +93,14 @@ export const useSkillsStore = create<SkillsStore>((set, get) => {
           : step
       ),
     }));
-  }).then((fn) => { toolResultUnlisten = fn; });
+  });
 
   return {
     servers: [],
     tools: [],
     skillsEnabled: true,
     activeToolSteps: [],
+    completedToolSteps: [],
     isLoading: false,
     error: null,
 
@@ -151,7 +159,10 @@ export const useSkillsStore = create<SkillsStore>((set, get) => {
 
     toggleSkills: () => set((s) => ({ skillsEnabled: !s.skillsEnabled })),
 
-    clearToolSteps: () => set({ activeToolSteps: [] }),
+    snapshotCompletedSteps: () =>
+      set((s) => ({ completedToolSteps: [...s.activeToolSteps] })),
+
+    clearToolSteps: () => set({ activeToolSteps: [], completedToolSteps: [] }),
 
     clearError: () => set({ error: null }),
   };

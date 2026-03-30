@@ -9,7 +9,10 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "build:dist": "npm run tauri -- build",
+    "collect": "node scripts/collect-artifacts.js",
+    "release": "npm run build:dist && npm run collect"
   },
   "dependencies": {
     "@radix-ui/react-avatar": "^1.1.3",
@@ -34,6 +37,7 @@
     "@tauri-apps/plugin-opener": "^2",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
+    "date-fns": "^4.1.0",
     "jspdf": "^4.2.1",
     "lucide-react": "^0.511.0",
     "react": "^19.1.0",

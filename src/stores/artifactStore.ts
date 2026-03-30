@@ -28,7 +28,7 @@ interface ArtifactStore {
   clearArtifacts: () => void;
 }
 
-export const useArtifactStore = create<ArtifactStore>((set, get) => ({
+export const useArtifactStore = create<ArtifactStore>((set) => ({
   artifacts: [],
   activeArtifactId: null,
   panelOpen: false,

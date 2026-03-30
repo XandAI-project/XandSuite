@@ -1,15 +1,18 @@
 import { useEffect, useRef, useState } from "react";
-import { Plus, Trash2, MessageSquare, Settings2, Check, X } from "lucide-react";
+import { Plus, Trash2, MessageSquare, Settings2, Check, X, Images } from "lucide-react";
+import { listen } from "@tauri-apps/api/event";
 import { useChatStore } from "@/stores/chatStore";
 import { useRagStore } from "@/stores/ragStore";
 import { useSkillsStore } from "@/stores/skillsStore";
 import { useArtifactStore } from "@/stores/artifactStore";
+import { useGalleryStore } from "@/stores/galleryStore";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { MessageBubble } from "./MessageBubble";
 import { ToolCallMessage } from "./ToolCallMessage";
 import { InputBar } from "./InputBar";
 import { ArtifactPanel } from "./ArtifactPanel";
+import { GalleryPanel } from "./GalleryPanel";
 import { cn, formatDate } from "@/lib/utils";
 
 export function ChatView() {
@@ -29,8 +32,22 @@ export function ChatView() {
   } = useChatStore();
 
   const { collections, fetchCollections } = useRagStore();
-  const { tools, activeToolSteps, skillsEnabled, clearToolSteps, fetchTools } = useSkillsStore();
+  const {
+    activeToolSteps,
+    completedToolSteps,
+    snapshotCompletedSteps,
+    clearToolSteps,
+    fetchTools,
+  } = useSkillsStore();
   const { artifacts, panelOpen, fetchArtifacts, clearArtifacts } = useArtifactStore();
+  const {
+    galleryOpen,
+    toggleGallery,
+    fetchImages,
+    fetchAllImages,
+    scope: galleryScope,
+    setActiveConversation: setGalleryConversation,
+  } = useGalleryStore();
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
@@ -51,11 +68,19 @@ export function ChatView() {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [activeConversation?.messages]);
 
-  // Reload artifacts whenever the active conversation changes
+  // Reload artifacts and gallery whenever the active conversation changes.
+  // Also clear any stale tool-step state from the previous conversation.
   useEffect(() => {
     if (activeConversation?.id) {
       clearArtifacts();
       fetchArtifacts(activeConversation.id);
+      clearToolSteps();
+      setGalleryConversation(activeConversation.id);
+      if (galleryScope === "conversation") {
+        fetchImages(activeConversation.id);
+      } else {
+        fetchAllImages();
+      }
     }
   }, [activeConversation?.id]);
 
@@ -65,16 +90,50 @@ export function ChatView() {
     setShowSystemPrompt(false);
   }, [activeConversation?.id]);
 
-  // Re-fetch artifacts from DB when streaming finishes.
-  // The backend saves artifacts BEFORE emitting done:true, so the DB is
-  // always up-to-date by the time this fires.
+  // When streaming ends:
+  // 1. Re-fetch artifacts (backend saves them before emitting done:true)
+  // 2. Snapshot any active tool steps into completedToolSteps so they remain
+  //    visible in the last assistant message after streaming finishes.
   useEffect(() => {
     const wasStreaming = prevStreamingRef.current;
     prevStreamingRef.current = isStreaming;
-    if (wasStreaming && !isStreaming && activeConversation?.id) {
-      fetchArtifacts(activeConversation.id);
+    if (wasStreaming && !isStreaming) {
+      if (activeConversation?.id) {
+        fetchArtifacts(activeConversation.id);
+      }
+      if (activeToolSteps.length > 0) {
+        snapshotCompletedSteps();
+      }
     }
   }, [isStreaming]);
+
+  // Re-fetch artifacts immediately whenever one is updated in-place
+  // (i.e. the user asked to edit an existing artifact).
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    listen<{ conversation_id: string }>("artifact_updated", (event) => {
+      if (
+        activeConversation?.id &&
+        event.payload.conversation_id === activeConversation.id
+      ) {
+        fetchArtifacts(activeConversation.id);
+      }
+    }).then((fn) => { unlisten = fn; });
+    return () => { unlisten?.(); };
+  }, [activeConversation?.id]);
+
+  // Re-fetch gallery whenever a new image is saved (e.g. from ComfyUI generation)
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    listen<{ conversation_id: string }>("gallery_updated", () => {
+      if (galleryScope === "all") {
+        fetchAllImages();
+      } else if (activeConversation?.id) {
+        fetchImages(activeConversation.id);
+      }
+    }).then((fn) => { unlisten = fn; });
+    return () => { unlisten?.(); };
+  }, [activeConversation?.id, galleryScope]);
 
   // Instantly create and open a new conversation — no dialog
   const handleNewChat = async () => {
@@ -154,7 +213,7 @@ export function ChatView() {
         {/* Chat column */}
         <div className={cn(
           "flex flex-col h-full overflow-hidden transition-all duration-300",
-          panelOpen ? "flex-1 min-w-0" : "flex-1"
+          (panelOpen && artifacts.length > 0) || galleryOpen ? "flex-1 min-w-0" : "flex-1"
         )}>
           {activeConversation ? (
             <>
@@ -173,6 +232,19 @@ export function ChatView() {
                     ))}
                   </div>
                 )}
+                {/* Gallery toggle */}
+                <button
+                  className={cn(
+                    "shrink-0 p-1.5 rounded-md transition-colors",
+                    galleryOpen
+                      ? "bg-violet-500/20 text-violet-400"
+                      : "text-muted-foreground hover:text-foreground hover:bg-secondary"
+                  )}
+                  onClick={toggleGallery}
+                  title="Toggle gallery"
+                >
+                  <Images className="w-4 h-4" />
+                </button>
                 {/* System prompt toggle */}
                 <button
                   className={cn(
@@ -234,12 +306,34 @@ export function ChatView() {
                     .filter((m) => m.role !== "system")
                     .map((message, idx, arr) => {
                       const isLast = idx === arr.length - 1;
-                      const showToolSteps =
+                      const isLastAssistant = isLast && message.role === "assistant";
+
+                      // Priority order for tool steps to display:
+                      // 1. Active steps while the stream is live (current turn)
+                      // 2. Completed snapshot from the just-finished stream
+                      // 3. Persisted steps loaded from DB (historical messages)
+                      const showActiveSteps =
                         isStreaming && isLast && message.id === "streaming" && activeToolSteps.length > 0;
+                      const showCompletedSteps =
+                        !isStreaming && isLastAssistant && completedToolSteps.length > 0;
+                      const hasPersistedSteps =
+                        !isStreaming &&
+                        !showCompletedSteps &&
+                        message.role === "assistant" &&
+                        Array.isArray(message.tool_steps) &&
+                        (message.tool_steps?.length ?? 0) > 0;
+
+                      const showToolSteps = showActiveSteps || showCompletedSteps || hasPersistedSteps;
+                      const stepsToShow = showActiveSteps
+                        ? activeToolSteps
+                        : showCompletedSteps
+                        ? completedToolSteps
+                        : (message.tool_steps ?? []);
+
                       return (
                         <div key={message.id} className="space-y-2">
                           {showToolSteps && (
-                            <ToolCallMessage steps={activeToolSteps} isStreaming={isStreaming} />
+                            <ToolCallMessage steps={stepsToShow} isStreaming={isStreaming && showActiveSteps} />
                           )}
                           <MessageBubble
                             message={message}
@@ -264,7 +358,10 @@ export function ChatView() {
               </ScrollArea>
 
               {/* Input */}
-              <InputBar collections={collections} disabled={isStreaming} />
+              <InputBar
+                collections={collections.filter((c) => c.id !== "xand_internal_memory")}
+                disabled={isStreaming}
+              />
             </>
           ) : (
             <div className="flex-1 flex flex-col items-center justify-center text-center p-8">
@@ -283,10 +380,29 @@ export function ChatView() {
           )}
         </div>
 
-        {/* Artifact panel (slide in from right) */}
-        {panelOpen && artifacts.length > 0 && (
-          <div className="w-[45%] shrink-0 h-full overflow-hidden border-l border-border">
-            <ArtifactPanel />
+        {/* Right column: artifact panel and/or gallery */}
+        {((panelOpen && artifacts.length > 0) || galleryOpen) && (
+          <div className="w-[45%] shrink-0 h-full flex flex-col overflow-hidden border-l border-border">
+            {panelOpen && artifacts.length > 0 && (
+              <div
+                className={cn(
+                  "overflow-hidden",
+                  galleryOpen ? "h-1/2 border-b border-border" : "flex-1"
+                )}
+              >
+                <ArtifactPanel />
+              </div>
+            )}
+            {galleryOpen && (
+              <div
+                className={cn(
+                  "overflow-hidden",
+                  panelOpen && artifacts.length > 0 ? "h-1/2" : "flex-1"
+                )}
+              >
+                <GalleryPanel />
+              </div>
+            )}
           </div>
         )}
       </div>

@@ -68,6 +68,14 @@ pub async fn execute_code(language: &str, code: &str) -> Result<CodeRunResult> {
             let cmd = spawn_shell(&path).await?;
             (path, cmd)
         }
+        "html" | "css" | "htm" => bail!(
+            "HTML/CSS cannot be executed in a terminal. \
+             Write the HTML directly inside an artifact tag instead:\n\
+             <artifact type=\"html\" title=\"Page Title\">\n\
+             <!DOCTYPE html>...\n\
+             </artifact>\n\
+             Do NOT call execute_code for HTML."
+        ),
         other => bail!("Unsupported language: '{}'. Supported: python, javascript, shell.", other),
     };
 

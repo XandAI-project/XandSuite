@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::Mutex as TokioMutex;
 
 use crate::agent::AgentRuntime;
+use crate::coding::CodingRuntime;
 use crate::db::AppDb;
 use crate::engine::EngineManager;
 use crate::models::AppSettings;
@@ -20,6 +21,8 @@ pub struct AppState {
     pub rag: Arc<TokioMutex<RagService>>,
     /// ReAct agent runtime
     pub agent_runtime: Arc<AgentRuntime>,
+    /// Coding assistant runtime
+    pub coding_runtime: Arc<CodingRuntime>,
     /// Application settings
     pub settings: Arc<Mutex<AppSettings>>,
     /// Internal llama-server process manager (tokio Mutex so start() can be awaited)

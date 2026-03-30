@@ -3,7 +3,7 @@ import { Navigate, Route, Routes } from "react-router-dom";
 import { Sidebar } from "@/components/layout/Sidebar";
 import { ChatView } from "@/components/chat/ChatView";
 import { ModelBrowser } from "@/components/models/ModelBrowser";
-import { AgentTaskView } from "@/components/agents/AgentTaskView";
+import { CodingView } from "@/components/coding/CodingView";
 import { FlowCanvas } from "@/components/flow/FlowCanvas";
 import { RagManager } from "@/components/rag/RagManager";
 import { DatabaseView } from "@/components/database/DatabaseView";
@@ -13,14 +13,19 @@ import { ArtifactsView } from "@/components/artifacts/ArtifactsView";
 import { LogView } from "@/components/logs/LogView";
 import { useModelStore } from "@/stores/modelStore";
 import { useLogStore } from "@/stores/logStore";
+import { useServerStore } from "@/stores/serverStore";
 
 function App() {
   const checkEngineStatus = useModelStore((s) => s.checkEngineStatus);
   const initLogs = useLogStore((s) => s.init);
+  const fetchServerStatus = useServerStore((s) => s.fetchStatus);
 
   useEffect(() => {
     checkEngineStatus();
     initLogs();
+    // Probe the llama-server port so any server left running from a previous
+    // session is detected, adopted, and reflected in the UI immediately.
+    fetchServerStatus();
   }, []);
 
   return (
@@ -30,7 +35,7 @@ function App() {
         <Routes>
           <Route path="/" element={<Navigate to="/chat" replace />} />
           <Route path="/chat" element={<ChatView />} />
-          <Route path="/agents" element={<AgentTaskView />} />
+          <Route path="/coding" element={<CodingView />} />
           <Route path="/flows" element={<FlowCanvas />} />
           <Route path="/models" element={<ModelBrowser />} />
           <Route path="/rag" element={<RagManager />} />

@@ -199,11 +199,47 @@ pub struct ServerStatus {
 }
 
 /// Get the current status of the internal llama-server.
+///
+/// If no child process is tracked, this command probes the configured port.
+/// When an orphaned server is found (e.g. from a previous app session) it
+/// is adopted so the UI shows the correct running state and the engine
+/// reconnects automatically.
 #[tauri::command]
 pub async fn get_server_status(state: State<'_, AppState>) -> Result<ServerStatus, String> {
     let mut server = state.server.lock().await;
     let running = server.is_running();
     let model = server.current_model().map(String::from);
+
+    // No child process tracked — probe the port to detect an orphaned server.
+    if !running {
+        let (probe_port, last_model) = {
+            let s = state.settings.lock().unwrap();
+            (s.llama_server_port, s.last_server_model.clone())
+        };
+
+        if let Some(detected) = probe_running_server(probe_port, last_model.as_deref()).await {
+            log::info!(
+                "Detected orphaned llama-server on port {} (model: {}). Adopting.",
+                probe_port,
+                detected
+            );
+            server.adopt(probe_port, Some(detected.clone()));
+
+            // Reconnect the engine to the already-running server.
+            drop(server);
+            let url = format!("http://127.0.0.1:{}", probe_port);
+            let _ = state.engine.connect_remote(url, None, None);
+
+            let binary_exists = LlamaServerManager::binary_exists(&state.data_dir);
+            return Ok(ServerStatus {
+                running: true,
+                port: probe_port,
+                model: Some(detected),
+                binary_exists,
+            });
+        }
+    }
+
     let port = server.port();
     let binary_exists = LlamaServerManager::binary_exists(&state.data_dir);
     Ok(ServerStatus {
@@ -212,6 +248,45 @@ pub async fn get_server_status(state: State<'_, AppState>) -> Result<ServerStatu
         model,
         binary_exists,
     })
+}
+
+/// Probe `http://127.0.0.1:{port}/health`. If healthy, try to retrieve the
+/// loaded model name from `/v1/models`. Falls back to `last_known_model`.
+/// Returns `None` when no server is reachable on that port.
+async fn probe_running_server(port: u16, last_known_model: Option<&str>) -> Option<String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .ok()?;
+
+    // Quick health check — a 200 or 503 ("loading") both mean something is there.
+    let health = client
+        .get(format!("http://127.0.0.1:{}/health", port))
+        .send()
+        .await
+        .ok()?;
+
+    if !health.status().is_success() && health.status().as_u16() != 503 {
+        return None;
+    }
+
+    // Try to read the model name from /v1/models (OpenAI-compatible endpoint).
+    if let Ok(resp) = client
+        .get(format!("http://127.0.0.1:{}/v1/models", port))
+        .send()
+        .await
+    {
+        if let Ok(json) = resp.json::<serde_json::Value>().await {
+            if let Some(id) = json["data"][0]["id"].as_str() {
+                if !id.is_empty() {
+                    return Some(id.to_string());
+                }
+            }
+        }
+    }
+
+    // Fall back to the last model path saved in settings.
+    last_known_model.map(String::from)
 }
 
 /// Start the internal llama-server with the given model file.
@@ -224,6 +299,22 @@ pub async fn start_local_server(
     let settings = state.settings.lock().unwrap().clone();
     let data_dir = state.data_dir.clone();
     let port = settings.llama_server_port;
+
+    // If an adopted (orphaned) server is running on the port, we must not try
+    // to spawn a second process. Clear the adopted state first; the new start()
+    // call will attempt to kill our own child (none here) and spawn fresh.
+    // If the orphaned process is still occupying the port, start() will fail
+    // with a meaningful error so the user knows to stop the existing server.
+    {
+        let mut server = state.server.lock().await;
+        if server.is_adopted() {
+            log::info!(
+                "Clearing adopted server state before starting a new server on port {}.",
+                port
+            );
+            server.clear_adopted();
+        }
+    }
 
     // Start the subprocess (tokio Mutex allows holding across .await)
     {

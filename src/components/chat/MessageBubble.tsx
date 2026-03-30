@@ -8,10 +8,9 @@ import {
   FileText, FileCode, FileJson, File,
   Code, Globe, AlignLeft, Terminal,
 } from "lucide-react";
-import { useState, useRef, useEffect, useCallback } from "react";
-import { readFile } from "@tauri-apps/plugin-fs";
-import { cn, bytesToBase64, imageMime } from "@/lib/utils";
-import type { Message, ArtifactType, AttachmentMeta } from "@/lib/tauri";
+import { useState, useRef, useEffect } from "react";
+import { cn } from "@/lib/utils";
+import type { Message, ArtifactType, AttachmentMeta, ImageMeta } from "@/lib/tauri";
 import { ArtifactCard } from "./ArtifactCard";
 import { useArtifactStore } from "@/stores/artifactStore";
 import { useSkillsStore } from "@/stores/skillsStore";
@@ -33,49 +32,16 @@ function parseAttachmentMeta(metadata?: AttachmentMeta | null): AttachmentMeta |
   return metadata;
 }
 
-/**
- * Loads a single image path from the filesystem as a base64 data-URL.
- * Returns null while loading or if the file is inaccessible.
- */
-function useImageDataUrl(path: string): string | null {
-  const [dataUrl, setDataUrl] = useState<string | null>(null);
-  const load = useCallback(async () => {
-    try {
-      const bytes = await readFile(path);
-      const ext = path.split(".").pop() ?? "jpeg";
-      const mime = imageMime(ext);
-      const b64 = bytesToBase64(new Uint8Array(bytes));
-      setDataUrl(`data:${mime};base64,${b64}`);
-    } catch {
-      setDataUrl(null);
-    }
-  }, [path]);
-  useEffect(() => { void load(); }, [load]);
-  return dataUrl;
-}
-
-/** Renders a single image thumbnail in a user bubble, loaded from a filesystem path. */
-function MessageImageThumb({ path }: { path: string }) {
-  const dataUrl = useImageDataUrl(path);
-  const name = path.replace(/\\/g, "/").split("/").pop() ?? path;
-  if (!dataUrl) {
-    return (
-      <div
-        className="w-20 h-20 rounded-lg border border-primary-foreground/20 bg-primary-foreground/10
-                   flex items-center justify-center text-primary-foreground/40"
-        title={name}
-      >
-        <File className="w-5 h-5" />
-      </div>
-    );
-  }
+/** Renders a single image thumbnail from a persisted base64 ImageMeta object. */
+function MessageImageThumb({ img }: { img: ImageMeta }) {
+  const src = `data:${img.mime};base64,${img.data}`;
   return (
     <img
-      src={dataUrl}
-      alt={name}
-      title={name}
+      src={src}
+      alt={img.filename}
+      title={img.filename}
       className="w-20 h-20 object-cover rounded-lg border border-primary-foreground/20 cursor-zoom-in"
-      onClick={() => window.open(dataUrl, "_blank")}
+      onClick={() => window.open(src, "_blank")}
     />
   );
 }
@@ -86,11 +52,14 @@ interface StreamingArtifactInfo {
   textBefore: string;
   title: string;
   artifactType: ArtifactType;
+  /** Characters streamed so far inside the artifact content. */
+  contentChars: number;
 }
 
 /**
  * During streaming, detect an open <artifact> tag with no matching closing tag yet.
- * Returns the text before the tag and artifact metadata so we can show a "Creating…" badge.
+ * Returns the text before the tag, artifact metadata, and how many content chars
+ * have been streamed so far so we can show a live size counter.
  */
 function detectStreamingArtifact(raw: string): StreamingArtifactInfo | null {
   // If every open tag has a matching close tag, let normal parseArtifacts handle it
@@ -109,23 +78,27 @@ function detectStreamingArtifact(raw: string): StreamingArtifactInfo | null {
   if (!lastMatch) {
     const partialIdx = raw.search(/<artifact/i);
     const textBefore = partialIdx > 0 ? raw.slice(0, partialIdx).trim() : "";
-    // Try to extract a partial type attribute if already streamed
     const partialTypeMatch = raw.slice(partialIdx).match(/type="([^"]*)/i);
     const partialType = (partialTypeMatch?.[1] ?? "text") as ArtifactType;
-    return { textBefore, title: "artifact", artifactType: partialType };
+    return { textBefore, title: "artifact", artifactType: partialType, contentChars: 0 };
   }
 
   const tagStart = lastMatch.index;
+  const tagEnd = tagStart + lastMatch[0].length;
   const textBefore = raw.slice(0, tagStart).trim();
   const attrs: Record<string, string> = {};
   const attrRe = /(\w+)="([^"]*)"/g;
   let a: RegExpExecArray | null;
   while ((a = attrRe.exec(lastMatch[1])) !== null) attrs[a[1]] = a[2];
 
+  // Count chars that have arrived after the opening tag
+  const contentChars = raw.length - tagEnd;
+
   return {
     textBefore,
     title: attrs.title ?? "Artifact",
     artifactType: (attrs.type ?? "text") as ArtifactType,
+    contentChars: Math.max(0, contentChars),
   };
 }
 
@@ -136,6 +109,8 @@ const TYPE_LABEL: Record<ArtifactType, string> = {
   markdown: "document",
   html: "HTML",
   text: "text",
+  csv: "CSV",
+  json: "JSON",
 };
 
 const TYPE_ICON: Record<ArtifactType, React.ReactNode> = {
@@ -143,6 +118,8 @@ const TYPE_ICON: Record<ArtifactType, React.ReactNode> = {
   markdown: <FileText className="w-3.5 h-3.5" />,
   html: <Globe className="w-3.5 h-3.5" />,
   text: <AlignLeft className="w-3.5 h-3.5" />,
+  csv: <FileText className="w-3.5 h-3.5" />,
+  json: <FileJson className="w-3.5 h-3.5" />,
 };
 
 function AnimatedDots() {
@@ -154,15 +131,35 @@ function AnimatedDots() {
   return <span className="inline-block w-5 text-left">{".".repeat(frame)}</span>;
 }
 
-function CreatingArtifactBadge({ title, artifactType }: { title: string; artifactType: ArtifactType }) {
+function CreatingArtifactBadge({
+  title,
+  artifactType,
+  contentChars,
+}: {
+  title: string;
+  artifactType: ArtifactType;
+  contentChars: number;
+}) {
   const label = TYPE_LABEL[artifactType] ?? artifactType;
   const icon = TYPE_ICON[artifactType] ?? <File className="w-3.5 h-3.5" />;
+  // Rough token estimate: ~4 chars per token (common approximation)
+  const tokens = Math.round(contentChars / 4);
+  const sizeLabel =
+    contentChars === 0
+      ? null
+      : tokens >= 1000
+      ? `~${(tokens / 1000).toFixed(1)}k tokens`
+      : `~${tokens} tokens`;
+
   return (
     <div className="flex items-center gap-2 mt-2 px-3 py-2 rounded-lg border border-border bg-secondary/50 text-xs text-muted-foreground w-fit">
       <span className="text-primary/70">{icon}</span>
       <span>Creating {label}</span>
       {title && title !== "Artifact" && (
         <span className="text-foreground/60 font-medium max-w-[200px] truncate">"{title}"</span>
+      )}
+      {sizeLabel && (
+        <span className="text-primary/60 font-mono tabular-nums">{sizeLabel}</span>
       )}
       <AnimatedDots />
     </div>
@@ -539,11 +536,11 @@ export function MessageBubble({ message, liveThinking, isThinking, onEdit, onReg
           )}>
             {isUser ? (
               <>
-                {/* Image thumbnails */}
+                {/* Image thumbnails (base64 stored in metadata) */}
                 {attachmentMeta?.images && attachmentMeta.images.length > 0 && (
                   <div className="flex flex-wrap gap-2 mb-2 pb-2 border-b border-primary-foreground/20">
-                    {attachmentMeta.images.map((imgPath) => (
-                      <MessageImageThumb key={imgPath} path={imgPath} />
+                    {attachmentMeta.images.map((img) => (
+                      <MessageImageThumb key={img.filename} img={img} />
                     ))}
                   </div>
                 )}
@@ -592,6 +589,7 @@ export function MessageBubble({ message, liveThinking, isThinking, onEdit, onReg
                   <CreatingArtifactBadge
                     title={streamingArtifact.title}
                     artifactType={streamingArtifact.artifactType}
+                    contentChars={streamingArtifact.contentChars}
                   />
                 )}
 

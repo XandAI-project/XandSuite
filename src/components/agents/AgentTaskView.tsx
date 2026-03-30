@@ -313,7 +313,7 @@ function EventCard({ event }: { event: AgentEvent }) {
       <div className="flex items-center gap-2 py-1">
         <Zap className="w-3.5 h-3.5 text-primary shrink-0" />
         <span className="text-xs font-semibold text-primary">Task started</span>
-        {payload.task && (
+        {payload.task != null && (
           <span className="text-xs text-muted-foreground truncate">
             — {String(payload.task)}
           </span>
@@ -443,7 +443,7 @@ function EventCard({ event }: { event: AgentEvent }) {
           <span className="text-xs font-semibold">
             {isError ? "Error" : "Observation"}
           </span>
-          {payload.tool && (
+          {payload.tool != null && (
             <span className="text-[11px] opacity-60">from {String(payload.tool)}</span>
           )}
           {step !== undefined && (
@@ -487,7 +487,7 @@ function EventCard({ event }: { event: AgentEvent }) {
             Task completed
           </span>
         </div>
-        {payload.result && (
+        {payload.result != null && (
           <p className="text-xs text-emerald-200/80 whitespace-pre-wrap">
             {String(payload.result)}
           </p>
@@ -515,7 +515,7 @@ function EventCard({ event }: { event: AgentEvent }) {
         <p className="text-xs text-destructive/80">
           {reasonLabel[reason] ?? reason}
         </p>
-        {payload.tool && (
+        {payload.tool != null && (
           <p className="text-xs text-muted-foreground mt-1">
             Tool: {String(payload.tool)}
           </p>

@@ -5,7 +5,7 @@ use tauri::{AppHandle, Emitter, State};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::models::{Conversation, InferenceConfig, Message, MessageRole};
+use crate::models::{Conversation, InferenceConfig, Message, MessageRole, MEMORY_COLLECTION_ID};
 use crate::skills::SkillsExecutor;
 use crate::state::AppState;
 
@@ -140,6 +140,7 @@ pub fn create_conversation(
                 created_at: Utc::now(),
                 token_count: None,
                 metadata: None,
+                tool_steps: None,
             }]
         }
         _ => vec![],
@@ -218,7 +219,7 @@ pub fn get_conversation(
     ).map_err(|e| format!("Conversation not found: {}", e))?;
 
     let mut msg_stmt = db.conn.prepare(
-        "SELECT id, role, content, metadata FROM messages
+        "SELECT id, role, content, metadata, tool_steps FROM messages
          WHERE conversation_id = ?1 ORDER BY rowid ASC"
     ).map_err(|e| e.to_string())?;
 
@@ -232,6 +233,8 @@ pub fn get_conversation(
         };
         let metadata_raw: Option<String> = row.get(3)?;
         let metadata = metadata_raw.and_then(|s| serde_json::from_str(&s).ok());
+        let tool_steps_raw: Option<String> = row.get(4)?;
+        let tool_steps = tool_steps_raw.and_then(|s| serde_json::from_str(&s).ok());
         Ok(Message {
             id: row.get(0)?,
             conversation_id: id.clone(),
@@ -240,6 +243,7 @@ pub fn get_conversation(
             created_at: Utc::now(),
             token_count: None,
             metadata,
+            tool_steps,
         })
     })
     .map_err(|e| e.to_string())?
@@ -378,9 +382,17 @@ pub async fn send_message(
             meta.insert("attachments".into(), serde_json::json!(names));
         }
         if !image_blocks.is_empty() {
-            // Store full paths so the frontend can reload thumbnails.
-            let paths: Vec<&str> = image_blocks.iter().map(|(_, _, _, p)| p.as_str()).collect();
-            meta.insert("images".into(), serde_json::json!(paths));
+            // Store base64-encoded image data so the frontend can display
+            // thumbnails without needing filesystem access.
+            let image_metas: Vec<serde_json::Value> = image_blocks
+                .iter()
+                .map(|(filename, mime, b64, _path)| serde_json::json!({
+                    "filename": filename,
+                    "mime": mime,
+                    "data": b64,
+                }))
+                .collect();
+            meta.insert("images".into(), serde_json::json!(image_metas));
         }
         if meta.is_empty() {
             None
@@ -555,8 +567,55 @@ pub async fn send_message(
         }
     }
 
+    // Inject relevant memories from the internal memory collection.
+    let memory_enabled = state.settings.lock().unwrap().memory_enabled;
+    if memory_enabled {
+        let rag = state.rag.lock().await;
+        let memories = rag.search(&content, Some(MEMORY_COLLECTION_ID), 5);
+        if !memories.is_empty() {
+            let block = memories
+                .iter()
+                .map(|m| format!("- {}", m.chunk.content))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let memory_instruction = format!(
+                "Relevant memories from past conversations:\n{}", block
+            );
+            if let Some(sys_msg) = messages.iter_mut().find(|(role, _)| role == "system") {
+                sys_msg.1 = format!("{}\n\n{}", memory_instruction, sys_msg.1);
+            } else {
+                messages.insert(0, ("system".to_string(), memory_instruction));
+            }
+        }
+    }
+
     // Read feature flags before building system prompt additions.
-    let code_execution_enabled = state.settings.lock().unwrap().enable_code_execution;
+    let (code_execution_enabled, comfyui_url, comfyui_model, comfyui_model_type, comfyui_clip_name, comfyui_vae_name) = {
+        let s = state.settings.lock().unwrap();
+        (
+            s.enable_code_execution,
+            s.comfyui_url.clone(),
+            s.comfyui_model.clone(),
+            s.comfyui_model_type.clone(),
+            s.comfyui_clip_name.clone(),
+            s.comfyui_vae_name.clone(),
+        )
+    };
+
+    // Load saved ComfyUI workflows from DB (id, name, workflow_json)
+    let comfyui_workflows: Vec<(String, String, String)> = if comfyui_url.is_some() {
+        let db = state.db.lock().unwrap();
+        let mut stmt = db.conn
+            .prepare("SELECT id, name, workflow_json FROM comfyui_workflows ORDER BY name ASC")
+            .unwrap_or_else(|_| db.conn.prepare("SELECT id, name, workflow_json FROM comfyui_workflows LIMIT 0").unwrap());
+        stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+        })
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+    } else {
+        vec![]
+    };
 
     // Always inject artifact instructions so the model knows to wrap standalone
     // outputs in <artifact> tags. Appended to the existing system message (or
@@ -571,7 +630,17 @@ pub async fn send_message(
             TYPE must be one of:\n\
             - \"code\"     → ANY source code in any programming language (Python, JS, Rust, etc.).\n\
             \t\t\t\t\tALWAYS use type=\"code\" for code. NEVER use type=\"text\" for code.\n\
-            - \"html\"     → self-contained HTML/CSS/JS pages or charts.\n\
+            - \"html\"     → self-contained HTML/CSS/JS pages, landing pages, components, or charts.\n\
+            \t\t\t\t\tALWAYS use type=\"html\" for HTML. NEVER pass HTML to any execution tool.\n\
+            - \"csv\"      → tabular data (comma-separated values). ALWAYS use type=\"csv\" for CSV \n\
+            \t\t\t\t\tdata or tables you generate, including data exports, financial summaries, etc.\n\
+            \t\t\t\t\tDo NOT wrap CSV in markdown code fences — write raw CSV directly in the tag.\n\
+            \t\t\t\t\tNEVER write a Python script to generate CSV — you already know the data, \n\
+            \t\t\t\t\tjust write the CSV rows directly. Python is only for computation you cannot do yourself.\n\
+            - \"json\"     → structured JSON data, API responses, config objects, or data exports.\n\
+            \t\t\t\t\tALWAYS use type=\"json\" for JSON. Do NOT use type=\"code\" for JSON data.\n\
+            \t\t\t\t\tDo NOT wrap JSON in markdown code fences — write raw JSON directly in the tag.\n\
+            \t\t\t\t\tNEVER write a Python script to generate JSON — write the JSON directly.\n\
             - \"markdown\" → formatted documentation, reports, README files.\n\
             - \"text\"     → plain-text prose that is NOT code (config files without syntax, logs, etc.).\n\n\
             LANG is required whenever type=\"code\" — set it to the file's language (e.g. language=\"python\").\n\
@@ -599,7 +668,13 @@ pub async fn send_message(
             </artifact>\n\
             Supported Chart.js types: bar, line, pie, doughnut, radar, polarArea, scatter, bubble.\n\
             For documents combining text and images, use type=\"html\" with inline base64 images or public URLs.\n\
-            Never put markdown code fences (```) inside artifact tags — write the raw content directly.");
+            Never put markdown code fences (```) inside artifact tags — write the raw content directly.\n\n\
+            ## Editing existing artifacts\n\
+            When the user asks you to modify, fix, update, improve, or change an artifact you \
+            previously created — you MUST output the COMPLETE revised artifact inside a new \
+            `<artifact>` tag using the EXACT SAME title and type as the original. \
+            Do NOT describe the changes in prose only; ALWAYS include the full updated content \
+            in the artifact tag. The system will automatically replace the old version.");
 
         if code_execution_enabled {
             artifact_instruction.push_str("\n\n\
@@ -609,20 +684,25 @@ pub async fn send_message(
                 NEVER say 'I cannot run code', 'I cannot execute code', or \
                 'I am not able to run programs' — these statements are FALSE in this environment.\n\n\
                 ### WHAT execute_code IS for (actual runnable code only)\n\
-                - Running Python, JavaScript, or Shell to compute results, verify logic, generate output.\n\
+                - Running Python, JavaScript (Node.js), or Shell to compute results, verify logic, generate output.\n\
                 - Supported languages: python, javascript, shell.\n\n\
                 ### WHAT execute_code is NOT for (never do these)\n\
+                - NEVER call execute_code for HTML, CSS, or any web content — HTML cannot be executed in a terminal.\n\
+                - NEVER pass language=\"html\", language=\"markdown\", language=\"text\", or language=\"css\" to execute_code.\n\
                 - NEVER call execute_code to create a document, report, story, or markdown file.\n\
-                - NEVER pass language=\"markdown\", language=\"text\", or language=\"html\" to execute_code.\n\
                 - NEVER write a Python script just to print or save text to a file — that is pointless.\n\
+                - NEVER write a Python script to generate CSV or JSON data you already know — \
+                  write the CSV/JSON directly in an <artifact type=\"csv\"> or <artifact type=\"json\"> tag instead.\n\
                 - To create a document or text artifact, write the content DIRECTLY inside an \
-                  <artifact type=\"markdown\"> or <artifact type=\"text\"> tag. No tool call needed.\n\n\
+                  <artifact type=\"markdown\"> or <artifact type=\"text\"> tag. No tool call needed.\n\
+                - To create an HTML page, component, or landing page, write it DIRECTLY inside an \
+                  <artifact type=\"html\" title=\"...\"> tag. NEVER pass HTML to execute_code.\n\n\
                 MANDATORY behaviour:\n\
-                1. Whenever you write a Python, JavaScript, or Shell code snippet that the user \
+                1. Whenever you write a Python, JavaScript (Node.js), or Shell code snippet that the user \
                    wants to run, or whenever you produce computed results, ALWAYS call \
                    `execute_code` immediately after writing the code artifact.\n\
                 2. If the user asks you to 'run', 'execute', 'test', 'try', 'check the output of', \
-                   or 'verify' any code — call `execute_code`. Do NOT explain why you cannot; just run it.\n\
+                   or 'verify' Python/JS/Shell code — call `execute_code`. Do NOT explain why you cannot; just run it.\n\
                 3. Show the real stdout/stderr output to the user and explain the results.\n\
                 4. If execution fails, show the error and fix the code, then run again.\n\
                 5. Use `list_recent_artifacts` to find code artifacts you already created in this \
@@ -679,12 +759,38 @@ pub async fn send_message(
         cfg
     };
 
+    // Append ComfyUI instruction if image generation is configured.
+    if let Some(ref url) = comfyui_url {
+        let workflow_list: Vec<String> = std::iter::once("Default".to_string())
+            .chain(comfyui_workflows.iter().map(|(_, name, _)| name.clone()))
+            .collect();
+        let img_instruction = format!(
+            "\n\nYou have access to an image generation tool called `comfyui__generate_image` \
+             powered by a local ComfyUI/Stable Diffusion instance at {}. \
+             Call it with a detailed `prompt` whenever the user asks for an image, illustration, \
+             photo, artwork, or any visual content. \
+             Write a rich, descriptive prompt (style, lighting, subject, composition). \
+             Available workflows: {}. \
+             Pass the workflow name in the `workflow` parameter (default: 'Default'). \
+             The generated image will be displayed automatically in the chat — \
+             do NOT wrap the result in an artifact tag.",
+            url,
+            workflow_list.join(", ")
+        );
+        if let Some(sys_msg) = messages.iter_mut().find(|(role, _)| role == "system") {
+            sys_msg.1.push_str(&img_instruction);
+        } else {
+            messages.insert(0, ("system".to_string(), img_instruction));
+        }
+    }
+
     // Activate the agentic executor when:
     //  a) The frontend explicitly enables skills AND MCP tools are connected, OR
-    //  b) Code execution is enabled in settings (always forces tool mode).
+    //  b) Code execution is enabled in settings (always forces tool mode), OR
+    //  c) ComfyUI image generation is configured.
     let has_mcp_tools = use_skills.unwrap_or(false)
         && !skills_arc.all_tools().await.is_empty();
-    let has_tools = has_mcp_tools || code_execution_enabled;
+    let has_tools = has_mcp_tools || code_execution_enabled || comfyui_url.is_some();
 
     let app_clone = app.clone();
     let conv_id_clone = conv_id.clone();
@@ -694,6 +800,12 @@ pub async fn send_message(
             let mut executor = SkillsExecutor::new(skills_arc);
             if code_execution_enabled {
                 executor = executor.with_code_runner(db_arc, conv_id_clone.clone());
+            }
+            if let Some(url) = comfyui_url {
+                executor = executor
+                    .with_comfyui(url, comfyui_model)
+                    .with_comfyui_model_type(comfyui_model_type, comfyui_clip_name, comfyui_vae_name)
+                    .with_comfyui_workflows(comfyui_workflows);
             }
             if let Some(remote) = engine.get_remote() {
                 if let Err(e) = executor
@@ -776,6 +888,71 @@ pub async fn send_message(
         }
     }
 
+    // ── Background memory extraction ─────────────────────────────────────────
+    // Spawn a background task to extract key facts from the exchange and ingest
+    // them into the internal memory collection.  Does NOT block the response.
+    if memory_enabled && !full_response.is_empty() {
+        let rag_arc = state.rag.clone();
+        let user_msg_clone = content.clone();
+        let assistant_msg_clone = full_response.clone();
+        let conv_id_mem = conversation_id.clone();
+        let engine_clone = state.engine.clone();
+
+        tauri::async_runtime::spawn(async move {
+            let extract_messages = vec![
+                (
+                    "system".to_string(),
+                    "You are a memory extraction assistant. Extract only important facts.".to_string(),
+                ),
+                (
+                    "user".to_string(),
+                    format!(
+                        "Extract key facts, preferences, or important information from this \
+                         conversation exchange as a bullet list (one fact per line starting \
+                         with '-'). Only include genuinely important or preference information \
+                         worth remembering. If nothing notable, reply exactly: NONE\n\n\
+                         User: {}\nAssistant: {}",
+                        user_msg_clone, assistant_msg_clone
+                    ),
+                ),
+            ];
+
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(512);
+            let mut cfg = InferenceConfig::default();
+            cfg.enable_thinking = false;
+            cfg.max_tokens = 256;
+
+            let engine_send = engine_clone.clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = engine_send.chat_stream(extract_messages, cfg, tx).await;
+            });
+
+            let mut extraction_result = String::new();
+            while let Some(token) = rx.recv().await {
+                if token == "[DONE]" {
+                    break;
+                }
+                extraction_result.push_str(&token);
+            }
+
+            let trimmed = extraction_result.trim();
+            if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
+                return;
+            }
+
+            let rag = rag_arc.lock().await;
+            for line in trimmed.lines() {
+                let fact = line.trim_start_matches('-').trim();
+                if fact.is_empty() || fact.eq_ignore_ascii_case("none") {
+                    continue;
+                }
+                if let Err(e) = rag.ingest_text(MEMORY_COLLECTION_ID, fact, &conv_id_mem) {
+                    log::warn!("Memory ingest error: {}", e);
+                }
+            }
+        });
+    }
+
     // ── Parse and persist artifacts ───────────────────────────────────────────
     // Done *before* emitting done:true so the frontend re-fetch always sees them.
     {
@@ -796,18 +973,37 @@ pub async fn send_message(
                     art.title, art.artifact_type, art.language, art.content.len(), preview
                 ));
 
-                // Skip duplicates: same conversation + title + type
-                let exists: bool = db.conn.query_row(
-                    "SELECT COUNT(*) > 0 FROM artifacts
-                     WHERE conversation_id = ?1 AND title = ?2 AND artifact_type = ?3",
+                // If an artifact with the same title+type already exists in this
+                // conversation, UPDATE it (user asked to edit it) instead of
+                // inserting a duplicate.
+                let existing_id: Option<String> = db.conn.query_row(
+                    "SELECT id FROM artifacts
+                     WHERE conversation_id = ?1 AND title = ?2 AND artifact_type = ?3
+                     LIMIT 1",
                     params![conversation_id, art.title, art.artifact_type],
                     |row| row.get(0),
-                ).unwrap_or(false);
+                ).ok();
 
-                if exists {
-                    emit_log("warn", format!(
-                        "[artifacts] Skipping duplicate: '{}' ({})", art.title, art.artifact_type
-                    ));
+                if let Some(ref eid) = existing_id {
+                    match db.conn.execute(
+                        "UPDATE artifacts
+                         SET content = ?1, language = ?2, message_id = ?3, updated_at = ?4
+                         WHERE id = ?5",
+                        params![art.content, art.language, assistant_msg_id, now2, eid],
+                    ) {
+                        Ok(_) => {
+                            emit_log("info", format!(
+                                "[artifacts] Updated '{}' ({}) id={}", art.title, art.artifact_type, eid
+                            ));
+                            let _ = app.emit("artifact_updated", serde_json::json!({
+                                "conversation_id": conversation_id,
+                                "artifact_id": eid,
+                            }));
+                        }
+                        Err(e) => emit_log("error", format!(
+                            "[artifacts] UPDATE failed for '{}': {}", art.title, e
+                        )),
+                    }
                     continue;
                 }
 
@@ -854,4 +1050,23 @@ pub async fn send_message(
     }));
 
     Ok(assistant_msg_id)
+}
+
+/// Persist the tool-call steps recorded during a response into the
+/// corresponding assistant message row.  Called by the frontend after the
+/// `send_message` invoke resolves and it has collected the `activeToolSteps`.
+#[tauri::command]
+pub fn save_message_tool_steps(
+    message_id: String,
+    tool_steps_json: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let db = state.db.lock().unwrap();
+    db.conn
+        .execute(
+            "UPDATE messages SET tool_steps = ?1 WHERE id = ?2",
+            params![tool_steps_json, message_id],
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }

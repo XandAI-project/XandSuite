@@ -16,6 +16,10 @@ pub struct LlamaServerManager {
     /// Timestamp of the last completed inference request.
     /// Used by the idle-watcher to decide when to stop the server.
     last_activity: Option<Instant>,
+    /// Set to true when we detected a server that was started outside our
+    /// lifetime (e.g. orphaned from a previous session). We track its
+    /// model/port but have no Child handle for it.
+    adopted: bool,
 }
 
 impl LlamaServerManager {
@@ -26,7 +30,31 @@ impl LlamaServerManager {
             model_path: None,
             bin_path: None,
             last_activity: None,
+            adopted: false,
         }
+    }
+
+    /// Mark an externally-running server as ours without spawning a new process.
+    /// Called when we detect an orphaned server on startup.
+    pub fn adopt(&mut self, port: u16, model_path: Option<String>) {
+        self.port = port;
+        self.model_path = model_path;
+        self.last_activity = Some(Instant::now());
+        self.adopted = true;
+    }
+
+    /// Returns true when the server was adopted (no child handle) rather than
+    /// started by this process.
+    pub fn is_adopted(&self) -> bool {
+        self.adopted
+    }
+
+    /// Clear the adopted flag without killing anything. Used before spawning a
+    /// replacement process so `start()` does not treat the port as free.
+    pub fn clear_adopted(&mut self) {
+        self.adopted = false;
+        self.model_path = None;
+        self.last_activity = None;
     }
 
     pub fn binary_path(data_dir: &Path) -> PathBuf {
@@ -148,6 +176,7 @@ impl LlamaServerManager {
         }
         self.model_path = None;
         self.last_activity = None;
+        self.adopted = false;
     }
 
     /// Call this every time an inference request completes to reset the idle timer.
@@ -168,6 +197,12 @@ impl LlamaServerManager {
     }
 
     pub fn is_running(&mut self) -> bool {
+        if self.adopted {
+            // We don't hold a Child handle — trust that it is still alive.
+            // If the process has actually died, the engine's HTTP client will
+            // fail and the user can restart manually.
+            return true;
+        }
         if let Some(child) = &mut self.process {
             matches!(child.try_wait(), Ok(None))
         } else {

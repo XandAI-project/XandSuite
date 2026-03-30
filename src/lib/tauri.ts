@@ -25,10 +25,27 @@ export interface ConversationSummary {
   message_count: number;
 }
 
+/** Per-image entry stored in message metadata. */
+export interface ImageMeta {
+  filename: string;
+  mime: string;
+  /** Base64-encoded image bytes — rendered as a data URL directly. */
+  data: string;
+}
+
 export interface AttachmentMeta {
   attachments?: string[];
-  /** Full filesystem paths for image attachments — used to load thumbnails. */
-  images?: string[];
+  /** Image attachments stored as base64 objects for persistent display. */
+  images?: ImageMeta[];
+}
+
+/** Mirror of ToolStep used in the frontend skillsStore. */
+export interface PersistedToolStep {
+  tool_call_id: string;
+  function_name: string;
+  arguments: Record<string, unknown>;
+  result?: string;
+  turn: number;
 }
 
 export interface Message {
@@ -39,6 +56,8 @@ export interface Message {
   created_at: string;
   /** Metadata object, e.g. AttachmentMeta (serialized by Tauri as a JSON object) */
   metadata?: AttachmentMeta | null;
+  /** Tool-call steps persisted with this assistant message. */
+  tool_steps?: PersistedToolStep[] | null;
 }
 
 export interface HfModel {
@@ -75,6 +94,13 @@ export interface RagCollection {
   name: string;
   description: string | null;
   document_count: number;
+  created_at: string;
+}
+
+export interface MemoryEntry {
+  id: string;
+  content: string;
+  source: string;
   created_at: string;
 }
 
@@ -225,7 +251,7 @@ export interface ToolResultEvent {
   turn: number;
 }
 
-export type ArtifactType = "code" | "markdown" | "html" | "text";
+export type ArtifactType = "code" | "markdown" | "html" | "text" | "csv" | "json";
 
 export interface Artifact {
   id: string;
@@ -237,6 +263,65 @@ export interface Artifact {
   content: string;
   created_at: string;
   updated_at: string;
+}
+
+// ── Coding / AI coding agent types ───────────────────────────────────────────
+
+export type CodingMode = "agent" | "plan" | "debug" | "ask";
+
+export interface CodingSession {
+  id: string;
+  title: string;
+  mode: CodingMode;
+  project_path: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CodingEventPayload {
+  event_type: string;
+  payload: Record<string, unknown>;
+}
+
+export interface CodingMessage {
+  id: string;
+  session_id: string;
+  role: "user" | "assistant";
+  content: string;
+  events: CodingEventPayload[];
+  created_at: string;
+}
+
+export interface CodingPlanTask {
+  id: string;
+  title: string;
+  description: string;
+  status: "pending" | "in_progress" | "completed" | "failed";
+  note: string | null;
+}
+
+export interface CodingPlan {
+  id: string;
+  session_id: string;
+  title: string;
+  tasks: CodingPlanTask[];
+  status: "pending" | "in_progress" | "completed";
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CodingEvent {
+  session_id: string;
+  event_type: string;
+  payload: Record<string, unknown>;
+}
+
+export interface FileTreeEntry {
+  name: string;
+  path: string;
+  type: "file" | "directory";
+  size?: number;
+  children?: FileTreeEntry[];
 }
 
 export interface AppSettings {
@@ -271,4 +356,37 @@ export interface AppSettings {
   enable_code_execution: boolean;
   /** Path to the multimodal projection file (mmproj-*.gguf) for VLM models. */
   mmproj_path: string | null;
+  /** Automatically extract and recall key facts from conversations. */
+  memory_enabled: boolean;
+  /** Base URL of a running ComfyUI instance. When set, enables image generation. */
+  comfyui_url: string | null;
+  /** Model filename. Interpreted according to comfyui_model_type. */
+  comfyui_model: string | null;
+  /** "checkpoint" | "unet" | null (auto-detect). */
+  comfyui_model_type: string | null;
+  /** CLIP model filename for UNETLoader workflows (auto-detected when null). */
+  comfyui_clip_name: string | null;
+  /** VAE model filename for UNETLoader workflows (auto-detected when null). */
+  comfyui_vae_name: string | null;
+}
+
+export interface ComfyWorkflow {
+  id: string;
+  name: string;
+  description: string | null;
+  workflow_json: string;
+  created_at: string;
+}
+
+export interface GalleryImage {
+  id: string;
+  conversation_id: string;
+  source: "generated" | "upload";
+  filename: string;
+  image_data: string;
+  mime_type: string;
+  prompt: string | null;
+  width: number | null;
+  height: number | null;
+  created_at: string;
 }

@@ -310,10 +310,12 @@ export function FlowCanvas() {
           .map((n) => n.id)
       );
 
+      const findLast = <T,>(arr: T[], pred: (x: T) => boolean) =>
+        [...arr].reverse().find(pred);
       const best =
-        result.node_results.findLast((r) => !r.error && outputNodeIds.has(r.node_id)) ??
-        result.node_results.findLast((r) => !r.error && llmNodeIds.has(r.node_id)) ??
-        result.node_results.findLast((r) => !r.error);
+        findLast(result.node_results, (r) => !r.error && outputNodeIds.has(r.node_id)) ??
+        findLast(result.node_results, (r) => !r.error && llmNodeIds.has(r.node_id)) ??
+        findLast(result.node_results, (r) => !r.error);
 
       // Determine output format: check the output node's format field
       const outputNode = activeFlow.nodes.find(

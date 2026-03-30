@@ -171,6 +171,59 @@ impl RagService {
         retriever::build_context_prompt(&relevant, 8192)
     }
 
+    /// Ingest a raw text string into a collection without going through a file.
+    /// `source` is stored in `source_file` for provenance (e.g. conversation ID).
+    pub fn ingest_text(
+        &self,
+        collection_id: &str,
+        text: &str,
+        source: &str,
+    ) -> Result<()> {
+        let doc_id = Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+
+        {
+            let db = self.db.lock().unwrap();
+            db.conn.execute(
+                "INSERT INTO rag_documents (id, collection_id, source_file, content, metadata, created_at)
+                 VALUES (?1, ?2, ?3, ?4, '{}', ?5)",
+                rusqlite::params![doc_id, collection_id, source, text, now],
+            )?;
+        }
+
+        let chunk_config = chunker::ChunkConfig::default();
+        let text_chunks = chunk_by_paragraphs(text, &chunk_config);
+        let chunks: Vec<retriever::StoredChunk> = text_chunks
+            .iter()
+            .enumerate()
+            .map(|(idx, chunk_text)| {
+                let embedding = embed_text_mock(chunk_text);
+                retriever::StoredChunk {
+                    id: Uuid::new_v4().to_string(),
+                    document_id: doc_id.clone(),
+                    collection_id: collection_id.to_string(),
+                    content: chunk_text.clone(),
+                    chunk_index: idx as u32,
+                    metadata: serde_json::Value::Object(Default::default()),
+                    embedding,
+                }
+            })
+            .collect();
+
+        let mut vs = self.vector_store.lock().unwrap();
+        vs.add_chunks(chunks)?;
+
+        Ok(())
+    }
+
+    /// Remove all vector-store chunks that belong to a single document.
+    /// The DB row should already be deleted by the caller.
+    pub fn delete_document_chunks(&self, document_id: &str) -> Result<()> {
+        let mut vs = self.vector_store.lock().unwrap();
+        vs.delete_document(document_id)?;
+        Ok(())
+    }
+
     pub fn delete_collection(&self, collection_id: &str) -> Result<()> {
         {
             let db = self.db.lock().unwrap();

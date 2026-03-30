@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { RefreshCw, Wrench, Server, ChevronDown, ChevronRight, Play, Loader2, AlertCircle, CheckCircle2 } from "lucide-react";
+import { RefreshCw, Wrench, Server, ChevronDown, ChevronRight, Play, Loader2, AlertCircle } from "lucide-react";
 import { useSkillsStore } from "@/stores/skillsStore";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";

@@ -291,7 +291,80 @@ impl AppDb {
                 ON rag_documents(collection_id);
             CREATE INDEX IF NOT EXISTS idx_artifacts_conversation
                 ON artifacts(conversation_id);
+
+            CREATE TABLE IF NOT EXISTS coding_sessions (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                mode TEXT NOT NULL DEFAULT 'agent',
+                project_path TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS coding_messages (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                events_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (session_id) REFERENCES coding_sessions(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS coding_plans (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                message_id TEXT,
+                tasks_json TEXT NOT NULL DEFAULT '[]',
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (session_id) REFERENCES coding_sessions(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_coding_messages_session
+                ON coding_messages(session_id);
+            CREATE INDEX IF NOT EXISTS idx_coding_plans_session
+                ON coding_plans(session_id);
+
+            CREATE TABLE IF NOT EXISTS comfyui_workflows (
+                id          TEXT PRIMARY KEY,
+                name        TEXT NOT NULL UNIQUE,
+                description TEXT,
+                workflow_json TEXT NOT NULL,
+                created_at  TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS gallery_images (
+                id              TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                source          TEXT NOT NULL,
+                filename        TEXT NOT NULL,
+                image_data      TEXT NOT NULL,
+                mime_type       TEXT NOT NULL DEFAULT 'image/png',
+                prompt          TEXT,
+                width           INTEGER,
+                height          INTEGER,
+                created_at      TEXT NOT NULL,
+                FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_gallery_conversation
+                ON gallery_images(conversation_id);
+
+            -- Add tool_steps column to existing messages rows (idempotent ALTER).
+            -- SQLite ignores "duplicate column" errors via OR IGNORE is not available
+            -- for ALTER TABLE, so we use a separate execute_batch line below.
         "#).context("Failed to run database migrations")?;
+
+        // ALTER TABLE is not idempotent in SQLite — ignore "duplicate column" error.
+        let _ = self.conn.execute_batch(
+            "ALTER TABLE messages ADD COLUMN tool_steps TEXT;"
+        );
+
+        self.conn.execute_batch(r#"
+            INSERT OR IGNORE INTO rag_collections (id, name, description, created_at)
+            VALUES ('xand_internal_memory', 'Internal Memory', 'Auto-generated from conversations', datetime('now'));
+        "#).context("Failed to run seed migrations")?;
 
         Ok(())
     }

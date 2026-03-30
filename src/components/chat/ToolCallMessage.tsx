@@ -8,9 +8,11 @@ import {
   AlertCircle,
   Terminal,
   Clock,
+  ImageIcon,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { ToolStep } from "@/stores/skillsStore";
+import { useGalleryStore } from "@/stores/galleryStore";
 
 interface Props {
   steps: ToolStep[];
@@ -108,6 +110,72 @@ function CodeExecutionResult({ raw }: { raw: string }) {
   );
 }
 
+// ── Image generation result renderer ─────────────────────────────────────────
+
+interface ImageGenResultData {
+  status?: string;
+  image_url?: string;
+  /** Gallery DB id — present when the image was persisted to the gallery. */
+  gallery_id?: string;
+  filename?: string;
+  width?: number;
+  height?: number;
+  prompt?: string;
+}
+
+/** Resolve the best image src for a generated image.
+ *  Prefers the persisted gallery base64 data URL (works after ComfyUI restarts)
+ *  and falls back to the live ComfyUI URL. */
+function useImageSrc(result: ImageGenResultData): string | undefined {
+  const galleryImages = useGalleryStore((s) => s.images);
+  if (result.gallery_id) {
+    const galleryEntry = galleryImages.find((img) => img.id === result.gallery_id);
+    if (galleryEntry) {
+      return `data:${galleryEntry.mime_type};base64,${galleryEntry.image_data}`;
+    }
+  }
+  return result.image_url;
+}
+
+
+// ── Always-visible image preview (uses gallery data URL for persistence) ─────
+
+function AlwaysVisibleImagePreview({ raw }: { raw: string }) {
+  let r: ImageGenResultData = {};
+  try {
+    r = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+
+  // eslint-disable-next-line react-hooks/rules-of-hooks
+  const src = useImageSrc(r);
+  if (!src) return null;
+
+  return (
+    <div className="border-t border-purple-500/20 px-3 pb-3 pt-2 space-y-2">
+      <img
+        src={src}
+        alt={r.prompt ?? "Generated image"}
+        className="rounded-md border border-border max-w-full max-h-96 object-contain"
+      />
+      <div className="flex flex-wrap gap-3 text-[10px] text-muted-foreground">
+        {r.width && r.height && (
+          <span>{r.width} × {r.height} px</span>
+        )}
+        {r.filename && (
+          <span className="font-mono">{r.filename}</span>
+        )}
+      </div>
+      {r.prompt && (
+        <p className="text-[10px] text-foreground/70 italic line-clamp-2">
+          "{r.prompt}"
+        </p>
+      )}
+    </div>
+  );
+}
+
 // ── Generic tool step card ────────────────────────────────────────────────────
 
 function ToolStepCard({
@@ -127,11 +195,14 @@ function ToolStepCard({
     ?.toLowerCase()
     .includes("execute_code");
 
-  // Auto-open code execution steps so output is visible immediately
+  const isImageGen = step.function_name
+    ?.toLowerCase()
+    .includes("generate_image");
+
+  // Auto-open code execution and image generation steps so output is visible immediately
   const [autoOpened, setAutoOpened] = useState(false);
-  if (isCodeExec && !pending && step.result !== undefined && !autoOpened) {
+  if ((isCodeExec || isImageGen) && !pending && step.result !== undefined && !autoOpened) {
     setAutoOpened(true);
-    // open on next tick to avoid React state-during-render warning
     setTimeout(() => setOpen(true), 0);
   }
 
@@ -143,6 +214,8 @@ function ToolStepCard({
           ? "border-amber-500/30 bg-amber-500/5"
           : isError
           ? "border-red-500/30 bg-red-500/5"
+          : isImageGen
+          ? "border-purple-500/30 bg-purple-500/5"
           : isCodeExec
           ? "border-blue-500/30 bg-blue-500/5"
           : "border-emerald-500/30 bg-emerald-500/5"
@@ -157,6 +230,8 @@ function ToolStepCard({
           <Loader2 className="w-3 h-3 text-amber-400 animate-spin shrink-0" />
         ) : isError ? (
           <AlertCircle className="w-3 h-3 text-red-400 shrink-0" />
+        ) : isImageGen ? (
+          <ImageIcon className="w-3 h-3 text-purple-400 shrink-0" />
         ) : isCodeExec ? (
           <Terminal className="w-3 h-3 text-blue-400 shrink-0" />
         ) : (
@@ -170,6 +245,8 @@ function ToolStepCard({
               ? "text-amber-300"
               : isError
               ? "text-red-300"
+              : isImageGen
+              ? "text-purple-300"
               : isCodeExec
               ? "text-blue-300"
               : "text-emerald-300"
@@ -187,16 +264,20 @@ function ToolStepCard({
         )}
       </button>
 
-      {/* Expanded details */}
+      {/* Collapsible details: image preview + arguments + results */}
       {open && (
         <div className="border-t border-white/10 px-3 pb-3 pt-2 space-y-2">
+          {/* Image shown at the top of the expanded card */}
+          {isImageGen && !pending && step.result !== undefined && (
+            <AlwaysVisibleImagePreview raw={step.result} />
+          )}
           <div>
             <div className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-1">
               Arguments
             </div>
             {isCodeExec && step.arguments?.code ? (
               <pre className="text-[10px] font-mono whitespace-pre-wrap break-all text-blue-200/80 bg-blue-950/30 border border-blue-500/20 rounded p-2 max-h-48 overflow-y-auto">
-                {step.arguments.code}
+                {String(step.arguments.code ?? "")}
               </pre>
             ) : (
               <pre className="text-[10px] font-mono whitespace-pre-wrap break-all text-foreground/80 bg-black/20 rounded p-2 max-h-32 overflow-y-auto">
@@ -204,15 +285,21 @@ function ToolStepCard({
               </pre>
             )}
           </div>
-          {step.result !== undefined && (
+          {/* For image gen the preview above already shows everything.
+              For other tools show the result / output section. */}
+          {step.result !== undefined && !isImageGen && (
             <div>
               <div
                 className={cn(
                   "text-[10px] font-semibold uppercase tracking-wider mb-1",
-                  isError ? "text-red-400" : isCodeExec ? "text-blue-400" : "text-emerald-400"
+                  isError
+                    ? "text-red-400"
+                    : isCodeExec
+                    ? "text-blue-400"
+                    : "text-emerald-400"
                 )}
               >
-                {isError ? "Error" : "Output"}
+                {isError ? "Error" : isCodeExec ? "Output" : "Result"}
               </div>
               {isCodeExec ? (
                 <CodeExecutionResult raw={step.result} />

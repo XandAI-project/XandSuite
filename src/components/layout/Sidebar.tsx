@@ -1,7 +1,7 @@
 import { NavLink } from "react-router-dom";
 import {
   MessageSquare,
-  Bot,
+  Code2,
   Cpu,
   Database,
   FileText,
@@ -20,7 +20,7 @@ import { useLogStore } from "@/stores/logStore";
 
 const navItems = [
   { to: "/chat",      icon: MessageSquare, label: "Chat" },
-  { to: "/agents",    icon: Bot,           label: "Agents" },
+  { to: "/coding",    icon: Code2,         label: "Coding" },
   { to: "/flows",     icon: GitBranch,     label: "Flows" },
   { to: "/skills",    icon: Wrench,        label: "Skills" },
   { to: "/models",    icon: Cpu,           label: "Models" },
