@@ -6,7 +6,7 @@ import {
   User, Bot, Copy, Check, ChevronDown, ChevronRight, Brain,
   Gauge, Pencil, RefreshCw, X,
   FileText, FileCode, FileJson, File,
-  Code, Globe, AlignLeft, Terminal,
+  Code, Globe, AlignLeft, Terminal, BookOpen,
 } from "lucide-react";
 import { useState, useRef, useEffect } from "react";
 import { cn } from "@/lib/utils";
@@ -14,6 +14,58 @@ import type { Message, ArtifactType, AttachmentMeta, ImageMeta } from "@/lib/tau
 import { ArtifactCard } from "./ArtifactCard";
 import { useArtifactStore } from "@/stores/artifactStore";
 import { useSkillsStore } from "@/stores/skillsStore";
+
+// ── SourcesCard ────────────────────────────────────────────────────────────────
+
+interface RagSource {
+  content: string;
+  source: string;
+  score: number;
+  entities?: string[];
+}
+
+function SourcesCard({ sources }: { sources: RagSource[] }) {
+  const [open, setOpen] = useState(false);
+  if (!sources || sources.length === 0) return null;
+  return (
+    <div className="mt-2 rounded-lg border border-border/60 bg-card/40 text-xs overflow-hidden">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="flex items-center gap-2 w-full px-3 py-2 text-left hover:bg-secondary/50 transition-colors"
+      >
+        <BookOpen className="w-3 h-3 text-primary/70 shrink-0" />
+        <span className="font-medium text-muted-foreground">
+          {sources.length} source{sources.length > 1 ? "s" : ""} retrieved
+        </span>
+        <ChevronRight className={cn("w-3 h-3 ml-auto text-muted-foreground transition-transform", open && "rotate-90")} />
+      </button>
+      {open && (
+        <div className="border-t border-border/60 divide-y divide-border/40">
+          {sources.map((s, i) => (
+            <div key={i} className="px-3 py-2 space-y-1">
+              <div className="flex items-center justify-between gap-2">
+                <span className="font-medium text-muted-foreground truncate">{s.source || "document"}</span>
+                <span className="shrink-0 text-[10px] px-1.5 py-0.5 rounded bg-primary/10 text-primary/80 font-medium">
+                  {(s.score * 100).toFixed(0)}%
+                </span>
+              </div>
+              <p className="text-muted-foreground/80 leading-relaxed line-clamp-2">{s.content}</p>
+              {s.entities && s.entities.length > 0 && (
+                <div className="flex flex-wrap gap-1 mt-1">
+                  {s.entities.slice(0, 4).map((e, ei) => (
+                    <span key={ei} className="text-[9px] px-1 py-0.5 rounded bg-purple-500/15 text-purple-300 border border-purple-500/20">
+                      {e}
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
 
 function attachmentIcon(filename: string) {
   const ext = filename.split(".").pop()?.toLowerCase() ?? "";
@@ -191,6 +243,10 @@ interface Props {
   isThinking?: boolean;
   onEdit?: (messageId: string, newContent: string) => void;
   onRegenerate?: () => void;
+  /** Avatar for the persona this conversation belongs to (shown instead of the Bot icon). */
+  personaAvatar?: string;
+  /** Persona name shown as tooltip on the avatar. */
+  personaName?: string;
 }
 
 // ── Artifact parsing ──────────────────────────────────────────────────────────
@@ -376,7 +432,7 @@ export const markdownComponents: React.ComponentProps<typeof ReactMarkdown>["com
 
 // ── Main component ────────────────────────────────────────────────────────────
 
-export function MessageBubble({ message, liveThinking, isThinking, onEdit, onRegenerate }: Props) {
+export function MessageBubble({ message, liveThinking, isThinking, onEdit, onRegenerate, personaAvatar, personaName }: Props) {
   const [copied, setCopied] = useState(false);
   const [thinkOpen, setThinkOpen] = useState(false);
   const [editing, setEditing] = useState(false);
@@ -459,16 +515,39 @@ export function MessageBubble({ message, liveThinking, isThinking, onEdit, onReg
   return (
     <div className={cn("flex gap-3 group", isUser && "flex-row-reverse")}>
       {/* Avatar */}
-      <div className={cn(
-        "flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center",
-        isUser ? "bg-primary" : "bg-secondary"
-      )}>
-        {isUser ? (
+      {isUser ? (
+        <div className="flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center bg-primary">
           <User className="w-4 h-4 text-primary-foreground" />
+        </div>
+      ) : personaAvatar ? (
+        personaAvatar.startsWith("data:") ? (
+          <img
+            src={personaAvatar}
+            alt={personaName ?? "Persona"}
+            title={personaName}
+            className="flex-shrink-0 w-8 h-8 rounded-full object-cover ring-1 ring-border"
+          />
         ) : (
+          <div
+            title={personaName}
+            className="flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center bg-secondary text-base leading-none ring-1 ring-border"
+          >
+            {personaAvatar}
+          </div>
+        )
+      ) : personaName ? (
+        // Persona without an avatar — show initials
+        <div
+          title={personaName}
+          className="flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center bg-primary/10 text-primary text-xs font-semibold ring-1 ring-border"
+        >
+          {personaName.split(" ").map((w) => w[0]).slice(0, 2).join("").toUpperCase()}
+        </div>
+      ) : (
+        <div className="flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center bg-secondary">
           <Bot className="w-4 h-4 text-foreground" />
-        )}
-      </div>
+        </div>
+      )}
 
       <div className={cn("flex flex-col max-w-[80%] gap-1.5", isUser && "items-end")}>
 
@@ -606,6 +685,15 @@ export function MessageBubble({ message, liveThinking, isThinking, onEdit, onReg
                     ))}
                   </div>
                 )}
+
+                {/* RAG source attribution */}
+                {!isUser && (() => {
+                  const meta = message.metadata as any;
+                  const sources: RagSource[] | undefined = meta?.sources;
+                  return sources && sources.length > 0
+                    ? <SourcesCard sources={sources} />
+                    : null;
+                })()}
               </>
             )}
 

@@ -11,6 +11,7 @@ import {
   Wrench,
   Layers,
   ScrollText,
+  UserCircle2,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useModelStore } from "@/stores/modelStore";
@@ -18,9 +19,12 @@ import { useServerStore } from "@/stores/serverStore";
 import { useSkillsStore } from "@/stores/skillsStore";
 import { useLogStore } from "@/stores/logStore";
 
+const codingEnabled = import.meta.env.VITE_ENABLE_CODING === "true";
+
 const navItems = [
   { to: "/chat",      icon: MessageSquare, label: "Chat" },
-  { to: "/coding",    icon: Code2,         label: "Coding" },
+  { to: "/personas",  icon: UserCircle2,   label: "Personas" },
+  ...(codingEnabled ? [{ to: "/coding", icon: Code2, label: "Coding" }] : []),
   { to: "/flows",     icon: GitBranch,     label: "Flows" },
   { to: "/skills",    icon: Wrench,        label: "Skills" },
   { to: "/models",    icon: Cpu,           label: "Models" },

@@ -112,6 +112,31 @@ pub async fn test_db_connection(
     test_connection_internal(&connection_string, &db_type).await
 }
 
+/// Public inner function usable from both Tauri commands and HTTP handlers.
+pub async fn test_connection_inner(connection_string: &str, db_type: &str) -> Result<bool, String> {
+    test_connection_internal(connection_string, db_type).await
+}
+
+/// Execute a query given a raw connection string — public for HTTP handlers.
+pub async fn execute_query_inner(conn_str: &str, db_type: &str, query: &str) -> Result<crate::models::QueryResult, String> {
+    match db_type.to_lowercase().as_str() {
+        "mongodb" => {
+            let connector = crate::db::mongodb::MongoConnector::connect(conn_str)
+                .await.map_err(|e| e.to_string())?;
+            let parts: Vec<&str> = query.splitn(2, ' ').collect();
+            let coll_path: Vec<&str> = parts[0].splitn(2, '.').collect();
+            if coll_path.len() != 2 {
+                return Err("MongoDB format: <database>.<collection> {filter}".to_string());
+            }
+            let filter = if parts.len() > 1 { parts[1] } else { "{}" };
+            connector.run_query(coll_path[0], coll_path[1], filter, 100).await.map_err(|e| e.to_string())
+        }
+        other => {
+            crate::db::sql::execute_sql_query(conn_str, query, other).await.map_err(|e| e.to_string())
+        }
+    }
+}
+
 async fn test_connection_internal(connection_string: &str, db_type: &str) -> Result<bool, String> {
     match db_type.to_lowercase().as_str() {
         "mongodb" => {

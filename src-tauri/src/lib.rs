@@ -1,12 +1,14 @@
 #![allow(dead_code)]
 
 mod agent;
+mod api_server;
 mod code_runner;
 mod coding;
 mod commands;
 mod db;
 mod engine;
 mod flow;
+mod graph_rag;
 mod hf;
 mod jobs;
 mod models;
@@ -16,8 +18,11 @@ mod skills;
 mod skills_init;
 mod state;
 mod web_fetch;
+mod whisper;
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use tokio::sync::broadcast;
 use tokio::sync::Mutex as TokioMutex;
 use tauri::Manager;
 
@@ -25,11 +30,14 @@ use crate::agent::AgentRuntime;
 use crate::coding::CodingRuntime;
 use crate::db::AppDb;
 use crate::engine::EngineManager;
+use crate::graph_rag::{GraphRagClient, GraphRagManager};
 use crate::models::AppSettings;
+use crate::rag::embeddings::Embedder;
 use crate::rag::RagService;
 use crate::server::LlamaServerManager;
 use crate::skills::SkillsManager;
 use crate::state::AppState;
+use crate::whisper::WhisperManager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -73,6 +81,10 @@ pub fn run() {
 
             // Initialize engine
             let engine = Arc::new(EngineManager::new());
+
+            // Embedder delegates to the running llama-server /v1/embeddings endpoint.
+            // No heavy ONNX/fastembed dependency — zero startup cost.
+            let embedder = Arc::new(Embedder::new(settings.clone()));
 
             // Initialize RAG service (uses tokio Mutex so guard is Send across awaits)
             let rag = RagService::new(db.clone(), &data_dir)
@@ -139,6 +151,48 @@ pub fn run() {
                 });
             }
 
+            // Initialize GraphRAG sidecar manager
+            let graph_rag = Arc::new(TokioMutex::new(GraphRagManager::new()));
+
+            // Determine GraphRAG startup settings
+            let (gr_enabled, gr_auto_start, gr_port, gr_vector_db, gr_server_path) = {
+                let s = settings.lock().unwrap();
+                (
+                    s.graph_rag_enabled,
+                    s.graph_rag_auto_start,
+                    s.graph_rag_port,
+                    s.graph_rag_vector_db.clone(),
+                    s.graph_rag_server_path.clone(),
+                )
+            };
+
+            let graph_rag_client: Option<Arc<GraphRagClient>> = if gr_enabled && gr_auto_start {
+                let data_dir_gr = data_dir.clone();
+                let embedding_model_name_gr = settings.lock().unwrap().embedding_model.clone();
+                let gr_arc = graph_rag.clone();
+
+                tauri::async_runtime::spawn(async move {
+                    let mut mgr = gr_arc.lock().await;
+                    if let Err(e) = mgr.start(
+                        &data_dir_gr,
+                        gr_port,
+                        &gr_vector_db,
+                        &embedding_model_name_gr,
+                        gr_server_path.as_deref(),
+                    ) {
+                        log::warn!("GraphRAG auto-start failed: {}", e);
+                    } else if let Err(e) = mgr.wait_ready(30).await {
+                        log::warn!("GraphRAG did not become ready: {}", e);
+                    }
+                });
+
+                Some(Arc::new(GraphRagClient::new(gr_port)))
+            } else if gr_enabled {
+                Some(Arc::new(GraphRagClient::new(gr_port)))
+            } else {
+                None
+            };
+
             // Initialize SkillsManager
             let workspace_dir = data_dir.join("agent_workspace");
             let tools_dir = {
@@ -181,18 +235,52 @@ pub fn run() {
                 });
             }
 
-            // Register app state
-            app.manage(AppState {
+            // Create broadcast channel for HTTP/SSE event bridge
+            let (event_tx, _) = broadcast::channel::<crate::api_server::events::ApiEvent>(1024);
+            let log_buffer = Arc::new(Mutex::new(VecDeque::<serde_json::Value>::new()));
+            let app_handle = app.handle().clone();
+
+            // Determine whether to spawn the mobile API server
+            let mobile_api_enabled = settings.lock().unwrap().mobile_api_enabled;
+            let mobile_api_port = settings.lock().unwrap().mobile_api_port;
+
+            // Whisper sidecar manager
+            let whisper = Arc::new(TokioMutex::new(WhisperManager::new()));
+
+            let app_state = AppState {
                 db,
                 engine,
+                embedder,
                 rag,
                 agent_runtime,
                 coding_runtime,
                 settings,
                 server,
                 skills,
+                graph_rag,
+                graph_rag_client,
+                whisper,
                 data_dir,
-            });
+                event_tx,
+                log_buffer,
+                app_handle,
+            };
+
+            // Create an Arc<AppState> for the HTTP server (shares all Arc fields)
+            let state_arc: Arc<AppState> = Arc::new(app_state.clone());
+
+            // Register the plain AppState for existing Tauri commands (State<'_, AppState>)
+            app.manage(app_state);
+            // Also manage Arc<AppState> so HTTP handlers can retrieve it via app.state::<Arc<AppState>>()
+            app.manage(state_arc.clone());
+
+            // Spawn the mobile API bridge if enabled in settings
+            if mobile_api_enabled {
+                let arc_for_task = state_arc.clone();
+                tauri::async_runtime::spawn(async move {
+                    crate::api_server::start_api_server(arc_for_task, mobile_api_port).await;
+                });
+            }
 
             Ok(())
         })
@@ -218,6 +306,13 @@ pub fn run() {
             commands::rag::delete_rag_collection,
             commands::rag::ingest_document,
             commands::rag::search_rag,
+            commands::rag::set_collection_retrieval_mode,
+            commands::rag::reindex_collection,
+            graph_rag::commands::graph_rag_status,
+            graph_rag::commands::start_graph_rag,
+            graph_rag::commands::stop_graph_rag,
+            graph_rag::commands::ingest_to_graph,
+            graph_rag::commands::query_graph,
             commands::agents::run_agent_task,
             commands::agents::list_agent_tasks,
             commands::agents::delete_agent_task,
@@ -277,6 +372,17 @@ pub fn run() {
             commands::gallery::list_all_gallery_images,
             commands::gallery::delete_gallery_image,
             commands::gallery::save_upload_to_gallery,
+            commands::whisper::get_whisper_status,
+            commands::whisper::start_whisper_server,
+            commands::whisper::stop_whisper_server,
+            commands::whisper::transcribe_audio,
+            commands::whisper::download_whisper_binary,
+            commands::whisper::download_whisper_model,
+            commands::personas::list_personas,
+            commands::personas::get_persona,
+            commands::personas::create_persona,
+            commands::personas::update_persona,
+            commands::personas::delete_persona,
         ])
         .run(tauri::generate_context!())
         .expect("error while running XandSuite");

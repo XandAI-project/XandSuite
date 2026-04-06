@@ -13,14 +13,20 @@ import {
   Loader2,
   Globe,
   ImageIcon,
+  AlertCircle,
+  Mic,
+  MicOff,
 } from "lucide-react";
+import { useNavigate } from "react-router-dom";
 import { readFile } from "@tauri-apps/plugin-fs";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { useChatStore } from "@/stores/chatStore";
 import { useSkillsStore } from "@/stores/skillsStore";
 import { useServerStore } from "@/stores/serverStore";
+import { useSettingsStore } from "@/stores/settingsStore";
 import { Button } from "@/components/ui/button";
 import { cn, bytesToBase64, imageMime } from "@/lib/utils";
+import { useVoiceInput } from "@/hooks/useVoiceInput";
 import type { RagCollection } from "@/lib/tauri";
 
 interface Props {
@@ -82,29 +88,38 @@ export function InputBar({ collections, disabled }: Props) {
   const [useRag, setUseRag] = useState(false);
   const [selectedCollection, setSelectedCollection] = useState<string | null>(null);
   const [attachedPaths, setAttachedPaths] = useState<string[]>([]);
+  const [showNoModelModal, setShowNoModelModal] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const imagePreviews = useImagePreviews(attachedPaths);
   const sendMessage = useChatStore((s) => s.sendMessage);
   const { tools, skillsEnabled, toggleSkills, clearToolSteps } = useSkillsStore();
+  const navigate = useNavigate();
 
   // Server / model state
   const { status, isStarting, engineMode, lastModel, startServer } = useServerStore();
 
+  // Voice input (Whisper)
+  const { settings } = useSettingsStore();
+  const whisperEnabled = settings?.whisper_enabled ?? false;
+  const [micError, setMicError] = useState<string | null>(null);
+
   // True when we're in local mode and the server isn't up yet
   const needsLoad = engineMode === "local" && !status.running && !isStarting;
-  // Can actually start a model (has a previously-used model path)
-  const canLoad = needsLoad && !!lastModel;
 
   const handleSend = async (overrideText?: string) => {
     const text = (overrideText ?? content).trim();
     if (!text || disabled) return;
+
+    // Gate: model must be running (or we're in remote mode)
+    if (needsLoad) {
+      setShowNoModelModal(true);
+      return;
+    }
+
     clearToolSteps();
-    if (!overrideText) {
-      // Only clear the textarea when sending normally (not from handleLoadAndSend)
-      setContent("");
-      if (textareaRef.current) {
-        textareaRef.current.style.height = "auto";
-      }
+    setContent("");
+    if (textareaRef.current) {
+      textareaRef.current.style.height = "auto";
     }
     const pathsToSend = [...attachedPaths];
     setAttachedPaths([]);
@@ -117,31 +132,61 @@ export function InputBar({ collections, disabled }: Props) {
     );
   };
 
+  // Ref so the onTranscript closure can call stopVoice even though stopVoice
+  // is only available after useVoiceInput returns.
+  const stopVoiceRef = useRef<() => void>(() => {});
+
+  const { active: recording, transcribing, start: startVoice, stop: stopVoice } = useVoiceInput({
+    onTranscript: (text) => {
+      handleSend(text);
+      // Stop listening after sending — 3 s of silence means the turn is done
+      stopVoiceRef.current();
+    },
+    onTranscribing: () => {},
+    onError: (msg) => setMicError(msg),
+    language: settings?.whisper_language ?? "auto",
+    silenceMs: 3000,
+  });
+
+  // Keep ref current so the stale onTranscript closure always stops the right session
+  stopVoiceRef.current = stopVoice;
+
   const handleLoadAndSend = async () => {
     const text = content.trim();
     if (!text || !lastModel) return;
 
-    // Clear textarea immediately so the user sees activity
+    setShowNoModelModal(false);
     setContent("");
     if (textareaRef.current) {
       textareaRef.current.style.height = "auto";
     }
 
-    // Start the server; startServer sets isStarting = true while loading
     await startServer(lastModel);
 
-    // Only send if server started without errors
     const { error } = useServerStore.getState();
     if (!error) {
       await handleSend(text);
     }
   };
 
+  const handleMic = async () => {
+    setMicError(null);
+    if (recording) {
+      stopVoice();
+    } else {
+      try {
+        await startVoice();
+      } catch (e) {
+        setMicError(e instanceof Error ? e.message : "Microphone access denied");
+      }
+    }
+  };
+
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      if (canLoad) {
-        handleLoadAndSend();
+      if (needsLoad) {
+        setShowNoModelModal(true);
       } else {
         handleSend();
       }
@@ -198,50 +243,13 @@ export function InputBar({ collections, disabled }: Props) {
   };
 
   // ── Derived send-button props ──────────────────────────────────────────────
-  type BtnVariant = "default" | "outline" | "secondary" | "ghost" | "link" | "destructive";
-
-  const sendButtonProps: {
-    onClick: () => void;
-    disabled: boolean;
-    title?: string;
-    variant?: BtnVariant;
-    wide?: boolean;
-  } = (() => {
-    if (isStarting) {
-      return {
-        onClick: () => {},
-        disabled: true,
-        title: "Starting model…",
-        wide: true,
-      };
-    }
-    if (needsLoad && lastModel) {
-      return {
-        onClick: () => handleLoadAndSend(),
-        disabled: !content.trim() || !!disabled,
-        title: `Load ${basename(lastModel)} and send`,
-        wide: true,
-      };
-    }
-    if (needsLoad && !lastModel) {
-      return {
-        onClick: () => {},
-        disabled: true,
-        title: "No model selected — go to Settings to load a model",
-        wide: true,
-      };
-    }
-    // Normal send — wrap in arrow function so no SyntheticEvent is passed as overrideText
-    return {
-      onClick: () => handleSend(),
-      disabled: !content.trim() || !!disabled,
-    };
-  })();
+  const sendButtonIsStarting = isStarting;
+  const sendButtonDisabled = !content.trim() || !!disabled || isStarting;
 
   const placeholderText = (() => {
     if (disabled) return "Generating…";
     if (isStarting) return "Starting model…";
-    if (needsLoad) return "Type your message — click Load Model to start the AI";
+    if (needsLoad) return "Type a message — press Enter or Send to load a model first";
     return "Message XandSuite… (Enter to send, Shift+Enter for newline)";
   })();
 
@@ -381,17 +389,64 @@ export function InputBar({ collections, disabled }: Props) {
       {/* Input area */}
       <div className={cn(
         "flex items-end gap-2 rounded-xl border border-border bg-card px-3 py-2 transition-colors",
-        !disabled && "focus-within:border-primary/50"
+        disabled ? "opacity-60" : "focus-within:border-primary/50"
       )}>
-        {/* Attach button */}
-        <button
-          className="shrink-0 text-muted-foreground hover:text-foreground transition-colors pb-1"
-          onClick={handleAttach}
-          disabled={disabled || isStarting}
-          title="Attach file"
-        >
-          <Paperclip className="w-4 h-4" />
-        </button>
+        {/* Action buttons group */}
+        <div className="flex items-center gap-1 pb-1 shrink-0">
+          {/* Attach button */}
+          <button
+            className={cn(
+              "flex items-center justify-center w-7 h-7 rounded-lg transition-all",
+              disabled || isStarting
+                ? "text-muted-foreground/40 cursor-not-allowed"
+                : "text-muted-foreground hover:text-foreground hover:bg-secondary"
+            )}
+            onClick={handleAttach}
+            disabled={disabled || isStarting}
+            title="Attach file"
+          >
+            <Paperclip className="w-4 h-4" />
+          </button>
+
+          {/* Microphone button — only shown when Whisper is enabled in settings */}
+          {whisperEnabled && (
+            <button
+              className={cn(
+                "relative flex items-center justify-center w-7 h-7 rounded-lg transition-all",
+                disabled || isStarting
+                  ? "text-muted-foreground/40 cursor-not-allowed"
+                  : transcribing
+                  ? "text-primary bg-primary/10 cursor-wait"
+                  : recording
+                  ? "text-red-400 bg-red-500/10 hover:bg-red-500/20"
+                  : "text-muted-foreground hover:text-foreground hover:bg-secondary"
+              )}
+              onClick={handleMic}
+              disabled={disabled || isStarting}
+              title={
+                disabled
+                  ? "Cannot use voice while generating"
+                  : transcribing
+                  ? "Transcribing…"
+                  : recording
+                  ? "Voice active — speak freely. Click to stop."
+                  : "Start voice input"
+              }
+            >
+              {transcribing ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : recording ? (
+                <>
+                  <MicOff className="w-4 h-4" />
+                  {/* Live recording indicator dot */}
+                  <span className="absolute top-0.5 right-0.5 w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse" />
+                </>
+              ) : (
+                <Mic className="w-4 h-4" />
+              )}
+            </button>
+          )}
+        </div>
 
         <textarea
           ref={textareaRef}
@@ -405,43 +460,92 @@ export function InputBar({ collections, disabled }: Props) {
           rows={1}
         />
 
-        {/* Send / Load Model button */}
-        {sendButtonProps.wide ? (
-          <Button
-            size="sm"
-            className={cn(
-              "shrink-0 h-8 gap-1.5 px-3 text-xs font-medium transition-all",
-              canLoad && !isStarting && "bg-primary hover:bg-primary/90"
-            )}
-            onClick={sendButtonProps.onClick}
-            disabled={sendButtonProps.disabled}
-            title={sendButtonProps.title}
-            variant={sendButtonProps.variant}
-          >
-            {isStarting ? (
-              <>
-                <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                Starting…
-              </>
-            ) : (
-              <>
-                <Cpu className="w-3.5 h-3.5" />
-                Load Model
-              </>
-            )}
-          </Button>
-        ) : (
-          <Button
-            size="icon"
-            className="h-8 w-8 shrink-0"
-            onClick={sendButtonProps.onClick}
-            disabled={sendButtonProps.disabled}
-            title={sendButtonProps.title}
-          >
-            <Send className="w-3.5 h-3.5" />
-          </Button>
-        )}
+        {/* Send button — always visible; shows spinner while model is starting */}
+        <Button
+          size="icon"
+          className="h-8 w-8 shrink-0"
+          onClick={() => sendButtonIsStarting ? undefined : handleSend()}
+          disabled={sendButtonDisabled}
+          title={
+            isStarting ? "Starting model…" :
+            needsLoad ? "Load a model first" :
+            "Send message"
+          }
+        >
+          {sendButtonIsStarting
+            ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            : <Send className="w-3.5 h-3.5" />
+          }
+        </Button>
       </div>
+      {/* Mic error toast */}
+      {micError && (
+        <div className="mt-1 text-xs text-destructive flex items-center gap-1 px-1">
+          <AlertCircle className="w-3 h-3 shrink-0" />
+          <span>{micError}</span>
+          <button className="ml-auto opacity-60 hover:opacity-100" onClick={() => setMicError(null)}>
+            <X className="w-3 h-3" />
+          </button>
+        </div>
+      )}
+
+      {/* No-model modal */}
+      {showNoModelModal && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+          onClick={() => setShowNoModelModal(false)}
+        >
+          <div
+            className="bg-card border border-border rounded-2xl shadow-2xl p-6 w-full max-w-sm mx-4 flex flex-col gap-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Header */}
+            <div className="flex items-start gap-3">
+              <div className="p-2 rounded-xl bg-yellow-500/10 border border-yellow-500/20 shrink-0">
+                <AlertCircle className="w-5 h-5 text-yellow-400" />
+              </div>
+              <div>
+                <h3 className="font-semibold text-base">No model loaded</h3>
+                <p className="text-sm text-muted-foreground mt-0.5">
+                  {lastModel
+                    ? `Load "${basename(lastModel)}" to start chatting, or browse models to choose a different one.`
+                    : "You need to select and load a model before you can send messages."}
+                </p>
+              </div>
+            </div>
+
+            {/* Actions */}
+            <div className="flex flex-col gap-2">
+              {lastModel && (
+                <Button
+                  className="w-full gap-2"
+                  onClick={handleLoadAndSend}
+                  disabled={isStarting}
+                >
+                  {isStarting ? (
+                    <><Loader2 className="w-4 h-4 animate-spin" /> Starting…</>
+                  ) : (
+                    <><Cpu className="w-4 h-4" /> Load &amp; Send</>
+                  )}
+                </Button>
+              )}
+              <Button
+                variant="outline"
+                className="w-full"
+                onClick={() => { setShowNoModelModal(false); navigate("/models"); }}
+              >
+                Browse Models
+              </Button>
+              <button
+                className="text-xs text-muted-foreground hover:text-foreground transition-colors text-center py-1"
+                onClick={() => setShowNoModelModal(false)}
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

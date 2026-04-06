@@ -22,7 +22,7 @@ interface ChatStore {
   fetchConversations: () => Promise<void>;
   openConversation: (id: string) => Promise<void>;
   /** Create a new conversation with an auto-generated "New chat" title. */
-  createConversation: (systemPrompt?: string) => Promise<Conversation>;
+  createConversation: (systemPrompt?: string, personaId?: string) => Promise<Conversation>;
   /** Update the title and/or system prompt of a conversation. */
   updateConversation: (id: string, title?: string, systemPrompt?: string) => Promise<void>;
   deleteConversation: (id: string) => Promise<void>;
@@ -83,10 +83,11 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     }
   },
 
-  createConversation: async (systemPrompt?: string) => {
+  createConversation: async (systemPrompt?: string, personaId?: string) => {
     const conv = await invoke<Conversation>("create_conversation", {
       title: "New chat",
       systemPrompt: systemPrompt || null,
+      personaId: personaId || null,
     });
     await get().fetchConversations();
     return conv;

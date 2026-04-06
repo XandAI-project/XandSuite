@@ -138,8 +138,33 @@ impl RemoteEngine {
 
     /// Convert `(role, content)` history pairs into `ChatMessage` structs.
     /// Handles special "tool::<id>" roles produced by the agentic executor.
+    ///
+    /// Jinja chat templates (e.g. llama-server) require that all `system`
+    /// messages appear at the very beginning of the conversation.  When the
+    /// user adds or changes a system prompt mid-session the messages array
+    /// can violate this rule and the server returns a 500.  We normalise the
+    /// list here: all system messages are collected, their contents are merged
+    /// (newline-separated) into a single entry, and that entry is hoisted to
+    /// position 0 before the rest of the history.
     fn build_messages(messages: Vec<(String, String)>) -> Vec<ChatMessage> {
-        messages
+        // Hoist system messages to the front.
+        let mut system_parts: Vec<String> = Vec::new();
+        let mut non_system: Vec<(String, String)> = Vec::new();
+        for (role, content) in messages {
+            if role == "system" {
+                system_parts.push(content);
+            } else {
+                non_system.push((role, content));
+            }
+        }
+
+        let mut ordered: Vec<(String, String)> = Vec::new();
+        if !system_parts.is_empty() {
+            ordered.push(("system".to_string(), system_parts.join("\n\n")));
+        }
+        ordered.extend(non_system);
+
+        ordered
             .into_iter()
             .map(|(role, content)| {
                 if let Some(tool_id) = role.strip_prefix("tool::") {

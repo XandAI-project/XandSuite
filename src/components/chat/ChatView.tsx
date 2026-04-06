@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Plus, Trash2, MessageSquare, Settings2, Check, X, Images } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
 import { useChatStore } from "@/stores/chatStore";
@@ -6,6 +6,7 @@ import { useRagStore } from "@/stores/ragStore";
 import { useSkillsStore } from "@/stores/skillsStore";
 import { useArtifactStore } from "@/stores/artifactStore";
 import { useGalleryStore } from "@/stores/galleryStore";
+import { usePersonaStore } from "@/stores/personaStore";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { MessageBubble } from "./MessageBubble";
@@ -49,6 +50,15 @@ export function ChatView() {
     setActiveConversation: setGalleryConversation,
   } = useGalleryStore();
 
+  const { personas, fetchPersonas } = usePersonaStore();
+
+  // Resolve the active persona for the current conversation (for avatar display)
+  const activePersona = useMemo(() => {
+    const pid = activeConversation?.persona_id;
+    if (!pid) return null;
+    return personas.find((p) => p.id === pid) ?? null;
+  }, [activeConversation?.persona_id, personas]);
+
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   // System prompt editor state
@@ -62,6 +72,7 @@ export function ChatView() {
     fetchConversations();
     fetchCollections();
     fetchTools();
+    fetchPersonas();
   }, []);
 
   useEffect(() => {
@@ -339,6 +350,8 @@ export function ChatView() {
                             message={message}
                             liveThinking={message.id === "streaming" ? streamingThinking : undefined}
                             isThinking={message.id === "streaming" ? isThinking : undefined}
+                            personaAvatar={activePersona?.avatar}
+                            personaName={activePersona?.name}
                             onEdit={
                               message.role === "user" && !isStreaming
                                 ? (id, content) => editAndResend(id, content)

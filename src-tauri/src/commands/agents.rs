@@ -110,6 +110,93 @@ pub async fn run_agent_task(
     Ok(task)
 }
 
+/// Public inner function so the HTTP handler can call the same logic without AppState wrapper.
+pub async fn run_agent_task_inner(
+    app: AppHandle,
+    title: String,
+    description: String,
+    state: &AppState,
+) -> Result<String, String> {
+    let task_id = Uuid::new_v4().to_string();
+    let now = Utc::now();
+
+    {
+        let db = state.db.lock().unwrap();
+        db.conn
+            .execute(
+                r#"INSERT INTO agent_tasks
+                   (id, title, description, status, steps_json, created_at, completed_at, result)
+                   VALUES (?1, ?2, ?3, 'running', '[]', ?4, NULL, NULL)"#,
+                params![task_id, title, description, now.to_rfc3339()],
+            )
+            .map_err(|e| e.to_string())?;
+    }
+
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    state.agent_runtime.register_cancel(&task_id, cancel_flag.clone());
+
+    let (event_tx_inner, mut event_rx) = mpsc::channel::<AgentEvent>(128);
+    let app_clone = app.clone();
+    tokio::spawn(async move {
+        while let Some(event) = event_rx.recv().await {
+            let event_type = match event.event_type {
+                AgentEventType::Started => "started",
+                AgentEventType::LlmGenerating => "llm_generating",
+                AgentEventType::Thought => "thought",
+                AgentEventType::Action => "action",
+                AgentEventType::Observation => "observation",
+                AgentEventType::Completed => "completed",
+                AgentEventType::Failed => "failed",
+                AgentEventType::Cancelled => "cancelled",
+            };
+            let _ = app_clone.emit("agent_event", json!({
+                "task_id": event.task_id,
+                "event_type": event_type,
+                "payload": event.payload,
+            }));
+            // Also broadcast to HTTP SSE clients
+            use tauri::Manager;
+            if let Some(st) = app_clone.try_state::<crate::state::AppState>() {
+                let _ = st.event_tx.send(crate::api_server::events::ApiEvent::AgentEvent {
+                    task_id: event.task_id.clone(),
+                    event_type: event_type.to_string(),
+                    payload: event.payload.clone(),
+                });
+            }
+        }
+    });
+
+    let _ = event_tx_inner.send(AgentEvent {
+        task_id: task_id.clone(),
+        event_type: AgentEventType::Started,
+        payload: json!({ "task": description }),
+    }).await;
+
+    let runtime = state.agent_runtime.clone();
+    let engine = state.engine.clone();
+    let tid = task_id.clone();
+    tokio::spawn(async move {
+        if let Err(e) = runtime.run_loop(
+            crate::models::AgentTask {
+                id: tid.clone(),
+                title: title.chars().take(80).collect(),
+                description,
+                status: crate::models::AgentTaskStatus::Running,
+                steps: vec![],
+                created_at: now,
+                completed_at: None,
+                result: None,
+            },
+            engine,
+            event_tx_inner,
+        ).await {
+            log::error!("Agent runtime error for task {}: {}", tid, e);
+        }
+    });
+
+    Ok(task_id)
+}
+
 /// List recent agent tasks (newest first).
 #[tauri::command]
 pub fn list_agent_tasks(state: State<'_, AppState>) -> Result<Vec<AgentTask>, String> {

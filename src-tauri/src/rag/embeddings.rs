@@ -1,21 +1,125 @@
+use anyhow::{Context, Result};
+use serde::Deserialize;
+use std::sync::{Arc, Mutex};
 
-pub const EMBEDDING_DIM: usize = 384;
+use crate::models::AppSettings;
 
-/// Generate a mock embedding for text.
-/// In production this should call the llama.cpp embeddings API.
-pub fn embed_text_mock(text: &str) -> Vec<f32> {
-    let mut embedding = vec![0.0f32; EMBEDDING_DIM];
+/// Default embedding dimension used for zero-vector fallbacks.
+/// 768 covers nomic-embed-text-v1.5 and most BGE models; the real
+/// dimension is whatever llama-server returns for the loaded model.
+pub const DEFAULT_DIM: usize = 768;
 
-    for (i, ch) in text.chars().enumerate().take(EMBEDDING_DIM * 4) {
-        let idx = (ch as usize + i * 31) % EMBEDDING_DIM;
-        embedding[idx] += 1.0 / (1.0 + i as f32);
-    }
-
-    normalize(&mut embedding);
-    embedding
+/// Generates embeddings by calling the running llama-server (or any
+/// OpenAI-compatible server) at `POST /v1/embeddings`.
+///
+/// Zero external deps — uses the `reqwest` client already in the project.
+/// If the server is not running the methods return gracefully degraded
+/// zero vectors so ingestion/search still work (just less semantically accurate).
+pub struct Embedder {
+    client: reqwest::Client,
+    /// Live reference to settings so the server URL is always up-to-date.
+    settings: Arc<Mutex<AppSettings>>,
+    /// Fallback zero-vector length (updated on first successful call).
+    pub dim: usize,
 }
 
-/// L2-normalize a vector in place.
+impl Embedder {
+    pub fn new(settings: Arc<Mutex<AppSettings>>) -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_default(),
+            settings,
+            dim: DEFAULT_DIM,
+        }
+    }
+
+    /// Embed a single text string.
+    pub async fn embed_one(&self, text: &str) -> Result<Vec<f32>> {
+        let mut results = self.embed_batch(&[text]).await?;
+        results
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("Server returned no embeddings"))
+    }
+
+    /// Embed a batch of texts, returning one vector per input.
+    pub async fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let (url, model) = self.server_params();
+        let endpoint = format!("{}/v1/embeddings", url.trim_end_matches('/'));
+
+        let body = serde_json::json!({
+            "model": model,
+            "input": texts,
+        });
+
+        let resp = self
+            .client
+            .post(&endpoint)
+            .json(&body)
+            .send()
+            .await
+            .context("Failed to reach embedding server")?
+            .error_for_status()
+            .context("Embedding server returned error status")?;
+
+        let parsed: EmbeddingResponse = resp
+            .json()
+            .await
+            .context("Failed to parse embedding response")?;
+
+        // Sort by index so the output order matches input order
+        let mut data = parsed.data;
+        data.sort_by_key(|e| e.index);
+
+        let mut embeddings: Vec<Vec<f32>> = data.into_iter().map(|e| e.embedding).collect();
+
+        // Normalise each vector in-place for cosine similarity
+        for emb in embeddings.iter_mut() {
+            normalize(emb);
+        }
+
+        Ok(embeddings)
+    }
+
+    /// Return (server_base_url, model_name) from current settings.
+    fn server_params(&self) -> (String, String) {
+        let s = self.settings.lock().unwrap();
+        let url = if s.default_engine_mode == "remote" {
+            s.remote_server_url
+                .clone()
+                .unwrap_or_else(|| format!("http://127.0.0.1:{}", s.llama_server_port))
+        } else {
+            format!("http://127.0.0.1:{}", s.llama_server_port)
+        };
+        // embedding_model is used as the model field in the request.
+        // llama-server ignores it (uses whatever is loaded), but Ollama
+        // and other OpenAI-compatible servers use it to route the request.
+        let model = s.embedding_model.clone();
+        (url, model)
+    }
+}
+
+// ── OpenAI /v1/embeddings response types ─────────────────────────────────────
+
+#[derive(Deserialize)]
+struct EmbeddingResponse {
+    data: Vec<EmbeddingObject>,
+}
+
+#[derive(Deserialize)]
+struct EmbeddingObject {
+    embedding: Vec<f32>,
+    index: usize,
+}
+
+// ── Math helpers ──────────────────────────────────────────────────────────────
+
+/// L2-normalise a vector in place.
 pub fn normalize(v: &mut Vec<f32>) {
     let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm > 1e-10 {
@@ -25,36 +129,7 @@ pub fn normalize(v: &mut Vec<f32>) {
     }
 }
 
-/// Cosine similarity between two normalized vectors.
+/// Cosine similarity between two (pre-normalised) vectors.
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_embedding_dimension() {
-        let emb = embed_text_mock("hello world");
-        assert_eq!(emb.len(), EMBEDDING_DIM);
-    }
-
-    #[test]
-    fn test_embedding_normalized() {
-        let emb = embed_text_mock("test text");
-        let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!((norm - 1.0).abs() < 0.01 || norm < 0.01);
-    }
-
-    #[test]
-    fn test_similar_texts_closer() {
-        let a = embed_text_mock("the cat sat on the mat");
-        let b = embed_text_mock("the cat sat on the mat again");
-        let c = embed_text_mock("quantum physics and black holes");
-        let sim_close = cosine_similarity(&a, &b);
-        let sim_far = cosine_similarity(&a, &c);
-        // With mock embeddings this is approximate
-        assert!(sim_close >= 0.0 && sim_far >= 0.0);
-    }
 }

@@ -6,11 +6,54 @@ export type { UnlistenFn };
 
 // Type-safe wrappers for Tauri commands
 
+// ── Personas ────────────────────────────────────────────────────────────────
+
+export interface Persona {
+  id: string;
+  name: string;
+  description?: string;
+  /** Base64 data-URL, a single emoji, or undefined for initials fallback. */
+  avatar?: string;
+  system_prompt: string;
+  /** Preferred model path/id — undefined means use the app default. */
+  model_id?: string;
+  rag_collection_ids: string[];
+  memory_enabled: boolean;
+  /** Auto-created RAG collection for per-persona memory. */
+  memory_collection_id?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CreatePersonaInput {
+  name: string;
+  description?: string;
+  avatar?: string;
+  system_prompt: string;
+  model_id?: string;
+  rag_collection_ids: string[];
+  memory_enabled: boolean;
+}
+
+export interface UpdatePersonaInput {
+  id: string;
+  name?: string;
+  description?: string;
+  avatar?: string;
+  system_prompt?: string;
+  model_id?: string;
+  rag_collection_ids?: string[];
+  memory_enabled?: boolean;
+}
+
+// ── Conversations ────────────────────────────────────────────────────────────
+
 export interface Conversation {
   id: string;
   title: string;
   model_id: string | null;
   system_prompt: string | null;
+  persona_id?: string | null;
   created_at: string;
   updated_at: string;
   messages: Message[];
@@ -20,6 +63,7 @@ export interface ConversationSummary {
   id: string;
   title: string;
   model_id: string | null;
+  persona_id?: string | null;
   created_at: string;
   updated_at: string;
   message_count: number;
@@ -95,6 +139,10 @@ export interface RagCollection {
   description: string | null;
   document_count: number;
   created_at: string;
+  /** "hybrid" (BM25+cosine) or "graph" (GraphRAG sidecar). */
+  retrieval_mode: "hybrid" | "graph";
+  /** True once the graphrag-server sidecar has finished indexing this collection. */
+  graph_indexed: boolean;
 }
 
 export interface MemoryEntry {
@@ -368,6 +416,44 @@ export interface AppSettings {
   comfyui_clip_name: string | null;
   /** VAE model filename for UNETLoader workflows (auto-detected when null). */
   comfyui_vae_name: string | null;
+  /** Enable the mobile HTTP/SSE bridge server. */
+  mobile_api_enabled: boolean;
+  /** Port for the mobile bridge server (default 3847). */
+  mobile_api_port: number;
+  /** Optional bearer token for mobile API authentication. */
+  mobile_api_token: string | null;
+  // ── Knowledge Base ────────────────────────────────────────────────────────
+  /** fastembed model name for semantic embeddings (default: nomic-embed-text-v1.5). */
+  embedding_model: string;
+  /** Weight for cosine similarity in hybrid BM25+cosine search (0–1, default 0.6). */
+  hybrid_cosine_weight: number;
+  // ── GraphRAG sidecar ──────────────────────────────────────────────────────
+  /** Enable the GraphRAG sidecar process. */
+  graph_rag_enabled: boolean;
+  /** Port for the graphrag-server sidecar (default 3848). */
+  graph_rag_port: number;
+  /** Override path to the graphrag-server binary. */
+  graph_rag_server_path: string | null;
+  /** Auto-start the sidecar when the app launches. */
+  graph_rag_auto_start: boolean;
+  /** Vector DB backend for graphrag-server ("lancedb" | "qdrant"). */
+  graph_rag_vector_db: string;
+
+  // User profile — collected during onboarding
+  onboarding_completed: boolean;
+  user_name?: string;
+  user_profession?: string;
+  user_about?: string;
+
+  // Voice input (whisper.cpp)
+  whisper_enabled: boolean;
+  whisper_model_path?: string;
+  /** BCP-47 language code, or "auto" for auto-detection. */
+  whisper_language: string;
+  /** Port the whisper-server sidecar listens on (default 8765). */
+  whisper_port: number;
+  /** Which whisper-server build to download: "cpu" or "cuda". */
+  whisper_variant: string;
 }
 
 export interface ComfyWorkflow {

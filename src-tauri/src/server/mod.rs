@@ -160,9 +160,51 @@ impl LlamaServerManager {
 
             if stderr_text.is_empty() {
                 return Err(anyhow::anyhow!("{}", e));
-            } else {
-                return Err(anyhow::anyhow!("{}\n\nllama-server output:\n{}", e, stderr_text.trim()));
             }
+
+            // Detect common known-bad patterns and surface a much more helpful message.
+            let trimmed = stderr_text.trim();
+
+            if trimmed.contains("unknown model architecture") {
+                // Extract the architecture name from the log line (e.g. "unknown model architecture: 'gemma4'")
+                let arch = trimmed
+                    .find("unknown model architecture: '")
+                    .map(|pos| {
+                        let rest = &trimmed[pos + "unknown model architecture: '".len()..];
+                        rest.split('\'').next().unwrap_or("unknown")
+                    })
+                    .unwrap_or("unknown");
+                return Err(anyhow::anyhow!(
+                    "Model architecture '{}' is not supported by your current llama-server binary.\n\
+                     Your binary is too old to run this model. Please update it:\n\
+                     Settings → Local Server → Update Binary\n\n\
+                     llama-server output:\n{}",
+                    arch, trimmed
+                ));
+            }
+
+            if trimmed.contains("CUDA error") || trimmed.contains("failed to initialize CUDA") {
+                return Err(anyhow::anyhow!(
+                    "CUDA initialisation failed. Make sure your GPU drivers are up to date and \
+                     the correct CUDA variant of llama-server is installed.\n\n\
+                     llama-server output:\n{}",
+                    trimmed
+                ));
+            }
+
+            if trimmed.contains("failed to load model") || trimmed.contains("error loading model") {
+                return Err(anyhow::anyhow!(
+                    "llama-server could not load the model file. The file may be corrupt, \
+                     incomplete, or in an unsupported format.\n\n\
+                     llama-server output:\n{}",
+                    trimmed
+                ));
+            }
+
+            // Generic fallback with full output
+            return Err(anyhow::anyhow!(
+                "Server error: {}\n\nllama-server output:\n{}", e, trimmed
+            ));
         }
 
         log::info!("llama-server ready on port {}", port);

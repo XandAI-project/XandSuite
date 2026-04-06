@@ -5,7 +5,7 @@ use tauri::{AppHandle, Emitter, State};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::models::{Conversation, InferenceConfig, Message, MessageRole, MEMORY_COLLECTION_ID};
+use crate::models::{Conversation, InferenceConfig, Message, MessageRole, Persona, MEMORY_COLLECTION_ID};
 use crate::skills::SkillsExecutor;
 use crate::state::AppState;
 
@@ -19,10 +19,18 @@ struct RawArtifact {
 }
 
 /// Extract artifact tags from LLM output.
-/// Returns one entry per complete `<artifact ...>...</artifact>` block.
+/// Returns one entry per `<artifact ...>...</artifact>` block.
+///
+/// Also handles the case where the LLM started an artifact tag but the stream
+/// was cut short before the closing `</artifact>` — in that scenario the entire
+/// remainder of the response is treated as the artifact content.
 fn extract_artifacts(text: &str) -> Vec<RawArtifact> {
     // (?si) = dotall (. matches \n) + case-insensitive
     let Ok(artifact_re) = regex::Regex::new(r"(?si)<artifact\s+([^>]*)>(.*?)</artifact>") else {
+        return vec![];
+    };
+    // Fallback: opening tag present but closing tag missing (truncated stream)
+    let Ok(partial_re) = regex::Regex::new(r"(?si)<artifact\s+([^>]*)>(.*)\z") else {
         return vec![];
     };
     // Also accept single-quoted attribute values
@@ -33,40 +41,55 @@ fn extract_artifacts(text: &str) -> Vec<RawArtifact> {
         return vec![];
     };
 
-    artifact_re
+    let parse_raw = |attr_str: &str, raw: String| -> RawArtifact {
+        // Strip markdown code fences the LLM sometimes wraps inside tags
+        let content = fence_re
+            .captures(&raw)
+            .map(|fc| fc[1].trim().to_string())
+            .unwrap_or(raw);
+
+        let mut title = "Untitled".to_string();
+        let mut artifact_type = "text".to_string();
+        let mut language: Option<String> = None;
+
+        for am in attr_re.captures_iter(attr_str) {
+            match &am[1] {
+                "title"    => title = am[2].to_string(),
+                "type"     => artifact_type = am[2].to_string(),
+                "language" => language = Some(am[2].to_string()),
+                _ => {}
+            }
+        }
+
+        // If the LLM used type="text" but also specified a language,
+        // it almost certainly meant type="code".
+        if artifact_type == "text" && language.is_some() {
+            artifact_type = "code".to_string();
+        }
+
+        RawArtifact { title, artifact_type, language, content }
+    };
+
+    // Primary pass — complete closed tags
+    let mut results: Vec<RawArtifact> = artifact_re
         .captures_iter(text)
-        .map(|cap| {
-            let attr_str = cap[1].to_string();
+        .map(|cap| parse_raw(&cap[1].to_string(), cap[2].trim().to_string()))
+        .collect();
+
+    // Fallback pass — if nothing matched and the response contains an unclosed
+    // <artifact ...> opening tag (e.g. stream cut before </artifact>), recover
+    // the content anyway so the artifact is not silently lost.
+    if results.is_empty() {
+        if let Some(cap) = partial_re.captures(text) {
             let raw = cap[2].trim().to_string();
-
-            // Strip markdown code fences the LLM sometimes wraps inside tags
-            let content = fence_re
-                .captures(&raw)
-                .map(|fc| fc[1].trim().to_string())
-                .unwrap_or(raw);
-
-            let mut title = "Untitled".to_string();
-            let mut artifact_type = "text".to_string();
-            let mut language: Option<String> = None;
-
-            for am in attr_re.captures_iter(&attr_str) {
-                match &am[1] {
-                    "title"    => title = am[2].to_string(),
-                    "type"     => artifact_type = am[2].to_string(),
-                    "language" => language = Some(am[2].to_string()),
-                    _ => {}
-                }
+            if !raw.is_empty() {
+                log::warn!("[artifacts] Unclosed <artifact> tag detected — recovering content ({} chars)", raw.len());
+                results.push(parse_raw(&cap[1].to_string(), raw));
             }
+        }
+    }
 
-            // If the LLM used type="text" but also specified a language,
-            // it almost certainly meant type="code".
-            if artifact_type == "text" && language.is_some() {
-                artifact_type = "code".to_string();
-            }
-
-            RawArtifact { title, artifact_type, language, content }
-        })
-        .collect()
+    results
 }
 
 #[derive(Serialize)]
@@ -74,6 +97,7 @@ pub struct ConversationSummary {
     pub id: String,
     pub title: String,
     pub model_id: Option<String>,
+    pub persona_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     pub message_count: u64,
@@ -83,7 +107,7 @@ pub struct ConversationSummary {
 pub fn list_conversations(state: State<'_, AppState>) -> Result<Vec<ConversationSummary>, String> {
     let db = state.db.lock().unwrap();
     let mut stmt = db.conn.prepare(
-        r#"SELECT c.id, c.title, c.model_id, c.created_at, c.updated_at,
+        r#"SELECT c.id, c.title, c.model_id, c.persona_id, c.created_at, c.updated_at,
            COUNT(m.id) as msg_count
            FROM conversations c
            LEFT JOIN messages m ON m.conversation_id = c.id
@@ -96,9 +120,10 @@ pub fn list_conversations(state: State<'_, AppState>) -> Result<Vec<Conversation
             id: row.get(0)?,
             title: row.get(1)?,
             model_id: row.get(2)?,
-            created_at: row.get(3)?,
-            updated_at: row.get(4)?,
-            message_count: row.get(5)?,
+            persona_id: row.get(3)?,
+            created_at: row.get(4)?,
+            updated_at: row.get(5)?,
+            message_count: row.get(6)?,
         })
     })
     .map_err(|e| e.to_string())?
@@ -112,19 +137,34 @@ pub fn list_conversations(state: State<'_, AppState>) -> Result<Vec<Conversation
 pub fn create_conversation(
     title: String,
     system_prompt: Option<String>,
+    persona_id: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Conversation, String> {
     let id = Uuid::new_v4().to_string();
     let now = Utc::now().to_rfc3339();
 
+    // If a persona is provided, resolve its system_prompt to store on the conversation.
+    let effective_system_prompt: Option<String> = if let Some(ref pid) = persona_id {
+        let db = state.db.lock().unwrap();
+        let persona_sp: Option<String> = db.conn.query_row(
+            "SELECT system_prompt FROM personas WHERE id = ?1",
+            params![pid],
+            |row| row.get(0),
+        ).ok();
+        // Persona system prompt takes precedence; fall back to caller-supplied one.
+        persona_sp.or(system_prompt.clone())
+    } else {
+        system_prompt.clone()
+    };
+
     let db = state.db.lock().unwrap();
     db.conn.execute(
-        "INSERT INTO conversations (id, title, model_id, system_prompt, created_at, updated_at)
-         VALUES (?1, ?2, NULL, ?3, ?4, ?4)",
-        params![id, title, system_prompt, now],
+        "INSERT INTO conversations (id, title, model_id, system_prompt, persona_id, created_at, updated_at)
+         VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?5)",
+        params![id, title, effective_system_prompt, persona_id, now],
     ).map_err(|e| e.to_string())?;
 
-    let messages = match &system_prompt {
+    let messages = match &effective_system_prompt {
         Some(sp) if !sp.is_empty() => {
             let msg_id = Uuid::new_v4().to_string();
             db.conn.execute(
@@ -150,7 +190,8 @@ pub fn create_conversation(
         id,
         title,
         model_id: None,
-        system_prompt,
+        system_prompt: effective_system_prompt,
+        persona_id,
         created_at: Utc::now(),
         updated_at: Utc::now(),
         messages,
@@ -207,14 +248,15 @@ pub fn get_conversation(
 ) -> Result<Conversation, String> {
     let db = state.db.lock().unwrap();
 
-    let (id, title, model_id, system_prompt) = db.conn.query_row(
-        "SELECT id, title, model_id, system_prompt FROM conversations WHERE id = ?1",
+    let (id, title, model_id, system_prompt, persona_id) = db.conn.query_row(
+        "SELECT id, title, model_id, system_prompt, persona_id FROM conversations WHERE id = ?1",
         params![conversation_id],
         |row| Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
             row.get::<_, Option<String>>(2)?,
             row.get::<_, Option<String>>(3)?,
+            row.get::<_, Option<String>>(4)?,
         )),
     ).map_err(|e| format!("Conversation not found: {}", e))?;
 
@@ -255,6 +297,7 @@ pub fn get_conversation(
         title,
         model_id,
         system_prompt,
+        persona_id,
         created_at: Utc::now(),
         updated_at: Utc::now(),
         messages,
@@ -295,8 +338,9 @@ pub fn truncate_conversation(
     Ok(())
 }
 
-#[tauri::command]
-pub async fn send_message(
+/// Inner implementation — accepts `&AppState` so it can be called from both the
+/// Tauri command (which passes `&*state`) and the HTTP handler (which passes `&*arc`).
+pub async fn send_message_inner(
     app: AppHandle,
     conversation_id: String,
     content: String,
@@ -304,7 +348,7 @@ pub async fn send_message(
     rag_collection_id: Option<String>,
     use_skills: Option<bool>,
     attachments: Option<Vec<String>>,
-    state: State<'_, AppState>,
+    state: &AppState,
 ) -> Result<String, String> {
     let user_msg_id = Uuid::new_v4().to_string();
     let now = Utc::now().to_rfc3339();
@@ -415,8 +459,8 @@ pub async fn send_message(
         ).map_err(|e| e.to_string())?;
     }
 
-    // Build message history (sync, short lock)
-    let mut messages: Vec<(String, String)> = {
+    // Build message history (sync, short lock); also read persona_id for this conversation.
+    let (mut messages, conversation_persona_id): (Vec<(String, String)>, Option<String>) = {
         let db = state.db.lock().unwrap();
         let mut stmt = db.conn.prepare(
             "SELECT role, content FROM messages WHERE conversation_id = ?1 ORDER BY rowid ASC"
@@ -427,7 +471,47 @@ pub async fn send_message(
         .map_err(|e| e.to_string())?
         .filter_map(|r| r.ok())
         .collect();
-        rows
+        let pid: Option<String> = db.conn.query_row(
+            "SELECT persona_id FROM conversations WHERE id = ?1",
+            params![conversation_id],
+            |row| row.get(0),
+        ).ok().flatten();
+        (rows, pid)
+    };
+
+    // Resolve persona (if any) for this conversation. The persona's model and
+    // RAG collections will be used unless the caller already set them explicitly.
+    let active_persona: Option<Persona> = if let Some(ref pid) = conversation_persona_id {
+        let db = state.db.lock().unwrap();
+        let result = db.conn.query_row(
+            "SELECT id, name, description, avatar, system_prompt, model_id,
+                    rag_collection_ids, memory_enabled, memory_collection_id,
+                    created_at, updated_at
+             FROM personas WHERE id = ?1",
+            params![pid],
+            |row| {
+                let rag_json: String = row.get(6)?;
+                let rag_ids: Vec<String> =
+                    serde_json::from_str(&rag_json).unwrap_or_default();
+                let mem_int: i64 = row.get(7)?;
+                Ok(Persona {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    description: row.get(2)?,
+                    avatar: row.get(3)?,
+                    system_prompt: row.get(4)?,
+                    model_id: row.get(5)?,
+                    rag_collection_ids: rag_ids,
+                    memory_enabled: mem_int != 0,
+                    memory_collection_id: row.get(8)?,
+                    created_at: row.get(9)?,
+                    updated_at: row.get(10)?,
+                })
+            },
+        );
+        result.ok()
+    } else {
+        None
     };
 
     // Helper: emit an app_log event AND write to the Rust log in one call.
@@ -441,11 +525,27 @@ pub async fn send_message(
                 "warn"  => log::warn!("{}", message),
                 _       => log::info!("{}", message),
             }
-            let _ = app_ref.emit("app_log", serde_json::json!({
+            let ts = chrono::Utc::now().to_rfc3339();
+            let payload = serde_json::json!({
                 "level": level,
                 "message": message,
-                "ts": chrono::Utc::now().to_rfc3339(),
-            }));
+                "ts": ts,
+            });
+            let _ = app_ref.emit("app_log", &payload);
+            // Forward to HTTP SSE and persist in log buffer
+            use tauri::Manager;
+            if let Some(st) = app_ref.try_state::<crate::state::AppState>() {
+                let _ = st.event_tx.send(crate::api_server::events::ApiEvent::AppLog {
+                    level: level.to_string(),
+                    message: message.clone(),
+                    ts: ts.clone(),
+                });
+                let mut buf = st.log_buffer.lock().unwrap();
+                if buf.len() >= 1000 {
+                    buf.pop_front();
+                }
+                buf.push_back(payload.clone());
+            }
         }
     };
 
@@ -540,10 +640,40 @@ pub async fn send_message(
         }
     }
 
-    // Inject RAG context if enabled
+    // Inject RAG context if enabled; capture sources for later attribution.
+    // If a persona is active and has default RAG collections, also inject those.
+    let mut pending_rag_sources: Vec<serde_json::Value> = vec![];
     if use_rag {
+        let cosine_weight = state.settings.lock().unwrap().hybrid_cosine_weight;
+        let graph_client_ref = state.graph_rag_client.as_ref().map(|c| c.as_ref());
         let rag = state.rag.lock().await;
-        let context = rag.build_rag_context(&content, rag_collection_id.as_deref());
+
+        // Determine effective collection: prefer the caller-supplied one, then
+        // fall back to the first persona collection (if any).
+        let effective_collection = rag_collection_id.as_deref().or_else(|| {
+            active_persona
+                .as_ref()
+                .and_then(|p| p.rag_collection_ids.first().map(|s| s.as_str()))
+        });
+
+        let (context, rag_sources) = rag
+            .build_rag_context_routed(
+                &content,
+                effective_collection,
+                &state.embedder,
+                cosine_weight,
+                graph_client_ref,
+            )
+            .await;
+        pending_rag_sources = rag_sources
+            .iter()
+            .map(|r| serde_json::json!({
+                "content": &r.chunk.content[..r.chunk.content.len().min(180)],
+                "source": r.chunk.metadata.get("source").and_then(|v| v.as_str()).unwrap_or(""),
+                "score": r.score,
+                "entities": r.entities,
+            }))
+            .collect();
         if !context.is_empty() {
             // Instruct the model to ground its answer in the retrieved excerpts.
             // This is appended to an existing system message or inserted as a new
@@ -570,8 +700,9 @@ pub async fn send_message(
     // Inject relevant memories from the internal memory collection.
     let memory_enabled = state.settings.lock().unwrap().memory_enabled;
     if memory_enabled {
+        let cosine_weight = state.settings.lock().unwrap().hybrid_cosine_weight;
         let rag = state.rag.lock().await;
-        let memories = rag.search(&content, Some(MEMORY_COLLECTION_ID), 5);
+        let memories = rag.search(&content, Some(MEMORY_COLLECTION_ID), 5, &state.embedder, cosine_weight).await;
         if !memories.is_empty() {
             let block = memories
                 .iter()
@@ -585,6 +716,67 @@ pub async fn send_message(
                 sys_msg.1 = format!("{}\n\n{}", memory_instruction, sys_msg.1);
             } else {
                 messages.insert(0, ("system".to_string(), memory_instruction));
+            }
+        }
+    }
+
+    // Inject user profile context gathered during onboarding.
+    // Only prepended when at least one profile field has been set, and only
+    // to the system message so it is never persisted to the conversation DB.
+    {
+        let (uname, uprof, uabout) = {
+            let s = state.settings.lock().unwrap();
+            (s.user_name.clone(), s.user_profession.clone(), s.user_about.clone())
+        };
+        let has_profile = uname.is_some() || uprof.is_some() || uabout.is_some();
+        if has_profile {
+            let mut profile_parts: Vec<String> = Vec::new();
+            if let Some(n) = &uname   { profile_parts.push(format!("The user's name is {}.", n)); }
+            if let Some(p) = &uprof   { profile_parts.push(format!("They work as a {}.", p)); }
+            if let Some(a) = &uabout  { profile_parts.push(format!("About them: {}", a)); }
+            let profile_block = format!(
+                "## User context\n{}\nUse this to personalise your responses where appropriate.",
+                profile_parts.join(" ")
+            );
+            if let Some(sys_msg) = messages.iter_mut().find(|(role, _)| role == "system") {
+                sys_msg.1 = format!("{}\n\n{}", profile_block, sys_msg.1);
+            } else {
+                messages.insert(0, ("system".to_string(), profile_block));
+            }
+        }
+    }
+
+    // Inject persona system prompt at the front of the system message so the
+    // persona's personality always leads the instruction stack.
+    if let Some(ref persona) = active_persona {
+        if !persona.system_prompt.is_empty() {
+            if let Some(sys_msg) = messages.iter_mut().find(|(role, _)| role == "system") {
+                sys_msg.1 = format!("{}\n\n{}", persona.system_prompt, sys_msg.1);
+            } else {
+                messages.insert(0, ("system".to_string(), persona.system_prompt.clone()));
+            }
+        }
+        // If persona memory is enabled, inject memories from its dedicated collection.
+        if persona.memory_enabled {
+            if let Some(ref mem_cid) = persona.memory_collection_id {
+                let cosine_weight = state.settings.lock().unwrap().hybrid_cosine_weight;
+                let rag = state.rag.lock().await;
+                let memories = rag.search(&content, Some(mem_cid.as_str()), 5, &state.embedder, cosine_weight).await;
+                if !memories.is_empty() {
+                    let block = memories
+                        .iter()
+                        .map(|m| format!("- {}", m.chunk.content))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let memory_instruction = format!(
+                        "Relevant memories for this persona:\n{}", block
+                    );
+                    if let Some(sys_msg) = messages.iter_mut().find(|(role, _)| role == "system") {
+                        sys_msg.1 = format!("{}\n\n{}", memory_instruction, sys_msg.1);
+                    } else {
+                        messages.insert(0, ("system".to_string(), memory_instruction));
+                    }
+                }
             }
         }
     }
@@ -668,7 +860,8 @@ pub async fn send_message(
             </artifact>\n\
             Supported Chart.js types: bar, line, pie, doughnut, radar, polarArea, scatter, bubble.\n\
             For documents combining text and images, use type=\"html\" with inline base64 images or public URLs.\n\
-            Never put markdown code fences (```) inside artifact tags — write the raw content directly.\n\n\
+            Never put markdown code fences (```) inside artifact tags — write the raw content directly.\n\
+            CRITICAL: Always close the tag with </artifact> on its own line immediately after the content ends.\n\n\
             ## Editing existing artifacts\n\
             When the user asks you to modify, fix, update, improve, or change an artifact you \
             previously created — you MUST output the COMPLETE revised artifact inside a new \
@@ -845,16 +1038,27 @@ pub async fn send_message(
 
     let thinking_prefix = crate::engine::remote::THINKING_PREFIX;
     let mut full_response = String::new();
+    let mut full_thinking = String::new();
     while let Some(token) = token_rx.recv().await {
         if token == "[DONE]" {
             break;
         }
         if let Some(thought) = token.strip_prefix(thinking_prefix) {
-            // Thinking/reasoning token — send on a separate event channel
+            // Thinking/reasoning token — accumulate for artifact fallback, send on separate event channel
+            full_thinking.push_str(thought);
             let _ = app.emit("chat_thinking", serde_json::json!({
                 "conversation_id": conv_id,
                 "token": thought,
             }));
+            {
+                use tauri::Manager;
+                if let Some(st) = app.try_state::<crate::state::AppState>() {
+                    let _ = st.event_tx.send(crate::api_server::events::ApiEvent::ChatThinking {
+                        conversation_id: conv_id.clone(),
+                        token: thought.to_string(),
+                    });
+                }
+            }
         } else {
             full_response.push_str(&token);
             let _ = app.emit("chat_token", serde_json::json!({
@@ -862,6 +1066,16 @@ pub async fn send_message(
                 "token": token,
                 "done": false
             }));
+            {
+                use tauri::Manager;
+                if let Some(st) = app.try_state::<crate::state::AppState>() {
+                    let _ = st.event_tx.send(crate::api_server::events::ApiEvent::ChatToken {
+                        conversation_id: conv_id.clone(),
+                        token: token.clone(),
+                        done: false,
+                    });
+                }
+            }
         }
     }
 
@@ -871,12 +1085,17 @@ pub async fn send_message(
     // ── Persist assistant message ─────────────────────────────────────────────
     let assistant_msg_id = Uuid::new_v4().to_string();
     let now2 = Utc::now().to_rfc3339();
+    let assistant_metadata = if !pending_rag_sources.is_empty() {
+        Some(serde_json::json!({ "sources": pending_rag_sources }).to_string())
+    } else {
+        None
+    };
     {
         let db = state.db.lock().unwrap();
         match db.conn.execute(
-            "INSERT INTO messages (id, conversation_id, role, content, created_at)
-             VALUES (?1, ?2, 'assistant', ?3, ?4)",
-            params![assistant_msg_id, conversation_id, full_response, now2],
+            "INSERT INTO messages (id, conversation_id, role, content, created_at, metadata)
+             VALUES (?1, ?2, 'assistant', ?3, ?4, ?5)",
+            params![assistant_msg_id, conversation_id, full_response, now2, assistant_metadata],
         ) {
             Ok(_) => emit_log("info", format!(
                 "[chat] Assistant message saved (id={}, {} chars)", assistant_msg_id, full_response.len()
@@ -893,6 +1112,7 @@ pub async fn send_message(
     // them into the internal memory collection.  Does NOT block the response.
     if memory_enabled && !full_response.is_empty() {
         let rag_arc = state.rag.clone();
+        let embedder_arc = state.embedder.clone();
         let user_msg_clone = content.clone();
         let assistant_msg_clone = full_response.clone();
         let conv_id_mem = conversation_id.clone();
@@ -946,7 +1166,7 @@ pub async fn send_message(
                 if fact.is_empty() || fact.eq_ignore_ascii_case("none") {
                     continue;
                 }
-                if let Err(e) = rag.ingest_text(MEMORY_COLLECTION_ID, fact, &conv_id_mem) {
+                if let Err(e) = rag.ingest_text(MEMORY_COLLECTION_ID, fact, &conv_id_mem, &embedder_arc).await {
                     log::warn!("Memory ingest error: {}", e);
                 }
             }
@@ -957,11 +1177,23 @@ pub async fn send_message(
     // Done *before* emitting done:true so the frontend re-fetch always sees them.
     {
         emit_log("info", format!(
-            "[artifacts] Response complete ({} chars). Scanning for artifact tags…",
-            full_response.len()
+            "[artifacts] Response complete ({} chars, {} thinking chars). Scanning for artifact tags…",
+            full_response.len(), full_thinking.len()
         ));
 
-        let artifacts = extract_artifacts(&full_response);
+        let mut artifacts = extract_artifacts(&full_response);
+        if artifacts.is_empty() && !full_thinking.is_empty() {
+            // The model placed the artifact inside its reasoning/thinking block.
+            // Extract it from there so it is never silently discarded.
+            let thinking_artifacts = extract_artifacts(&full_thinking);
+            if !thinking_artifacts.is_empty() {
+                emit_log("info", format!(
+                    "[artifacts] None in response body; found {} artifact(s) inside thinking block",
+                    thinking_artifacts.len()
+                ));
+                artifacts = thinking_artifacts;
+            }
+        }
         emit_log("info", format!("[artifacts] Found {} artifact(s)", artifacts.len()));
 
         if !artifacts.is_empty() {
@@ -999,6 +1231,15 @@ pub async fn send_message(
                                 "conversation_id": conversation_id,
                                 "artifact_id": eid,
                             }));
+                            {
+                                use tauri::Manager;
+                                if let Some(st) = app.try_state::<crate::state::AppState>() {
+                                    let _ = st.event_tx.send(crate::api_server::events::ApiEvent::ArtifactUpdated {
+                                        conversation_id: conversation_id.clone(),
+                                        artifact_id: eid.clone(),
+                                    });
+                                }
+                            }
                         }
                         Err(e) => emit_log("error", format!(
                             "[artifacts] UPDATE failed for '{}': {}", art.title, e
@@ -1048,8 +1289,33 @@ pub async fn send_message(
         "token": "",
         "done": true
     }));
+    {
+        use tauri::Manager;
+        if let Some(st) = app.try_state::<crate::state::AppState>() {
+            let _ = st.event_tx.send(crate::api_server::events::ApiEvent::ChatToken {
+                conversation_id: conv_id.clone(),
+                token: String::new(),
+                done: true,
+            });
+        }
+    }
 
     Ok(assistant_msg_id)
+}
+
+/// Tauri command wrapper — delegates to `send_message_inner`.
+#[tauri::command]
+pub async fn send_message(
+    app: AppHandle,
+    conversation_id: String,
+    content: String,
+    use_rag: bool,
+    rag_collection_id: Option<String>,
+    use_skills: Option<bool>,
+    attachments: Option<Vec<String>>,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    send_message_inner(app, conversation_id, content, use_rag, rag_collection_id, use_skills, attachments, &*state).await
 }
 
 /// Persist the tool-call steps recorded during a response into the

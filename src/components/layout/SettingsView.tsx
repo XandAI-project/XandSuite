@@ -1,11 +1,14 @@
 import { useEffect, useState } from "react";
-import { Save, Loader2, Download, CheckCircle2, Plus, Trash2, Pencil, ChevronDown, ChevronRight } from "lucide-react";
+import { Save, Loader2, Download, CheckCircle2, Plus, Trash2, Pencil, ChevronDown, ChevronRight, Mic, Play, Square } from "lucide-react";
 import { invoke } from "@/lib/tauri";
+import { listen } from "@tauri-apps/api/event";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 import { Progress } from "@/components/ui/progress";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { useServerStore } from "@/stores/serverStore";
+import { useSettingsStore } from "@/stores/settingsStore";
 import { cn } from "@/lib/utils";
 import type { AppSettings, ComfyWorkflow } from "@/lib/tauri";
 
@@ -19,6 +22,10 @@ export function SettingsView() {
     status: serverStatus, gpuInfo, isDownloading, downloadProgress, error: serverError,
     fetchStatus, detectGpu, downloadBinary, listenToProgress,
   } = useServerStore();
+
+  // Keep the global settings store in sync so other components (e.g. InputBar)
+  // always reflect the latest saved values.
+  const { fetchSettings: syncSettingsStore } = useSettingsStore();
 
   useEffect(() => {
     invoke<AppSettings>("get_settings").then(setSettings).catch(console.error);
@@ -34,6 +41,9 @@ export function SettingsView() {
     setIsSaving(true);
     try {
       await invoke("save_settings", { settings });
+      // Refresh the global store so InputBar and other consumers
+      // see the new values (e.g. whisper_enabled) immediately.
+      await syncSettingsStore();
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
     } catch (e) {
@@ -451,6 +461,80 @@ export function SettingsView() {
             </Field>
           </Section>
 
+          {/* Voice Input (Whisper) */}
+          <Section title="Voice Input (Whisper)">
+            <Field
+              label="Enable voice input"
+              description="Show a microphone button in the chat input bar. Audio is transcribed locally using whisper-server."
+            >
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  className="w-4 h-4 accent-primary"
+                  checked={settings.whisper_enabled ?? false}
+                  onChange={(e) => update("whisper_enabled", e.target.checked)}
+                />
+                <span className="text-sm flex items-center gap-1.5">
+                  <Mic className="w-3.5 h-3.5" /> Enable microphone / voice input
+                </span>
+              </label>
+            </Field>
+
+            {(settings.whisper_enabled) && (
+              <>
+                {/* Binary download — same pattern as llama-server */}
+                <Field
+                  label="whisper-server binary"
+                  description="The whisper.cpp server binary. Downloaded from ggml-org/whisper.cpp (latest release)."
+                >
+                  <WhisperBinaryRow
+                    variant={settings.whisper_variant ?? "cpu"}
+                    onVariantChange={(v) => update("whisper_variant", v)}
+                  />
+                </Field>
+
+                {/* Model */}
+                <Field
+                  label="Whisper model"
+                  description="GGML model file for transcription. 'base' is a good balance of speed and accuracy."
+                >
+                  <WhisperModelRow
+                    currentPath={settings.whisper_model_path}
+                    onPathChange={(p) => update("whisper_model_path", p)}
+                  />
+                </Field>
+
+                {/* Language */}
+                <Field
+                  label="Language"
+                  description="BCP-47 language code (e.g. 'en', 'pt', 'es'). Use 'auto' for automatic detection."
+                >
+                  <Input
+                    value={settings.whisper_language ?? "auto"}
+                    onChange={(e) => update("whisper_language", e.target.value)}
+                    placeholder="auto"
+                    className="w-32"
+                  />
+                </Field>
+
+                {/* Port */}
+                <Field label="Server port" description="Port the whisper-server sidecar listens on (default 8765).">
+                  <Input
+                    type="number"
+                    value={settings.whisper_port ?? 8765}
+                    onChange={(e) => update("whisper_port", Number(e.target.value))}
+                    className="w-28"
+                  />
+                </Field>
+
+                {/* Server control */}
+                <Field label="Server" description="Start or stop the whisper-server sidecar manually.">
+                  <WhisperServerControl />
+                </Field>
+              </>
+            )}
+          </Section>
+
           {/* Image Generation */}
           <Section title="Image Generation (ComfyUI)">
             <Field
@@ -600,6 +684,190 @@ export function SettingsView() {
                 />
                 <span className="text-sm">Enable conversation memory</span>
               </label>
+            </Field>
+          </Section>
+
+          {/* Knowledge Base */}
+          <Section title="Knowledge Base">
+            <Field
+              label="Embedding model"
+              description="Model name sent to the running llama-server (or Ollama) /v1/embeddings endpoint. llama-server ignores this field and uses whatever model is currently loaded; Ollama uses it to route to the right model."
+            >
+              <select
+                className="w-full bg-background border border-input rounded-md px-3 py-2 text-sm"
+                value={settings.embedding_model ?? "nomic-embed-text-v1.5"}
+                onChange={(e) => update("embedding_model", e.target.value)}
+              >
+                <option value="nomic-embed-text-v1.5">nomic-embed-text-v1.5 (768d, recommended)</option>
+                <option value="nomic-embed-text-v1.5-quantized">nomic-embed-text-v1.5 quantized (768d)</option>
+                <option value="all-MiniLM-L6-v2">all-MiniLM-L6-v2 (384d, lightweight)</option>
+                <option value="bge-base-en-v1.5">BGE-Base-EN v1.5 (768d)</option>
+                <option value="bge-large-en-v1.5">BGE-Large-EN v1.5 (1024d)</option>
+                <option value="bge-small-en-v1.5">BGE-Small-EN v1.5 (384d)</option>
+                <option value="multilingual-e5-large">Multilingual E5 Large (1024d, multilingual)</option>
+                <option value="multilingual-e5-base">Multilingual E5 Base (384d, multilingual)</option>
+                <option value="mxbai-embed-large-v1">MxBai Embed Large v1 (1024d)</option>
+              </select>
+            </Field>
+            <Field
+              label={`Hybrid cosine weight: ${(settings.hybrid_cosine_weight ?? 0.6).toFixed(2)}`}
+              description="Fraction of the final relevance score coming from semantic (cosine) similarity. The remainder comes from BM25 keyword search. 0 = BM25 only, 1 = cosine only."
+            >
+              <input
+                type="range"
+                min={0}
+                max={1}
+                step={0.05}
+                value={settings.hybrid_cosine_weight ?? 0.6}
+                onChange={(e) => update("hybrid_cosine_weight", parseFloat(e.target.value))}
+                className="w-full accent-primary"
+              />
+            </Field>
+
+            {/* GraphRAG sub-section */}
+            <div className="mt-2 border border-border rounded-lg overflow-hidden">
+              <div className="flex items-center gap-3 px-4 py-3 bg-secondary/30">
+                <label className="flex items-center gap-2 cursor-pointer flex-1">
+                  <input
+                    type="checkbox"
+                    className="w-4 h-4 accent-primary"
+                    checked={settings.graph_rag_enabled ?? false}
+                    onChange={(e) => update("graph_rag_enabled", e.target.checked)}
+                  />
+                  <span className="text-sm font-medium">Enable GraphRAG sidecar</span>
+                </label>
+                <span className="text-[10px] text-muted-foreground/60">
+                  Advanced knowledge graph retrieval for interconnected documents
+                </span>
+              </div>
+              {settings.graph_rag_enabled && (
+                <div className="p-4 space-y-3 border-t border-border">
+                  <Field
+                    label="Port"
+                    description="Port the graphrag-server sidecar listens on (default 3848)."
+                  >
+                    <Input
+                      type="number"
+                      min={1024}
+                      max={65535}
+                      value={settings.graph_rag_port ?? 3848}
+                      onChange={(e) => update("graph_rag_port", parseInt(e.target.value) || 3848)}
+                    />
+                  </Field>
+                  <Field
+                    label="Auto-start"
+                    description="Start the graphrag-server sidecar automatically when the app launches."
+                  >
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        className="w-4 h-4 accent-primary"
+                        checked={settings.graph_rag_auto_start ?? false}
+                        onChange={(e) => update("graph_rag_auto_start", e.target.checked)}
+                      />
+                      <span className="text-sm">Auto-start with app</span>
+                    </label>
+                  </Field>
+                  <Field
+                    label="Vector database"
+                    description="Backend vector store used by graphrag-server. lancedb is embedded (no extra process)."
+                  >
+                    <select
+                      className="w-full bg-background border border-input rounded-md px-3 py-2 text-sm"
+                      value={settings.graph_rag_vector_db ?? "lancedb"}
+                      onChange={(e) => update("graph_rag_vector_db", e.target.value)}
+                    >
+                      <option value="lancedb">LanceDB (embedded, recommended)</option>
+                      <option value="qdrant">Qdrant (requires separate Qdrant instance)</option>
+                    </select>
+                  </Field>
+                  <Field
+                    label="Server binary path (optional)"
+                    description="Override path to the graphrag-server binary. Leave empty to use the default location in your app data directory."
+                  >
+                    <Input
+                      placeholder="e.g. C:\tools\graphrag-server.exe"
+                      value={settings.graph_rag_server_path || ""}
+                      onChange={(e) => update("graph_rag_server_path", e.target.value || null)}
+                    />
+                  </Field>
+                </div>
+              )}
+            </div>
+          </Section>
+
+          {/* Mobile API */}
+          <Section title="Mobile API Bridge">
+            <Field
+              label="Enable mobile API server"
+              description="Starts an embedded HTTP/SSE server so the XandSuite mobile app can connect to this desktop instance over your local network."
+            >
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  className="w-4 h-4 accent-primary"
+                  checked={settings.mobile_api_enabled ?? false}
+                  onChange={(e) => update("mobile_api_enabled", e.target.checked)}
+                />
+                <span className="text-sm">Enable mobile API server</span>
+              </label>
+            </Field>
+            {settings.mobile_api_enabled && (
+              <>
+                <Field
+                  label="Port"
+                  description="Port the mobile API server listens on (default 3847). Restart the app to apply changes."
+                >
+                  <Input
+                    type="number"
+                    min={1024}
+                    max={65535}
+                    value={settings.mobile_api_port ?? 3847}
+                    onChange={(e) => update("mobile_api_port", parseInt(e.target.value) || 3847)}
+                  />
+                </Field>
+                <Field
+                  label="API token (optional)"
+                  description="If set, mobile clients must send this token as Bearer authorization. Leave empty to allow unauthenticated connections on your local network."
+                >
+                  <Input
+                    type="password"
+                    placeholder="Leave empty for no authentication"
+                    value={settings.mobile_api_token || ""}
+                    onChange={(e) => update("mobile_api_token", e.target.value || null)}
+                  />
+                </Field>
+                <p className="text-xs text-emerald-400">
+                  Mobile API active on port {settings.mobile_api_port ?? 3847}. Connect the mobile app to{" "}
+                  <code className="font-mono">http://&lt;this-device-IP&gt;:{settings.mobile_api_port ?? 3847}</code>
+                </p>
+              </>
+            )}
+          </Section>
+
+          {/* User profile */}
+          <Section title="Profile">
+            <Field label="Your name" description="How the AI addresses you.">
+              <Input
+                placeholder="e.g. Alex"
+                value={settings.user_name ?? ""}
+                onChange={(e) => update("user_name", e.target.value || null)}
+              />
+            </Field>
+            <Field label="Your role / profession" description="Gives the AI context about your background.">
+              <Input
+                placeholder="e.g. Developer, Designer, Researcher…"
+                value={settings.user_profession ?? ""}
+                onChange={(e) => update("user_profession", e.target.value || null)}
+              />
+            </Field>
+            <Field label="About you" description="Extra context injected into every conversation system prompt.">
+              <Textarea
+                placeholder="e.g. I prefer concise answers and code examples over prose…"
+                value={settings.user_about ?? ""}
+                onChange={(e) => update("user_about", e.target.value || null)}
+                className="min-h-[80px] resize-none"
+              />
             </Field>
           </Section>
 
@@ -827,6 +1095,298 @@ function Field({ label, description, children }: { label: string; description?: 
       <label className="text-sm font-medium mb-1 block">{label}</label>
       {description && <p className="text-xs text-muted-foreground mb-1.5">{description}</p>}
       {children}
+    </div>
+  );
+}
+
+// ── Whisper sub-components ─────────────────────────────────────────────────────
+
+const WHISPER_SIZES = [
+  { id: "tiny",     label: "Tiny",     size: "~75 MB" },
+  { id: "base",     label: "Base",     size: "~142 MB" },
+  { id: "small",    label: "Small",    size: "~466 MB" },
+  { id: "medium",   label: "Medium",   size: "~1.5 GB" },
+  { id: "large-v3", label: "Large v3", size: "~3 GB" },
+];
+
+interface WhisperStatus {
+  binary_exists: boolean;
+  running: boolean;
+  port: number;
+  model_path?: string;
+  enabled: boolean;
+}
+
+const WHISPER_VARIANTS = [
+  { id: "cpu",    label: "CPU only",  subtitle: "Any hardware" },
+  { id: "cuda11", label: "CUDA 11",   subtitle: "GTX 10/16, RTX 20" },
+  { id: "cuda12", label: "CUDA 12",   subtitle: "RTX 30/40/50" },
+] as const;
+
+function WhisperBinaryRow({
+  variant,
+  onVariantChange,
+}: {
+  variant: string;
+  onVariantChange: (v: string) => void;
+}) {
+  const [status, setStatus] = useState<WhisperStatus | null>(null);
+  const [downloading, setDownloading] = useState(false);
+  const [downloadedBytes, setDownloadedBytes] = useState(0);
+  const [totalBytes, setTotalBytes] = useState(0);
+  const [error, setError] = useState<string | null>(null);
+
+  const { saveSettings } = useSettingsStore();
+
+  const refresh = () =>
+    invoke<WhisperStatus>("get_whisper_status").then(setStatus).catch(console.error);
+
+  useEffect(() => { refresh(); }, []);
+
+  const handleDownload = async (v: string) => {
+    setError(null);
+    setDownloading(true);
+    setDownloadedBytes(0);
+    setTotalBytes(0);
+
+    // Persist the chosen variant to the backend before the download command
+    // reads settings — this ensures the correct build is downloaded.
+    onVariantChange(v);
+    await saveSettings({ whisper_variant: v });
+
+    const unlisten = await listen<{
+      model_id: string;
+      downloaded_bytes: number;
+      total_bytes?: number;
+    }>("server_binary_progress", (event) => {
+      const p = event.payload;
+      if (p.model_id !== "whisper-server") return;
+      if (p.total_bytes) setTotalBytes(p.total_bytes);
+      setDownloadedBytes(p.downloaded_bytes);
+    });
+
+    try {
+      await invoke("download_whisper_binary");
+      await refresh();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      unlisten();
+      setDownloading(false);
+    }
+  };
+
+  return (
+    <div className="space-y-3">
+      {/* Installed status */}
+      <div className="flex items-center gap-2">
+        {status?.binary_exists ? (
+          <span className="flex items-center gap-1.5 text-xs text-emerald-400">
+            <CheckCircle2 className="w-3.5 h-3.5" />
+            Binary installed
+          </span>
+        ) : (
+          <span className="text-xs text-muted-foreground">Not installed</span>
+        )}
+      </div>
+
+      {/* Variant buttons */}
+      <div className="flex flex-wrap gap-2">
+        {WHISPER_VARIANTS.map(({ id, label, subtitle }) => {
+          const isSelected = variant === id;
+          return (
+            <Button
+              key={id}
+              size="sm"
+              variant={isSelected ? "default" : "outline"}
+              disabled={downloading}
+              onClick={() => handleDownload(id)}
+              className={cn("flex-col h-auto py-1.5 px-3 gap-0", isSelected && "ring-1 ring-primary")}
+            >
+              <span className="flex items-center gap-1">
+                {downloading && isSelected ? (
+                  <Loader2 className="w-3 h-3 animate-spin" />
+                ) : (
+                  <Download className="w-3 h-3" />
+                )}
+                {label}
+              </span>
+              <span className="text-[9px] opacity-60">{subtitle}</span>
+            </Button>
+          );
+        })}
+      </div>
+
+      {/* Download progress */}
+      {downloading && (
+        <div className="space-y-0.5">
+          <Progress
+            className="h-1.5"
+            value={totalBytes > 0 ? (downloadedBytes / totalBytes) * 100 : undefined}
+          />
+          <p className="text-[10px] text-muted-foreground">
+            {downloadedBytes > 0
+              ? `${(downloadedBytes / 1024 / 1024).toFixed(1)} MB${totalBytes ? ` / ${(totalBytes / 1024 / 1024).toFixed(0)} MB` : ""}`
+              : "Contacting GitHub…"}
+          </p>
+        </div>
+      )}
+
+      {error && <p className="text-xs text-destructive">{error}</p>}
+    </div>
+  );
+}
+
+function WhisperModelRow({
+  currentPath,
+  onPathChange,
+}: {
+  currentPath?: string;
+  onPathChange: (path: string) => void;
+}) {
+  const [selectedSize, setSelectedSize] = useState("base");
+  const [downloading, setDownloading] = useState(false);
+  const [downloadedBytes, setDownloadedBytes] = useState(0);
+  const [totalBytes, setTotalBytes] = useState(0);
+  const [error, setError] = useState<string | null>(null);
+
+  // Persist the model path immediately so the backend knows about it
+  // without requiring the user to hit the global Save button first.
+  const { saveSettings } = useSettingsStore();
+
+  const currentFile = currentPath ? currentPath.replace(/\\/g, "/").split("/").pop() : null;
+
+  const handleDownload = async () => {
+    setError(null);
+    setDownloading(true);
+    setDownloadedBytes(0);
+    setTotalBytes(0);
+
+    // Listen for progress events emitted by the Rust download command.
+    // The model_id is "whisper-{size}" (set by commands/whisper.rs).
+    const targetModelId = `whisper-${selectedSize}`;
+    const unlisten = await listen<{
+      model_id: string;
+      filename: string;
+      downloaded_bytes: number;
+      total_bytes?: number;
+      status: string;
+    }>("download_progress", (event) => {
+      const p = event.payload;
+      if (p.model_id !== targetModelId) return;
+      if (p.total_bytes) setTotalBytes(p.total_bytes);
+      setDownloadedBytes(p.downloaded_bytes);
+    });
+
+    try {
+      const path = await invoke<string>("download_whisper_model", { size: selectedSize });
+      // Update local UI state
+      onPathChange(path);
+      // Immediately persist to backend so start_whisper_server can find it
+      await saveSettings({ whisper_model_path: path });
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      unlisten();
+      setDownloading(false);
+    }
+  };
+
+  const pct = totalBytes > 0 ? Math.round((downloadedBytes / totalBytes) * 100) : 0;
+
+  return (
+    <div className="flex flex-col gap-2">
+      {currentFile && (
+        <p className="text-xs text-muted-foreground">
+          Active: <span className="font-mono text-foreground">{currentFile}</span>
+        </p>
+      )}
+      <div className="flex items-center gap-2 flex-wrap">
+        <select
+          value={selectedSize}
+          onChange={(e) => setSelectedSize(e.target.value)}
+          className="text-sm bg-background border border-border rounded px-2 py-1 h-8"
+        >
+          {WHISPER_SIZES.map((s) => (
+            <option key={s.id} value={s.id}>
+              {s.label} — {s.size}
+            </option>
+          ))}
+        </select>
+        {downloading ? (
+          <div className="flex items-center gap-2">
+            <Progress value={pct} className="w-32 h-1.5" />
+            <span className="text-xs text-muted-foreground">{pct}%</span>
+          </div>
+        ) : (
+          <Button size="sm" variant="outline" onClick={handleDownload} className="h-7 gap-1.5">
+            <Download className="w-3 h-3" /> Download
+          </Button>
+        )}
+      </div>
+      {error && <p className="text-xs text-destructive">{error}</p>}
+    </div>
+  );
+}
+
+function WhisperServerControl() {
+  const [status, setStatus] = useState<WhisperStatus | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const refresh = () =>
+    invoke<WhisperStatus>("get_whisper_status").then(setStatus).catch(console.error);
+
+  useEffect(() => { refresh(); }, []);
+
+  const handleStart = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await invoke("start_whisper_server");
+      await refresh();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleStop = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await invoke("stop_whisper_server");
+      await refresh();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="flex items-center gap-3 flex-wrap">
+      <span className={cn(
+        "text-xs px-2 py-0.5 rounded-full font-medium",
+        status?.running
+          ? "bg-green-500/15 text-green-400"
+          : "bg-muted text-muted-foreground"
+      )}>
+        {status?.running ? `Running (port ${status.port})` : "Stopped"}
+      </span>
+      {status?.running ? (
+        <Button size="sm" variant="outline" onClick={handleStop} disabled={busy} className="h-7 gap-1.5">
+          {busy ? <Loader2 className="w-3 h-3 animate-spin" /> : <Square className="w-3 h-3" />}
+          Stop
+        </Button>
+      ) : (
+        <Button size="sm" variant="outline" onClick={handleStart} disabled={busy} className="h-7 gap-1.5">
+          {busy ? <Loader2 className="w-3 h-3 animate-spin" /> : <Play className="w-3 h-3" />}
+          Start
+        </Button>
+      )}
+      {error && <p className="text-xs text-destructive w-full">{error}</p>}
     </div>
   );
 }

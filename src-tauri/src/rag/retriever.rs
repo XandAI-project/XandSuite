@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use super::embeddings::cosine_similarity;
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct StoredChunk {
     pub id: String,
@@ -11,7 +13,7 @@ pub struct StoredChunk {
     pub content: String,
     pub chunk_index: u32,
     pub metadata: serde_json::Value,
-    // kept for schema compatibility; no longer used for retrieval
+    /// Real L2-normalised embedding vector (dim matches the configured model).
     pub embedding: Vec<f32>,
 }
 
@@ -54,16 +56,20 @@ impl VectorStore {
         self.persist()
     }
 
-    /// BM25-based full-text search.
-    /// Works correctly with natural language queries (any language) without
-    /// requiring a separate embedding model.
+    /// Hybrid search combining cosine similarity and BM25.
+    ///
+    /// * `query_embedding` — pre-computed query embedding (may be empty vec if
+    ///   the embedder is unavailable; falls back to BM25-only in that case).
+    /// * `cosine_weight` — fraction of the final score coming from cosine
+    ///   similarity (0.0–1.0).  The remaining fraction comes from BM25.
     pub fn search(
         &self,
         query: &str,
+        query_embedding: &[f32],
         collection_id: Option<&str>,
         top_k: usize,
+        cosine_weight: f32,
     ) -> Vec<RetrievedChunk> {
-        // Candidate chunks for this collection
         let candidates: Vec<&StoredChunk> = self
             .chunks
             .iter()
@@ -78,60 +84,89 @@ impl VectorStore {
         }
 
         let query_terms = tokenize_query(query);
-        if query_terms.is_empty() {
-            return vec![];
-        }
+        let use_bm25 = !query_terms.is_empty();
+        let use_cosine = !query_embedding.is_empty() && cosine_weight > 0.0;
 
-        // Pre-tokenize all candidate chunks
-        let tokenized: Vec<Vec<String>> =
-            candidates.iter().map(|c| tokenize(&c.content)).collect();
+        // Pre-tokenize all chunks for BM25
+        let tokenized: Vec<Vec<String>> = if use_bm25 {
+            candidates.iter().map(|c| tokenize(&c.content)).collect()
+        } else {
+            vec![]
+        };
 
-        // Average document length
-        let avg_doc_len =
-            tokenized.iter().map(|t| t.len()).sum::<usize>() as f32 / tokenized.len() as f32;
+        let bm25_weight = 1.0 - cosine_weight.clamp(0.0, 1.0);
 
-        // Document frequency: how many chunks contain each term
+        // BM25 parameters
+        let avg_doc_len = if use_bm25 && !tokenized.is_empty() {
+            tokenized.iter().map(|t| t.len()).sum::<usize>() as f32 / tokenized.len() as f32
+        } else {
+            1.0
+        };
+
         let mut doc_freq: HashMap<String, usize> = HashMap::new();
-        for tokens in &tokenized {
-            let unique: std::collections::HashSet<&String> = tokens.iter().collect();
-            for term in unique {
-                *doc_freq.entry(term.clone()).or_insert(0) += 1;
+        if use_bm25 {
+            for tokens in &tokenized {
+                let unique: std::collections::HashSet<&String> = tokens.iter().collect();
+                for term in unique {
+                    *doc_freq.entry(term.clone()).or_insert(0) += 1;
+                }
             }
         }
-
         let total_docs = candidates.len();
 
-        // Score every candidate with BM25
-        let mut scored: Vec<(f32, &StoredChunk)> = candidates
+        // Score every candidate
+        let mut scored: Vec<(f32, &'_ StoredChunk)> = candidates
             .iter()
-            .zip(tokenized.iter())
-            .map(|(chunk, tokens)| {
-                let score = bm25_score(
-                    &query_terms,
-                    tokens,
-                    tokens.len(),
-                    avg_doc_len,
-                    total_docs,
-                    &doc_freq,
-                );
-                (score, *chunk)
+            .enumerate()
+            .map(|(i, chunk)| {
+                let cosine_score = if use_cosine && !chunk.embedding.is_empty() {
+                    cosine_similarity(query_embedding, &chunk.embedding).max(0.0)
+                } else {
+                    0.0
+                };
+
+                let bm25_score = if use_bm25 {
+                    bm25_score(
+                        &query_terms,
+                        &tokenized[i],
+                        tokenized[i].len(),
+                        avg_doc_len,
+                        total_docs,
+                        &doc_freq,
+                    )
+                } else {
+                    0.0
+                };
+
+                (cosine_score, bm25_score, *chunk)
+            })
+            .collect::<Vec<_>>()
+            // Normalise BM25 scores to [0,1] so they are on the same scale as cosine
+            .pipe_bm25_normalise(use_bm25)
+            .into_iter()
+            .map(|(cos, bm25, chunk)| {
+                let score = if use_cosine && use_bm25 {
+                    cosine_weight * cos + bm25_weight * bm25
+                } else if use_cosine {
+                    cos
+                } else {
+                    bm25
+                };
+                (score, chunk)
             })
             .collect();
 
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Normalise scores to 0-1 using the max score so the UI percentage
-        // is meaningful (100 % = best matching chunk in this result set).
-        let max_score = scored.first().map(|(s, _)| *s).unwrap_or(1.0).max(1e-6);
-
         scored
             .into_iter()
-            // Only return chunks that actually matched at least one query term
             .filter(|(score, _)| *score > 0.0)
             .take(top_k)
             .map(|(score, chunk)| RetrievedChunk {
                 chunk: chunk.clone(),
-                score: score / max_score,
+                score,
+                entities: vec![],
+                relationships: vec![],
             })
             .collect()
     }
@@ -170,12 +205,28 @@ impl VectorStore {
     }
 }
 
+// ── Normalisation helper (free function on Vec to keep score_loop readable) ──
+
+trait NormaliseBm25 {
+    fn pipe_bm25_normalise(self, active: bool) -> Self;
+}
+
+impl<'a> NormaliseBm25 for Vec<(f32, f32, &'a StoredChunk)> {
+    fn pipe_bm25_normalise(mut self, active: bool) -> Self {
+        if !active {
+            return self;
+        }
+        let max_bm25 = self.iter().map(|(_, b, _)| *b).fold(0.0_f32, f32::max).max(1e-6);
+        for (_, bm25, _) in self.iter_mut() {
+            *bm25 /= max_bm25;
+        }
+        self
+    }
+}
+
 // ── BM25 helpers ──────────────────────────────────────────────────────────────
 
-/// Common Portuguese and English stop words stripped from *queries* only.
-/// Documents are still indexed with all tokens so nothing is lost at ingest time.
 const STOP_WORDS: &[&str] = &[
-    // Portuguese — function words, common verbs, prepositions, pronouns
     "de", "da", "do", "das", "dos", "em", "na", "no", "nas", "nos",
     "ao", "aos", "às", "um", "uma", "uns", "umas",
     "que", "para", "com", "por", "mas", "ou", "se", "já",
@@ -190,18 +241,15 @@ const STOP_WORDS: &[&str] = &[
     "como", "quando", "onde", "quem", "qual", "quais",
     "também", "ainda", "até", "depois", "antes", "sempre", "nunca",
     "há", "vai", "vem", "pode", "deve", "quer",
-    // English — common function words
     "the", "a", "an", "and", "or", "is", "are", "was", "were",
     "be", "been", "being", "have", "has", "had",
     "do", "does", "did", "will", "would", "could", "should",
     "may", "might", "must", "can", "to", "of", "in", "for",
     "on", "with", "at", "by", "from", "up", "about", "into",
-    "tell", "me", "about", "who", "what", "when", "where", "how",
+    "tell", "me", "who", "what", "when", "where", "how",
     "brief", "briefly", "please",
 ];
 
-/// Tokenise text: lowercase, split on non-alphanumeric, filter single chars.
-/// Language-agnostic — works with Portuguese, English, etc.
 fn tokenize(text: &str) -> Vec<String> {
     text.to_lowercase()
         .split(|c: char| !c.is_alphanumeric())
@@ -210,9 +258,6 @@ fn tokenize(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Like `tokenize` but also strips stop words.
-/// Used for queries so that conversational phrases don't dilute BM25 scores
-/// for the specific entity or concept the user is asking about.
 fn tokenize_query(text: &str) -> Vec<String> {
     tokenize(text)
         .into_iter()
@@ -220,9 +265,6 @@ fn tokenize_query(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// BM25 (Okapi BM25) scoring for a single document against a query.
-///
-/// Parameters k1=1.5, b=0.75 are standard defaults.
 fn bm25_score(
     query_terms: &[String],
     doc_tokens: &[String],
@@ -237,38 +279,32 @@ fn bm25_score(
     let mut score = 0.0_f32;
     for term in query_terms {
         let tf = doc_tokens.iter().filter(|t| *t == term).count() as f32;
-        if tf == 0.0 {
-            continue;
-        }
-        // Document frequency — default to 1 to avoid div-by-zero
+        if tf == 0.0 { continue; }
         let df = *doc_freq.get(term).unwrap_or(&1) as f32;
         let n = total_docs as f32;
-
-        // IDF with smoothing (avoids negative IDF for very common terms)
         let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
-
-        // Length-normalised TF
         let norm = 1.0 - B + B * (doc_len as f32 / avg_doc_len.max(1.0));
         let tf_norm = (tf * (K1 + 1.0)) / (tf + K1 * norm);
-
         score += idf * tf_norm;
     }
     score
 }
 
-// ── Result type ───────────────────────────────────────────────────────────────
+// ── Result types ──────────────────────────────────────────────────────────────
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct RetrievedChunk {
     pub chunk: StoredChunk,
-    /// Normalised relevance score in [0, 1]  (1.0 = best match in result set)
+    /// Combined relevance score in [0, 1].
     pub score: f32,
+    /// Entities extracted by the graph pipeline (empty for hybrid mode).
+    pub entities: Vec<String>,
+    /// Relationships extracted by the graph pipeline (empty for hybrid mode).
+    pub relationships: Vec<String>,
 }
 
 // ── Context builder ───────────────────────────────────────────────────────────
 
-/// Assemble retrieved chunks into a context block for the LLM.
-/// Each entry includes the source file so the model can cite it.
 pub fn build_context_prompt(chunks: &[RetrievedChunk], max_chars: usize) -> String {
     let mut context = String::from("Relevant context from the knowledge base:\n\n");
     let mut total = context.len();
@@ -282,10 +318,17 @@ pub fn build_context_prompt(chunks: &[RetrievedChunk], max_chars: usize) -> Stri
             .or_else(|| retrieved.chunk.metadata.get("source_file").and_then(|v| v.as_str()))
             .unwrap_or("document");
 
+        let entity_line = if !retrieved.entities.is_empty() {
+            format!("\n  entities: {}", retrieved.entities.join(", "))
+        } else {
+            String::new()
+        };
+
         let entry = format!(
-            "[{}] (source: {})\n{}\n\n",
+            "[{}] (source: {}{})\n{}\n\n",
             i + 1,
             source,
+            entity_line,
             retrieved.chunk.content
         );
 

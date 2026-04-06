@@ -16,6 +16,7 @@ use anyhow::{Context, Result};
 use rusqlite::params as sql_params;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::mpsc;
@@ -78,6 +79,8 @@ pub struct SkillsExecutor {
     comfyui_vae_name: Option<String>,
     /// Named custom workflows: (id, name, workflow_json)
     comfyui_workflows: Vec<(String, String, String)>,
+    /// Counts hard code-execution failures (exit_code != 0 or non-empty stderr) for retry capping.
+    code_exec_retries: AtomicUsize,
 }
 
 impl SkillsExecutor {
@@ -92,6 +95,7 @@ impl SkillsExecutor {
             comfyui_clip_name: None,
             comfyui_vae_name: None,
             comfyui_workflows: vec![],
+            code_exec_retries: AtomicUsize::new(0),
         }
     }
 
@@ -289,7 +293,7 @@ impl SkillsExecutor {
                     "[executor] Dispatching tool '{}' (id={}) args={}", fn_name, tc.id, args_preview
                 ));
 
-                // Emit tool-call event to frontend
+                // Emit tool-call event to frontend and HTTP SSE clients
                 let _ = app.emit(
                     "chat_tool_call",
                     json!({
@@ -300,6 +304,18 @@ impl SkillsExecutor {
                         "turn": turn,
                     }),
                 );
+                {
+                    use tauri::Manager;
+                    if let Some(st) = app.try_state::<crate::state::AppState>() {
+                        let _ = st.event_tx.send(crate::api_server::events::ApiEvent::ChatToolCall {
+                            conversation_id: conv_id.to_string(),
+                            tool_call_id: tc.id.clone(),
+                            function_name: fn_name.to_string(),
+                            arguments: args.clone(),
+                            turn: turn as u32,
+                        });
+                    }
+                }
 
                 let result_text = self
                     .dispatch_tool_call(fn_name, args, app, conv_id)
@@ -320,7 +336,7 @@ impl SkillsExecutor {
                     "[executor] Tool '{}' result ({} chars): {}", fn_name, result_text.len(), result_preview
                 ));
 
-                // Emit result event
+                // Emit result event to frontend and HTTP SSE clients
                 let _ = app.emit(
                     "chat_tool_result",
                     json!({
@@ -331,6 +347,16 @@ impl SkillsExecutor {
                         "turn": turn,
                     }),
                 );
+                {
+                    use tauri::Manager;
+                    if let Some(st) = app.try_state::<crate::state::AppState>() {
+                        let _ = st.event_tx.send(crate::api_server::events::ApiEvent::ChatToolResult {
+                            conversation_id: conv_id.to_string(),
+                            tool_call_id: tc.id.clone(),
+                            result: result_text.clone(),
+                        });
+                    }
+                }
 
                 // Append tool result as a "tool" role message
                 messages.push((
@@ -412,19 +438,44 @@ impl SkillsExecutor {
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
 
-                // HTML/CSS cannot be executed — intercept and hand the content
-                // back to the LLM so it can wrap it in an artifact tag.
-                if matches!(language, "html" | "htm" | "css") {
-                    let instruction = format!(
-                        "STOP — HTML/CSS cannot be executed in a terminal and must NOT be \
-                         passed to execute_code again.\n\
-                         You MUST output it as an artifact in your next response:\n\
-                         <artifact type=\"html\" title=\"Page Title\">\n{}\n</artifact>\n\
-                         Do NOT call any tool. Just write the artifact tag with the content above.",
-                        code
-                    );
+                // Only Python may be executed. Every other language is redirected
+                // back to the LLM with an instruction to emit an artifact instead.
+                if language != "python" {
+                    let instruction = match language {
+                        "html" | "htm" | "css" => format!(
+                            "STOP — HTML/CSS must NOT be passed to execute_code.\n\
+                             Output it as an artifact in your NEXT response (no tool call):\n\
+                             <artifact type=\"html\" title=\"Page Title\">\n{}\n</artifact>\n\
+                             Do NOT call any tool.",
+                            code
+                        ),
+                        "javascript" | "typescript" | "js" | "ts" => format!(
+                            "STOP — JavaScript/TypeScript cannot be executed here.\n\
+                             Output it as a code artifact in your NEXT response (no tool call):\n\
+                             <artifact type=\"code\" language=\"javascript\" title=\"Script\">\n{}\n</artifact>\n\
+                             Do NOT call any tool.",
+                            code
+                        ),
+                        "shell" | "bash" | "sh" | "zsh" | "powershell" | "ps1" => format!(
+                            "STOP — Shell scripts cannot be executed here.\n\
+                             Output it as a code artifact in your NEXT response (no tool call):\n\
+                             <artifact type=\"code\" language=\"shell\" title=\"Shell Script\">\n{}\n</artifact>\n\
+                             Do NOT call any tool.",
+                            code
+                        ),
+                        other => format!(
+                            "STOP — Only Python can be executed with execute_code. \
+                             '{}' is not a supported execution language.\n\
+                             If this is displayable code, output it as a code artifact in your \
+                             NEXT response (no tool call):\n\
+                             <artifact type=\"code\" language=\"{}\" title=\"Code\">\n{}\n</artifact>\n\
+                             Do NOT call any tool.",
+                            other, other, code
+                        ),
+                    };
+                    log::warn!("[executor] Non-Python execute_code attempt (language={}) — redirecting to artifact", language);
                     return Ok(serde_json::to_string(&json!({
-                        "error": "HTML_NOT_EXECUTABLE",
+                        "error": "NOT_EXECUTABLE",
                         "instruction": instruction,
                     })).unwrap_or_default());
                 }
@@ -435,7 +486,45 @@ impl SkillsExecutor {
                     "[executor] Code execution complete: exit_code={} stdout_len={} stderr_len={}",
                     run.exit_code, run.stdout.len(), run.stderr.len()
                 );
-                Ok(serde_json::to_string(&run).unwrap_or_default())
+
+                // Build result as a mutable JSON value so we can attach retry hints.
+                let mut result_val = serde_json::to_value(&run).unwrap_or(json!({}));
+
+                let hard_fail = run.exit_code != 0 || !run.stderr.is_empty();
+                let soft_fail = !hard_fail && {
+                    let out = run.stdout.to_ascii_lowercase();
+                    out.contains("traceback") || out.contains("error:") || out.contains("exception")
+                };
+
+                if hard_fail {
+                    // Increment the persistent retry counter for this executor session.
+                    let attempt = self.code_exec_retries.fetch_add(1, Ordering::Relaxed) + 1;
+                    log::warn!("[executor] Hard code failure (attempt {}/3) exit_code={}", attempt, run.exit_code);
+                    if attempt <= 3 {
+                        result_val["_retry_hint"] = json!(format!(
+                            "FAILURE: Code exited with code {}. \
+                             Analyze the error above, fix the code, and call execute_code again immediately. \
+                             This is attempt {}/3. DO NOT describe the error — rewrite and retry.",
+                            run.exit_code, attempt
+                        ));
+                    } else {
+                        result_val["_retry_hint"] = json!(
+                            "MAX_RETRIES_REACHED: 3 code execution attempts have failed. \
+                             Do NOT call execute_code again. \
+                             Summarize what went wrong and provide your best explanation."
+                        );
+                    }
+                } else if soft_fail {
+                    log::info!("[executor] Soft code failure detected in stdout (caught exception?)");
+                    result_val["_retry_hint"] = json!(
+                        "WARNING: The output suggests a runtime error was caught and printed. \
+                         If the result is wrong or an error occurred, fix the code and call \
+                         execute_code again (max 3 total attempts). \
+                         Always use sys.exit(1) on failure so errors are reliably detected."
+                    );
+                }
+
+                Ok(result_val.to_string())
             }
             "list_recent_artifacts" => {
                 let limit = arguments
@@ -820,6 +909,14 @@ impl SkillsExecutor {
                                 "gallery_updated",
                                 serde_json::json!({ "conversation_id": conv_id }),
                             );
+                            {
+                                use tauri::Manager;
+                                if let Some(st) = app.try_state::<crate::state::AppState>() {
+                                    let _ = st.event_tx.send(crate::api_server::events::ApiEvent::GalleryUpdated {
+                                        conversation_id: conv_id.to_string(),
+                                    });
+                                }
+                            }
                         }
                     }
                 } else {
@@ -1098,13 +1195,18 @@ fn code_runner_execute_tool() -> ToolDefinition {
         kind: "function".to_string(),
         function: FunctionDef {
             name: format!("{}__execute_code", CODE_RUNNER_SERVER_ID),
-            description: "Run code in a real sandboxed subprocess and return stdout, stderr, \
-                           exit code, and wall-clock time. \
-                           ONLY for python, javascript, or shell. \
-                           NEVER use this tool for HTML, CSS, or web pages — those must be \
-                           written as <artifact type=\"html\"> tags, not executed. \
-                           Call this tool when the user asks you to run, execute, test, or \
-                           verify Python/JS/Shell code, or whenever you want to show real output."
+            description: "Run Python code in a real sandboxed subprocess and return stdout, \
+                           stderr, exit code, and wall-clock time. \
+                           ONLY Python is supported — do NOT pass any other language to this tool. \
+                           For HTML/CSS pages use: <artifact type=\"html\" title=\"...\">...</artifact>. \
+                           For JavaScript/TypeScript use: <artifact type=\"code\" language=\"javascript\" title=\"...\">...</artifact>. \
+                           For shell scripts use: <artifact type=\"code\" language=\"shell\" title=\"...\">...</artifact>. \
+                           Call this tool only when the user asks you to run, execute, test, or \
+                           verify Python code, or whenever you need to show real computed output. \
+                           IMPORTANT: Always signal failures with `sys.exit(1)` — do NOT silently \
+                           catch exceptions and print them; raise them so errors are reliably \
+                           detected and retried. \
+                           If a result has `_retry_hint` in the response, read it and act on it."
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -1112,12 +1214,12 @@ fn code_runner_execute_tool() -> ToolDefinition {
                 "properties": {
                     "language": {
                         "type": "string",
-                        "enum": ["python", "javascript", "shell"],
-                        "description": "The language to execute. Must be one of: python, javascript, shell. HTML and CSS are NOT supported — use an artifact tag for those."
+                        "enum": ["python"],
+                        "description": "Must be 'python'. This is the only supported execution language. For all other languages output an artifact tag instead of calling this tool."
                     },
                     "code": {
                         "type": "string",
-                        "description": "The source code to run. Write it exactly as you would in a file."
+                        "description": "The Python source code to run. Write it exactly as you would in a .py file."
                     }
                 }
             }),

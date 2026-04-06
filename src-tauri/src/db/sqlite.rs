@@ -356,10 +356,36 @@ impl AppDb {
             -- for ALTER TABLE, so we use a separate execute_batch line below.
         "#).context("Failed to run database migrations")?;
 
-        // ALTER TABLE is not idempotent in SQLite — ignore "duplicate column" error.
+        // ALTER TABLE is not idempotent in SQLite — ignore "duplicate column" errors.
         let _ = self.conn.execute_batch(
             "ALTER TABLE messages ADD COLUMN tool_steps TEXT;"
         );
+        let _ = self.conn.execute_batch(
+            "ALTER TABLE rag_collections ADD COLUMN retrieval_mode TEXT NOT NULL DEFAULT 'hybrid';"
+        );
+        let _ = self.conn.execute_batch(
+            "ALTER TABLE rag_collections ADD COLUMN graph_indexed INTEGER NOT NULL DEFAULT 0;"
+        );
+        let _ = self.conn.execute_batch(
+            "ALTER TABLE conversations ADD COLUMN persona_id TEXT REFERENCES personas(id);"
+        );
+
+        // Personas table (idempotent)
+        self.conn.execute_batch(r#"
+            CREATE TABLE IF NOT EXISTS personas (
+                id                   TEXT PRIMARY KEY,
+                name                 TEXT NOT NULL,
+                description          TEXT,
+                avatar               TEXT,
+                system_prompt        TEXT NOT NULL DEFAULT '',
+                model_id             TEXT,
+                rag_collection_ids   TEXT NOT NULL DEFAULT '[]',
+                memory_enabled       INTEGER NOT NULL DEFAULT 0,
+                memory_collection_id TEXT,
+                created_at           TEXT NOT NULL,
+                updated_at           TEXT NOT NULL
+            );
+        "#).context("Failed to create personas table")?;
 
         self.conn.execute_batch(r#"
             INSERT OR IGNORE INTO rag_collections (id, name, description, created_at)

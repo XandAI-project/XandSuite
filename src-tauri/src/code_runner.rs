@@ -206,7 +206,14 @@ async fn spawn_python(path: &std::path::Path) -> Result<tokio::process::Child> {
     let interpreters = ["python3", "python"];
     for interp in &interpreters {
         if let Ok(child) = Command::new(interp)
+            // -u: unbuffered so all output is captured even on crash
+            .arg("-u")
             .arg(path)
+            // Force UTF-8 I/O on all platforms (critical on Windows where the
+            // default cp1252 codec can't encode emoji / non-latin characters,
+            // causing a secondary UnicodeEncodeError that hides the real error).
+            .env("PYTHONIOENCODING", "utf-8")
+            .env("PYTHONUTF8", "1")
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
@@ -220,6 +227,8 @@ async fn spawn_python(path: &std::path::Path) -> Result<tokio::process::Child> {
 async fn spawn_node(path: &std::path::Path) -> Result<tokio::process::Child> {
     Command::new("node")
         .arg(path)
+        // Ensure UTF-8 output on Windows
+        .env("NODE_ICU_DATA", "")  // avoid icu issues
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -230,7 +239,18 @@ async fn spawn_shell(path: &std::path::Path) -> Result<tokio::process::Child> {
     #[cfg(target_os = "windows")]
     {
         Command::new("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-File", &path.to_string_lossy()])
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                // Switch console to UTF-8 so emoji and non-ASCII output is captured correctly
+                "-Command",
+                &format!(
+                    "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; \
+                     [Console]::InputEncoding  = [System.Text.Encoding]::UTF8; \
+                     & '{}'",
+                    path.to_string_lossy().replace('\'', "''")
+                ),
+            ])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()

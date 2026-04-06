@@ -11,22 +11,29 @@ import { SettingsView } from "@/components/layout/SettingsView";
 import { SkillsPanel } from "@/components/skills/SkillsPanel";
 import { ArtifactsView } from "@/components/artifacts/ArtifactsView";
 import { LogView } from "@/components/logs/LogView";
+import { OnboardingWizard } from "@/components/onboarding/OnboardingWizard";
+import { PersonasView } from "@/components/personas/PersonasView";
 import { useModelStore } from "@/stores/modelStore";
 import { useLogStore } from "@/stores/logStore";
 import { useServerStore } from "@/stores/serverStore";
+import { useSettingsStore } from "@/stores/settingsStore";
+
+const codingEnabled = import.meta.env.VITE_ENABLE_CODING === "true";
 
 function App() {
   const checkEngineStatus = useModelStore((s) => s.checkEngineStatus);
   const initLogs = useLogStore((s) => s.init);
   const fetchServerStatus = useServerStore((s) => s.fetchStatus);
+  const { settings, fetchSettings } = useSettingsStore();
 
   useEffect(() => {
     checkEngineStatus();
     initLogs();
-    // Probe the llama-server port so any server left running from a previous
-    // session is detected, adopted, and reflected in the UI immediately.
     fetchServerStatus();
+    fetchSettings();
   }, []);
+
+  const showOnboarding = settings !== null && !settings.onboarding_completed;
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-background text-foreground">
@@ -35,7 +42,8 @@ function App() {
         <Routes>
           <Route path="/" element={<Navigate to="/chat" replace />} />
           <Route path="/chat" element={<ChatView />} />
-          <Route path="/coding" element={<CodingView />} />
+          <Route path="/personas" element={<PersonasView />} />
+          {codingEnabled && <Route path="/coding" element={<CodingView />} />}
           <Route path="/flows" element={<FlowCanvas />} />
           <Route path="/models" element={<ModelBrowser />} />
           <Route path="/rag" element={<RagManager />} />
@@ -46,6 +54,9 @@ function App() {
           <Route path="/settings" element={<SettingsView />} />
         </Routes>
       </main>
+
+      {/* One-time onboarding overlay — rendered above everything else */}
+      {showOnboarding && <OnboardingWizard />}
     </div>
   );
 }

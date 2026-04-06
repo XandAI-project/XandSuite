@@ -9,6 +9,10 @@ import {
   Search,
   Brain,
   Database,
+  GitBranch,
+  BarChart2,
+  CheckCircle2,
+  RefreshCw,
 } from "lucide-react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { formatDistanceToNow } from "date-fns";
@@ -21,6 +25,7 @@ import { Badge } from "@/components/ui/badge";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
 import type { RagCollection } from "@/lib/tauri";
+import { useSettingsStore } from "@/stores/settingsStore";
 
 type Tab = "internal" | "external";
 
@@ -53,7 +58,7 @@ export function RagManager() {
           )}
         >
           <Database className="w-3.5 h-3.5" />
-          External
+          Knowledge Bases
         </button>
       </div>
 
@@ -160,19 +165,25 @@ function formatRelative(dateStr: string): string {
 function ExternalCollectionsTab() {
   const { collections, fetchCollections, createCollection, deleteCollection, ingestDocument } =
     useRagStore();
+  const { settings, fetchSettings } = useSettingsStore();
+  const graphRagEnabled = settings?.graph_rag_enabled ?? false;
   const [selectedCollection, setSelectedCollection] = useState<RagCollection | null>(null);
   const [newName, setNewName] = useState("");
   const [newDesc, setNewDesc] = useState("");
   const [showCreate, setShowCreate] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<
-    { content: string; score: number; source: string }[]
+    { content: string; score: number; source: string; entities?: string[] }[]
   >([]);
   const [isSearching, setIsSearching] = useState(false);
   const [isIngesting, setIsIngesting] = useState(false);
+  const [isSwitchingMode, setIsSwitchingMode] = useState(false);
+  const [isReindexing, setIsReindexing] = useState(false);
+  const [reindexError, setReindexError] = useState<string | null>(null);
 
   useEffect(() => {
     fetchCollections();
+    fetchSettings();
   }, []);
 
   const handleCreate = async () => {
@@ -207,7 +218,7 @@ function ExternalCollectionsTab() {
     if (!searchQuery.trim()) return;
     setIsSearching(true);
     try {
-      const results = await invoke<{ content: string; score: number; source: string }[]>(
+      const results = await invoke<{ content: string; score: number; source: string; entities?: string[] }[]>(
         "search_rag",
         {
           query: searchQuery,
@@ -220,6 +231,42 @@ function ExternalCollectionsTab() {
       console.error(e);
     } finally {
       setIsSearching(false);
+    }
+  };
+
+  const handleSetRetrievalMode = async (mode: "hybrid" | "graph") => {
+    if (!selectedCollection) return;
+    setIsSwitchingMode(true);
+    setReindexError(null);
+    try {
+      await invoke("set_collection_retrieval_mode", {
+        collectionId: selectedCollection.id,
+        mode,
+      });
+      await fetchCollections();
+      const updated = collections.find((c) => c.id === selectedCollection.id);
+      if (updated) setSelectedCollection(updated);
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setIsSwitchingMode(false);
+    }
+  };
+
+  const handleReindex = async () => {
+    if (!selectedCollection) return;
+    setIsReindexing(true);
+    setReindexError(null);
+    try {
+      await invoke("reindex_collection", { collectionId: selectedCollection.id });
+      await fetchCollections();
+      const updated = collections.find((c) => c.id === selectedCollection.id);
+      if (updated) setSelectedCollection(updated);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setReindexError(msg);
+    } finally {
+      setIsReindexing(false);
     }
   };
 
@@ -257,8 +304,13 @@ function ExternalCollectionsTab() {
                 <FolderOpen className="w-3.5 h-3.5 shrink-0" />
                 <div className="flex-1 min-w-0">
                   <div className="text-xs font-medium truncate">{col.name}</div>
-                  <div className="text-[10px] text-muted-foreground">
-                    {col.document_count} chunks
+                  <div className="flex items-center gap-1 mt-0.5">
+                    <span className="text-[10px] text-muted-foreground">{col.document_count} chunks</span>
+                    {col.retrieval_mode === "graph" && (
+                      <span className="text-[9px] px-1 py-0.5 rounded bg-purple-500/20 text-purple-300 font-medium">
+                        Graph
+                      </span>
+                    )}
                   </div>
                 </div>
                 <Button
@@ -281,7 +333,7 @@ function ExternalCollectionsTab() {
       {/* Main panel */}
       <div className="flex-1 flex flex-col min-w-0">
         <div className="px-6 py-4 border-b border-border">
-          <h1 className="text-xl font-semibold">RAG Manager</h1>
+          <h1 className="text-xl font-semibold">Knowledge Bases</h1>
           <p className="text-sm text-muted-foreground mt-1">
             Upload documents to create searchable knowledge bases for your AI models.
           </p>
@@ -305,6 +357,78 @@ function ExternalCollectionsTab() {
                 Upload Document
               </Button>
             </div>
+
+            {/* Retrieval mode selector */}
+            <div className="flex items-center gap-3 p-3 rounded-lg border border-border bg-card/50">
+              <div className="flex-1">
+                <div className="text-xs font-medium mb-0.5">Retrieval Mode</div>
+                <div className="text-[11px] text-muted-foreground">
+                  Choose how this knowledge base is searched during chat.
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => handleSetRetrievalMode("hybrid")}
+                  disabled={isSwitchingMode}
+                  className={cn(
+                    "flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-colors",
+                    selectedCollection.retrieval_mode !== "graph"
+                      ? "bg-primary text-primary-foreground"
+                      : "bg-secondary text-muted-foreground hover:text-foreground"
+                  )}
+                >
+                  <BarChart2 className="w-3 h-3" />
+                  Hybrid
+                </button>
+                <button
+                  onClick={() => graphRagEnabled && handleSetRetrievalMode("graph")}
+                  disabled={isSwitchingMode || !graphRagEnabled}
+                  title={!graphRagEnabled ? "Enable GraphRAG in Settings → Knowledge Base" : undefined}
+                  className={cn(
+                    "flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-colors",
+                    selectedCollection.retrieval_mode === "graph"
+                      ? "bg-purple-600 text-white"
+                      : graphRagEnabled
+                        ? "bg-secondary text-muted-foreground hover:text-foreground"
+                        : "bg-secondary/50 text-muted-foreground/50 cursor-not-allowed"
+                  )}
+                >
+                  <GitBranch className="w-3 h-3" />
+                  Graph
+                </button>
+                {isSwitchingMode && <Loader2 className="w-3.5 h-3.5 animate-spin text-muted-foreground" />}
+              </div>
+              {selectedCollection.retrieval_mode === "graph" && (
+                <div className="ml-1">
+                  {selectedCollection.graph_indexed ? (
+                    <div className="flex items-center gap-1 text-[10px] text-green-400">
+                      <CheckCircle2 className="w-3 h-3" />
+                      Indexed
+                    </div>
+                  ) : isReindexing ? (
+                    <div className="flex items-center gap-1 text-[10px] text-yellow-400">
+                      <RefreshCw className="w-3 h-3 animate-spin" />
+                      Indexing…
+                    </div>
+                  ) : (
+                    <button
+                      onClick={handleReindex}
+                      className="flex items-center gap-1 text-[10px] text-yellow-400 hover:text-yellow-300 transition-colors"
+                      title="Send documents to GraphRAG server for graph indexing"
+                    >
+                      <RefreshCw className="w-3 h-3" />
+                      Not indexed — click to index
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {reindexError && (
+              <div className="text-[11px] text-destructive bg-destructive/10 border border-destructive/20 rounded-md px-3 py-2">
+                {reindexError}
+              </div>
+            )}
 
             <p className="text-sm text-muted-foreground">
               Supported formats: PDF, CSV, JSON, JSONL, TXT, Markdown
@@ -351,6 +475,15 @@ function ExternalCollectionsTab() {
                           {r.content.slice(0, 300)}
                           {r.content.length > 300 ? "..." : ""}
                         </p>
+                        {r.entities && r.entities.length > 0 && (
+                          <div className="flex flex-wrap gap-1 mt-1.5">
+                            {r.entities.slice(0, 5).map((entity, ei) => (
+                              <span key={ei} className="text-[9px] px-1.5 py-0.5 rounded bg-purple-500/15 text-purple-300 border border-purple-500/20">
+                                {entity}
+                              </span>
+                            ))}
+                          </div>
+                        )}
                       </div>
                     ))}
                   </div>
@@ -372,14 +505,14 @@ function ExternalCollectionsTab() {
       {showCreate && (
         <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50">
           <div className="bg-card border border-border rounded-xl p-6 w-full max-w-md mx-4">
-            <h3 className="text-lg font-semibold mb-4">New Collection</h3>
+            <h3 className="text-lg font-semibold mb-4">New Knowledge Base</h3>
             <div className="space-y-3">
               <div>
                 <label className="text-xs text-muted-foreground mb-1 block">Name</label>
                 <Input
                   value={newName}
                   onChange={(e) => setNewName(e.target.value)}
-                  placeholder="My Knowledge Base"
+                  placeholder="e.g. Product Documentation"
                   autoFocus
                 />
               </div>
