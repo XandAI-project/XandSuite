@@ -37,3 +37,5 @@ src-tauri/WixUI_InstallDir.wxs
 *.db-wal
 models/
 *.gguf
+
+/version/executables

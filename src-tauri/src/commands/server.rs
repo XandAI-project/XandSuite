@@ -3,6 +3,7 @@ use tauri::{AppHandle, Emitter, State};
 use tokio::sync::mpsc;
 
 use crate::models::DownloadProgress;
+use crate::process_ext::HideWindowStd;
 use crate::server::{downloader::BinaryVariant, LlamaServerManager};
 use crate::state::AppState;
 
@@ -27,8 +28,9 @@ pub fn detect_gpu() -> Result<GpuInfo, String> {
 fn query_gpu_name() -> String {
     #[cfg(target_os = "windows")]
     {
-        // Use PowerShell WMI — fast and reliable on all Windows versions
-        let output = std::process::Command::new("powershell")
+        let mut cmd = std::process::Command::new("powershell");
+        cmd.hide_window();
+        let output = cmd
             .args([
                 "-NoProfile",
                 "-NonInteractive",

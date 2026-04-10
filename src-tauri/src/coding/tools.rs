@@ -5,6 +5,8 @@ use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::timeout;
 
+use crate::process_ext::HideWindowTokio;
+
 // ── Tool definitions ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -435,10 +437,9 @@ async fn shell_exec(command: &str, cwd: &Path, timeout_secs: u64) -> Result<Valu
     std::fs::create_dir_all(cwd).ok();
 
     let child = if cfg!(target_os = "windows") {
-        Command::new("cmd")
-            .args(["/C", command])
-            .current_dir(cwd)
-            .output()
+        let mut cmd = Command::new("cmd");
+        cmd.hide_window();
+        cmd.args(["/C", command]).current_dir(cwd).output()
     } else {
         Command::new("sh")
             .args(["-c", command])

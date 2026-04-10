@@ -4,6 +4,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::rag::ingest::ingest_file;
 
+/// Read any file from disk and return its raw bytes as a base64-encoded string.
+/// Used by the frontend to embed local files (e.g. PDFs) as data URIs.
+#[tauri::command]
+pub async fn read_file_as_base64(path: String) -> Result<String, String> {
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|e| format!("Failed to read '{}': {}", path, e))?;
+    use base64::Engine as _;
+    Ok(base64::engine::general_purpose::STANDARD.encode(&bytes))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttachmentContent {
     pub filename: String,

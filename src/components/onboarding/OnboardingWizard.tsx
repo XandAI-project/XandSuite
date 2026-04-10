@@ -166,7 +166,7 @@ export function OnboardingWizard() {
                     className={cn(
                       "px-3 py-1.5 rounded-full text-sm font-medium border transition-all",
                       selectedChip === chip
-                        ? "bg-primary text-primary-foreground border-primary"
+                        ? "glass-primary text-white border-blue-400/40"
                         : "bg-secondary border-border text-muted-foreground hover:text-foreground hover:border-primary/50"
                     )}
                   >

@@ -9,6 +9,7 @@ import {
   Terminal,
   Clock,
   ImageIcon,
+  Video,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { ToolStep } from "@/stores/skillsStore";
@@ -131,7 +132,12 @@ function useImageSrc(result: ImageGenResultData): string | undefined {
   if (result.gallery_id) {
     const galleryEntry = galleryImages.find((img) => img.id === result.gallery_id);
     if (galleryEntry) {
-      return `data:${galleryEntry.mime_type};base64,${galleryEntry.image_data}`;
+      // image_data may be a raw URL (package-generated) or a base64 blob (legacy upload)
+      const data = galleryEntry.image_data;
+      if (data.startsWith("http://") || data.startsWith("https://")) {
+        return data;
+      }
+      return `data:${galleryEntry.mime_type};base64,${data}`;
     }
   }
   return result.image_url;
@@ -176,6 +182,84 @@ function AlwaysVisibleImagePreview({ raw }: { raw: string }) {
   );
 }
 
+// ── Video generation result renderer ─────────────────────────────────────────
+
+interface VideoGenResultData {
+  status?: string;
+  video_url?: string;
+  gallery_id?: string;
+  filename?: string;
+  width?: number;
+  height?: number;
+  frames?: number;
+  seed?: number;
+  prompt?: string;
+}
+
+/** Resolve the best video src.
+ *  For videos the gallery stores the URL (not base64) so we just read it back.
+ *  Falls back to the live ComfyUI URL from the tool result. */
+function useVideoSrc(result: VideoGenResultData): string | undefined {
+  const galleryImages = useGalleryStore((s) => s.images);
+  if (result.gallery_id) {
+    const entry = galleryImages.find((img) => img.id === result.gallery_id);
+    if (entry && entry.mime_type.startsWith("video/")) {
+      return entry.image_data; // stored as URL for videos
+    }
+  }
+  return result.video_url;
+}
+
+function AlwaysVisibleVideoPreview({ raw }: { raw: string }) {
+  let r: VideoGenResultData = {};
+  try {
+    r = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+
+  // eslint-disable-next-line react-hooks/rules-of-hooks
+  const src = useVideoSrc(r);
+  if (!src) return null;
+
+  const isGif = r.filename?.toLowerCase().endsWith(".gif");
+
+  return (
+    <div className="border-t border-teal-500/20 px-3 pb-3 pt-2 space-y-2">
+      {isGif ? (
+        <img
+          src={src}
+          alt={r.prompt ?? "Generated video"}
+          className="rounded-md border border-border max-w-full max-h-96 object-contain"
+        />
+      ) : (
+        <video
+          src={src}
+          controls
+          loop
+          className="rounded-md border border-border max-w-full max-h-96 w-full"
+        />
+      )}
+      <div className="flex flex-wrap gap-3 text-[10px] text-muted-foreground">
+        {r.width && r.height && (
+          <span>{r.width} × {r.height} px</span>
+        )}
+        {r.frames && (
+          <span>{r.frames} frames</span>
+        )}
+        {r.filename && (
+          <span className="font-mono">{r.filename}</span>
+        )}
+      </div>
+      {r.prompt && (
+        <p className="text-[10px] text-foreground/70 italic line-clamp-2">
+          "{r.prompt}"
+        </p>
+      )}
+    </div>
+  );
+}
+
 // ── Generic tool step card ────────────────────────────────────────────────────
 
 function ToolStepCard({
@@ -199,9 +283,13 @@ function ToolStepCard({
     ?.toLowerCase()
     .includes("generate_image");
 
-  // Auto-open code execution and image generation steps so output is visible immediately
+  const isVideoGen = step.function_name
+    ?.toLowerCase()
+    .includes("generate_video");
+
+  // Auto-open code execution, image, and video generation steps so output is visible immediately
   const [autoOpened, setAutoOpened] = useState(false);
-  if ((isCodeExec || isImageGen) && !pending && step.result !== undefined && !autoOpened) {
+  if ((isCodeExec || isImageGen || isVideoGen) && !pending && step.result !== undefined && !autoOpened) {
     setAutoOpened(true);
     setTimeout(() => setOpen(true), 0);
   }
@@ -214,6 +302,8 @@ function ToolStepCard({
           ? "border-amber-500/30 bg-amber-500/5"
           : isError
           ? "border-red-500/30 bg-red-500/5"
+          : isVideoGen
+          ? "border-teal-500/30 bg-teal-500/5"
           : isImageGen
           ? "border-purple-500/30 bg-purple-500/5"
           : isCodeExec
@@ -230,6 +320,8 @@ function ToolStepCard({
           <Loader2 className="w-3 h-3 text-amber-400 animate-spin shrink-0" />
         ) : isError ? (
           <AlertCircle className="w-3 h-3 text-red-400 shrink-0" />
+        ) : isVideoGen ? (
+          <Video className="w-3 h-3 text-teal-400 shrink-0" />
         ) : isImageGen ? (
           <ImageIcon className="w-3 h-3 text-purple-400 shrink-0" />
         ) : isCodeExec ? (
@@ -241,15 +333,17 @@ function ToolStepCard({
         <span
           className={cn(
             "font-medium capitalize",
-            pending
-              ? "text-amber-300"
-              : isError
-              ? "text-red-300"
-              : isImageGen
-              ? "text-purple-300"
-              : isCodeExec
-              ? "text-blue-300"
-              : "text-emerald-300"
+          pending
+            ? "text-amber-300"
+            : isError
+            ? "text-red-300"
+            : isVideoGen
+            ? "text-teal-300"
+            : isImageGen
+            ? "text-purple-300"
+            : isCodeExec
+            ? "text-blue-300"
+            : "text-emerald-300"
           )}
         >
           {prettifyName(step.function_name)}
@@ -271,6 +365,10 @@ function ToolStepCard({
           {isImageGen && !pending && step.result !== undefined && (
             <AlwaysVisibleImagePreview raw={step.result} />
           )}
+          {/* Video shown at the top of the expanded card */}
+          {isVideoGen && !pending && step.result !== undefined && (
+            <AlwaysVisibleVideoPreview raw={step.result} />
+          )}
           <div>
             <div className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-1">
               Arguments
@@ -285,9 +383,9 @@ function ToolStepCard({
               </pre>
             )}
           </div>
-          {/* For image gen the preview above already shows everything.
+          {/* For image/video gen the preview above already shows everything.
               For other tools show the result / output section. */}
-          {step.result !== undefined && !isImageGen && (
+          {step.result !== undefined && !isImageGen && !isVideoGen && (
             <div>
               <div
                 className={cn(

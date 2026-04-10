@@ -1,22 +1,26 @@
-import { useEffect, useState } from "react";
-import { Save, Loader2, Download, CheckCircle2, Plus, Trash2, Pencil, ChevronDown, ChevronRight, Mic, Play, Square } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { Save, Loader2, Download, CheckCircle2, Mic, Play, Square, FolderOpen, ExternalLink, AudioLines } from "lucide-react";
 import { invoke } from "@/lib/tauri";
 import { listen } from "@tauri-apps/api/event";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { openPath } from "@tauri-apps/plugin-opener";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Progress } from "@/components/ui/progress";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useServerStore } from "@/stores/serverStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { cn } from "@/lib/utils";
-import type { AppSettings, ComfyWorkflow } from "@/lib/tauri";
+import type { AppSettings } from "@/lib/tauri";
 
 export function SettingsView() {
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [isSaving, setIsSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [dataDir, setDataDir] = useState("");
+  const [modelsDir, setModelsDir] = useState("");
 
   const {
     status: serverStatus, gpuInfo, isDownloading, downloadProgress, error: serverError,
@@ -30,6 +34,7 @@ export function SettingsView() {
   useEffect(() => {
     invoke<AppSettings>("get_settings").then(setSettings).catch(console.error);
     invoke<string>("get_data_dir").then(setDataDir).catch(console.error);
+    invoke<string>("get_models_dir").then(setModelsDir).catch(console.error);
     fetchStatus();
     detectGpu();
     const unlistenPromise = listenToProgress();
@@ -44,6 +49,8 @@ export function SettingsView() {
       // Refresh the global store so InputBar and other consumers
       // see the new values (e.g. whisper_enabled) immediately.
       await syncSettingsStore();
+      // Re-resolve the models dir in case it was changed
+      invoke<string>("get_models_dir").then(setModelsDir).catch(console.error);
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
     } catch (e) {
@@ -57,6 +64,19 @@ export function SettingsView() {
     setSettings((s) => s ? { ...s, [key]: value } : null);
   };
 
+  const handleBrowseModelsDir = async () => {
+    const selected = await openDialog({
+      directory: true,
+      multiple: false,
+      defaultPath: modelsDir || undefined,
+      title: "Select Models Directory",
+    });
+    if (selected && typeof selected === "string") {
+      update("models_directory", selected);
+      setModelsDir(selected);
+    }
+  };
+
   if (!settings) {
     return (
       <div className="flex items-center justify-center h-full">
@@ -67,18 +87,44 @@ export function SettingsView() {
 
   return (
     <div className="flex flex-col h-full">
-      <div className="px-6 py-4 border-b border-border flex items-center justify-between">
+      {/* Header */}
+      <div className="px-6 py-4 border-b border-border flex items-center justify-between shrink-0">
         <div>
           <h1 className="text-xl font-semibold">Settings</h1>
-          <p className="text-sm text-muted-foreground mt-1">Configure XandSuite preferences</p>
+          <p className="text-sm text-muted-foreground mt-0.5">Configure XandSuite preferences</p>
         </div>
-        <Button onClick={handleSave} disabled={isSaving}>
-          {isSaving ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <Save className="w-4 h-4 mr-2" />}
+        <Button onClick={handleSave} disabled={isSaving} className="gap-2">
+          {isSaving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
           {saved ? "Saved!" : "Save Settings"}
         </Button>
       </div>
 
-      <ScrollArea className="flex-1 px-6 py-6">
+      <Tabs defaultValue="models" className="flex flex-col flex-1 overflow-hidden">
+        {/* Tab nav strip */}
+        <div className="border-b border-border px-6 shrink-0">
+          <TabsList className="h-10 bg-transparent gap-1 p-0">
+            {[
+              { value: "models",   label: "Models" },
+              { value: "voice",    label: "Voice" },
+              { value: "remote",   label: "Remote" },
+              { value: "knowledge",label: "Knowledge" },
+              { value: "advanced", label: "Advanced" },
+              { value: "profile",  label: "Profile" },
+            ].map(({ value, label }) => (
+              <TabsTrigger
+                key={value}
+                value={value}
+                className="rounded-none border-b-2 border-transparent data-[state=active]:border-primary data-[state=active]:bg-transparent data-[state=active]:shadow-none px-3 h-10 text-sm"
+              >
+                {label}
+              </TabsTrigger>
+            ))}
+          </TabsList>
+        </div>
+
+        {/* ── Models tab ── */}
+        <TabsContent value="models" className="flex-1 overflow-hidden mt-0">
+        <ScrollArea className="h-full px-6 py-6">
         <div className="max-w-xl space-y-8">
           {/* HuggingFace */}
           <Section title="HuggingFace">
@@ -105,12 +151,36 @@ export function SettingsView() {
 
           {/* Model storage */}
           <Section title="Model Storage">
-            <Field label="Models directory" description={`Currently stored in: ${dataDir}`}>
-              <Input
-                placeholder="models"
-                value={settings.models_directory}
-                onChange={(e) => update("models_directory", e.target.value)}
-              />
+            <Field
+              label="Models directory"
+              description="Downloaded models are saved here. Changes apply to new downloads — existing models stay where they are."
+            >
+              <div className="flex gap-2 items-center">
+                <div className="flex-1 flex items-center gap-2 h-9 rounded-md border border-input bg-secondary/40 px-3 text-sm font-mono text-muted-foreground overflow-hidden">
+                  <span className="truncate">{modelsDir || settings.models_directory || "models"}</span>
+                </div>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="shrink-0 gap-1.5"
+                  onClick={handleBrowseModelsDir}
+                  title="Choose a different folder"
+                >
+                  <FolderOpen className="w-3.5 h-3.5" />
+                  Change
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="icon"
+                  className="shrink-0 w-9 h-9"
+                  onClick={() => openPath(modelsDir || settings.models_directory).catch(console.error)}
+                  title="Open folder in explorer"
+                >
+                  <ExternalLink className="w-3.5 h-3.5" />
+                </Button>
+              </div>
             </Field>
             <Field label="Default engine mode">
               <select
@@ -418,6 +488,15 @@ export function SettingsView() {
             </Field>
           </Section>
 
+        </div>
+        </ScrollArea>
+        </TabsContent>
+
+        {/* ── Remote tab ── */}
+        <TabsContent value="remote" className="flex-1 overflow-hidden mt-0">
+        <ScrollArea className="h-full px-6 py-6">
+        <div className="max-w-xl space-y-8">
+
           {/* Remote server */}
           <Section title="Remote LLM Server (optional)">
             <Field label="Server URL" description="OpenAI-compatible endpoint (e.g., http://localhost:8080)">
@@ -437,29 +516,14 @@ export function SettingsView() {
             </Field>
           </Section>
 
-          {/* Tools & Code Execution */}
-          <Section title="Tools &amp; Code Execution">
-            <Field
-              label="Code Execution"
-              description="Allow the AI to run code (Python, JavaScript, Shell) in a sandboxed subprocess and return real output — like Claude's code execution."
-            >
-              <label className="flex items-center gap-2 cursor-pointer">
-                <input
-                  type="checkbox"
-                  className="w-4 h-4 accent-primary"
-                  checked={settings.enable_code_execution ?? false}
-                  onChange={(e) => update("enable_code_execution", e.target.checked)}
-                />
-                <span className="text-sm">Enable code execution</span>
-              </label>
-              {settings.enable_code_execution && (
-                <p className="text-xs text-amber-400 mt-2">
-                  Requires Python 3 and/or Node.js to be installed and available on your PATH.
-                  Code runs with the same permissions as this application.
-                </p>
-              )}
-            </Field>
-          </Section>
+        </div>
+        </ScrollArea>
+        </TabsContent>
+
+        {/* ── Voice tab ── */}
+        <TabsContent value="voice" className="flex-1 overflow-hidden mt-0">
+        <ScrollArea className="h-full px-6 py-6">
+        <div className="max-w-xl space-y-8">
 
           {/* Voice Input (Whisper) */}
           <Section title="Voice Input (Whisper)">
@@ -535,89 +599,189 @@ export function SettingsView() {
             )}
           </Section>
 
-          {/* Image Generation */}
-          <Section title="Image Generation (ComfyUI)">
+          {/* Voice Output (KokoroTTS) */}
+          <Section title="Voice Output (KokoroTTS)">
             <Field
-              label="ComfyUI URL"
-              description="Base URL of a running ComfyUI instance. Leave empty to disable image generation."
+              label="Enable voice output"
+              description="Enables voice-to-voice conversation mode. Responses are synthesised locally using KokoroTTS (requires Python 3)."
             >
-              <Input
-                placeholder="http://localhost:8188"
-                value={settings.comfyui_url || ""}
-                onChange={(e) => update("comfyui_url", e.target.value || null)}
-              />
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  className="w-4 h-4 accent-primary"
+                  checked={settings.tts_enabled ?? false}
+                  onChange={(e) => update("tts_enabled", e.target.checked)}
+                />
+                <span className="text-sm flex items-center gap-1.5">
+                  <AudioLines className="w-3.5 h-3.5" /> Enable voice output
+                </span>
+              </label>
             </Field>
-            {settings.comfyui_url && (
+
+            {settings.tts_enabled && (
               <>
-                {/* Model type selector */}
+                {/* Model download */}
                 <Field
-                  label="Model Type"
-                  description="Which loader ComfyUI uses for your model. Auto-detect checks checkpoints/ first, then diffusion_models/."
+                  label="KokoroTTS models"
+                  description="Downloads kokoro-v1.0.int8.onnx (~88 MB) and voices-v1.0.bin (~27 MB) from GitHub. Stored in the app data folder."
                 >
-                  <select
-                    className="w-full bg-secondary border border-border rounded px-3 py-1.5 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
-                    value={settings.comfyui_model_type || "auto"}
-                    onChange={(e) =>
-                      update("comfyui_model_type", e.target.value === "auto" ? null : e.target.value)
-                    }
-                  >
-                    <option value="auto">Auto-detect</option>
-                    <option value="checkpoint">Checkpoint (models/checkpoints/)</option>
-                    <option value="unet">Diffusion Model (models/diffusion_models/)</option>
-                  </select>
+                  <KokoroModelsRow />
                 </Field>
 
-                {/* Model name */}
+                {/* Voice selection */}
                 <Field
-                  label="Model filename"
-                  description={
-                    settings.comfyui_model_type === "unet"
-                      ? "Filename in models/diffusion_models/ (e.g. z_image_turbo_bf16.safetensors). Leave blank to auto-pick the first available."
-                      : settings.comfyui_model_type === "checkpoint"
-                      ? "Filename in models/checkpoints/ (e.g. v1-5-pruned-emaonly.safetensors). Leave blank to auto-pick the first available."
-                      : "Model filename — auto-detected from checkpoints/ then diffusion_models/ when left blank."
-                  }
+                  label="Default voice"
+                  description="Voice used when speaking responses. Each language has dedicated voices."
                 >
+                  <div className="flex items-center gap-3 flex-wrap">
+                    <select
+                      value={settings.tts_voice ?? "af_heart"}
+                      onChange={(e) => {
+                        const voiceId = e.target.value;
+                        // Auto-update language to match voice prefix
+                        const langMap: Record<string, string> = {
+                          af: "en-us", am: "en-us",
+                          bf: "en-gb", bm: "en-gb",
+                          pf: "pt-br", pm: "pt-br",
+                          ef: "es",    em: "es",
+                          ff: "fr",
+                          if: "it",
+                          hf: "hi",    hm: "hi",
+                          jf: "ja",    jm: "ja",
+                          kf: "ko",    km: "ko",
+                          zf: "zh",    zm: "zh",
+                        };
+                        const prefix = voiceId.slice(0, 2);
+                        const lang = langMap[prefix] ?? settings.tts_language ?? "en-us";
+                        update("tts_voice", voiceId);
+                        update("tts_language", lang);
+                      }}
+                      className="text-sm bg-background border border-border rounded px-2 py-1 h-8"
+                    >
+                      <optgroup label="English (US)">
+                        {["af_heart","af_bella","af_sarah","af_sky","am_adam","am_michael"].map(v => (
+                          <option key={v} value={v}>{v}</option>
+                        ))}
+                      </optgroup>
+                      <optgroup label="English (UK)">
+                        {["bf_emma","bf_isabella","bm_george","bm_lewis"].map(v => (
+                          <option key={v} value={v}>{v}</option>
+                        ))}
+                      </optgroup>
+                      <optgroup label="Portuguese (BR)">
+                        {["pf_dora","pm_alex","pm_santa"].map(v => (
+                          <option key={v} value={v}>{v}</option>
+                        ))}
+                      </optgroup>
+                      <optgroup label="Spanish">
+                        {["ef_dora","em_alex","em_santa"].map(v => (
+                          <option key={v} value={v}>{v}</option>
+                        ))}
+                      </optgroup>
+                      <optgroup label="French">
+                        {["ff_siwis"].map(v => (
+                          <option key={v} value={v}>{v}</option>
+                        ))}
+                      </optgroup>
+                      <optgroup label="Italian">
+                        {["if_sara"].map(v => (
+                          <option key={v} value={v}>{v}</option>
+                        ))}
+                      </optgroup>
+                      <optgroup label="Hindi">
+                        {["hf_alpha","hm_omega"].map(v => (
+                          <option key={v} value={v}>{v}</option>
+                        ))}
+                      </optgroup>
+                      <optgroup label="Japanese">
+                        {["jf_alpha","jf_gongitsune","jm_kumo"].map(v => (
+                          <option key={v} value={v}>{v}</option>
+                        ))}
+                      </optgroup>
+                      <optgroup label="Korean">
+                        {["kf_alpha","km_omega"].map(v => (
+                          <option key={v} value={v}>{v}</option>
+                        ))}
+                      </optgroup>
+                      <optgroup label="Mandarin">
+                        {["zf_xiaobei","zm_yunxi"].map(v => (
+                          <option key={v} value={v}>{v}</option>
+                        ))}
+                      </optgroup>
+                    </select>
+                    <span className="text-xs text-muted-foreground">
+                      Language: <span className="font-mono">{settings.tts_language ?? "en-us"}</span>
+                    </span>
+                  </div>
+                </Field>
+
+                {/* Speed */}
+                <Field label="Speech speed" description="Rate multiplier. 1.0 = normal, 0.8 = slower, 1.3 = faster.">
+                  <div className="flex items-center gap-3">
+                    <input
+                      type="range"
+                      min={0.5}
+                      max={2.0}
+                      step={0.1}
+                      value={settings.tts_speed ?? 1.0}
+                      onChange={(e) => update("tts_speed", parseFloat(e.target.value))}
+                      className="w-32 accent-primary"
+                    />
+                    <span className="text-sm w-10 text-right tabular-nums">
+                      {(settings.tts_speed ?? 1.0).toFixed(1)}×
+                    </span>
+                  </div>
+                </Field>
+
+                {/* Port */}
+                <Field label="Server port" description="Port the kokoro_server.py sidecar listens on (default 8766).">
                   <Input
-                    placeholder="Leave blank to auto-detect"
-                    value={settings.comfyui_model || ""}
-                    onChange={(e) => update("comfyui_model", e.target.value || null)}
+                    type="number"
+                    value={settings.tts_port ?? 8766}
+                    onChange={(e) => update("tts_port", Number(e.target.value))}
+                    className="w-28"
                   />
                 </Field>
 
-                {/* CLIP + VAE fields — only shown for UNETLoader models */}
-                {settings.comfyui_model_type === "unet" && (
-                  <>
-                    <Field
-                      label="CLIP model"
-                      description="Filename in models/clip/ (e.g. clip_l.safetensors). Leave blank to auto-pick the first available."
-                    >
-                      <Input
-                        placeholder="Leave blank to auto-detect"
-                        value={settings.comfyui_clip_name || ""}
-                        onChange={(e) => update("comfyui_clip_name", e.target.value || null)}
-                      />
-                    </Field>
-                    <Field
-                      label="VAE model"
-                      description="Filename in models/vae/ (e.g. ae.safetensors). Leave blank to auto-pick the first available."
-                    >
-                      <Input
-                        placeholder="Leave blank to auto-detect"
-                        value={settings.comfyui_vae_name || ""}
-                        onChange={(e) => update("comfyui_vae_name", e.target.value || null)}
-                      />
-                    </Field>
-                  </>
-                )}
-
-                <p className="text-xs text-emerald-400">
-                  Image generation enabled — the AI can now call{" "}
-                  <code className="font-mono">generate_image</code> when you ask for visuals.
-                </p>
-                <ComfyWorkflowManager />
+                {/* Server control */}
+                <Field label="Server" description="Start or stop the KokoroTTS sidecar manually.">
+                  <KokoroServerControl />
+                </Field>
               </>
             )}
+          </Section>
+
+        </div>
+        </ScrollArea>
+        </TabsContent>
+
+        {/* ── Advanced tab ── */}
+        <TabsContent value="advanced" className="flex-1 overflow-hidden mt-0">
+        <ScrollArea className="h-full px-6 py-6">
+        <div className="max-w-xl space-y-8">
+
+          {/* Code Execution */}
+          <Section title="Tools &amp; Code Execution">
+            <Field
+              label="Code Execution"
+              description="Allow the AI to run code (Python, JavaScript, Shell) in a sandboxed subprocess and return real output."
+            >
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  className="w-4 h-4 accent-primary"
+                  checked={settings.enable_code_execution ?? false}
+                  onChange={(e) => update("enable_code_execution", e.target.checked)}
+                />
+                <span className="text-sm">Enable code execution</span>
+              </label>
+              {settings.enable_code_execution && (
+                <p className="text-xs text-amber-400 mt-2">
+                  Requires Python 3 and/or Node.js to be installed and available on your PATH.
+                  Code runs with the same permissions as this application.
+                </p>
+              )}
+            </Field>
           </Section>
 
           {/* VLM / Multimodal */}
@@ -668,6 +832,15 @@ export function SettingsView() {
               />
             </Field>
           </Section>
+
+        </div>
+        </ScrollArea>
+        </TabsContent>
+
+        {/* ── Knowledge tab ── */}
+        <TabsContent value="knowledge" className="flex-1 overflow-hidden mt-0">
+        <ScrollArea className="h-full px-6 py-6">
+        <div className="max-w-xl space-y-8">
 
           {/* Memory */}
           <Section title="Memory">
@@ -845,6 +1018,15 @@ export function SettingsView() {
             )}
           </Section>
 
+        </div>
+        </ScrollArea>
+        </TabsContent>
+
+        {/* ── Profile tab ── */}
+        <TabsContent value="profile" className="flex-1 overflow-hidden mt-0">
+        <ScrollArea className="h-full px-6 py-6">
+        <div className="max-w-xl space-y-8">
+
           {/* User profile */}
           <Section title="Profile">
             <Field label="Your name" description="How the AI addresses you.">
@@ -880,202 +1062,10 @@ export function SettingsView() {
             </div>
           </Section>
         </div>
-      </ScrollArea>
-    </div>
-  );
-}
+        </ScrollArea>
+        </TabsContent>
 
-// ── ComfyUI Workflow Manager ──────────────────────────────────────────────────
-
-const PLACEHOLDER_HELP = `Export your workflow from ComfyUI using "Save (API format)".
-Then replace values in the JSON with these placeholders:
-
-  __POSITIVE_PROMPT__  → the AI's image prompt
-  __NEGATIVE_PROMPT__  → negative prompt
-  __SEED__             → random seed
-  __STEPS__            → number of steps
-  __WIDTH__            → image width
-  __HEIGHT__           → image height
-
-Example: find the text node and change its "text" value to __POSITIVE_PROMPT__`;
-
-interface WorkflowForm {
-  id: string | null;
-  name: string;
-  description: string;
-  workflow_json: string;
-}
-
-const emptyForm = (): WorkflowForm => ({ id: null, name: "", description: "", workflow_json: "" });
-
-function ComfyWorkflowManager() {
-  const [workflows, setWorkflows] = useState<ComfyWorkflow[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [form, setForm] = useState<WorkflowForm | null>(null);
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [helpOpen, setHelpOpen] = useState(false);
-
-  const load = () => {
-    setLoading(true);
-    invoke<ComfyWorkflow[]>("list_comfyui_workflows")
-      .then(setWorkflows)
-      .catch(console.error)
-      .finally(() => setLoading(false));
-  };
-
-  useEffect(() => { load(); }, []);
-
-  const handleSave = async () => {
-    if (!form) return;
-    setError(null);
-    if (!form.name.trim()) { setError("Name is required."); return; }
-    if (!form.workflow_json.trim()) { setError("Workflow JSON is required."); return; }
-    try {
-      JSON.parse(form.workflow_json);
-    } catch {
-      setError("Invalid JSON — please paste valid ComfyUI API-format workflow JSON.");
-      return;
-    }
-    setSaving(true);
-    try {
-      await invoke("save_comfyui_workflow", {
-        payload: {
-          id: form.id ?? undefined,
-          name: form.name.trim(),
-          description: form.description.trim() || null,
-          workflow_json: form.workflow_json.trim(),
-        },
-      });
-      setForm(null);
-      load();
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const handleDelete = async (id: string) => {
-    if (!confirm("Delete this workflow?")) return;
-    await invoke("delete_comfyui_workflow", { id }).catch(console.error);
-    load();
-  };
-
-  return (
-    <div className="space-y-3 pt-1">
-      {/* Header */}
-      <div className="flex items-center justify-between">
-        <span className="text-sm font-medium">Custom Workflows</span>
-        {!form && (
-          <Button size="sm" variant="outline" onClick={() => setForm(emptyForm())}>
-            <Plus className="w-3 h-3 mr-1" /> Add Workflow
-          </Button>
-        )}
-      </div>
-
-      {/* Help block */}
-      <div className="rounded-md border border-border bg-secondary/20 text-xs">
-        <button
-          className="flex w-full items-center gap-1.5 px-3 py-2 text-muted-foreground hover:text-foreground transition-colors"
-          onClick={() => setHelpOpen((v) => !v)}
-        >
-          {helpOpen ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
-          How to use placeholder tokens
-        </button>
-        {helpOpen && (
-          <pre className="px-3 pb-3 text-[10px] font-mono whitespace-pre-wrap text-muted-foreground leading-relaxed">
-            {PLACEHOLDER_HELP}
-          </pre>
-        )}
-      </div>
-
-      {/* Workflow list */}
-      {loading ? (
-        <div className="flex items-center gap-2 text-xs text-muted-foreground py-2">
-          <Loader2 className="w-3 h-3 animate-spin" /> Loading…
-        </div>
-      ) : workflows.length === 0 && !form ? (
-        <p className="text-xs text-muted-foreground italic">
-          No custom workflows yet. Add one to let the AI pick it by name.
-        </p>
-      ) : (
-        <div className="space-y-2">
-          {workflows.map((wf) => (
-            <div
-              key={wf.id}
-              className="flex items-start justify-between gap-2 rounded-md border border-border bg-secondary/20 px-3 py-2"
-            >
-              <div className="min-w-0">
-                <p className="text-sm font-medium truncate">{wf.name}</p>
-                {wf.description && (
-                  <p className="text-xs text-muted-foreground truncate">{wf.description}</p>
-                )}
-              </div>
-              <div className="flex shrink-0 gap-1">
-                <button
-                  className="p-1 rounded hover:bg-white/10 text-muted-foreground hover:text-foreground transition-colors"
-                  title="Edit"
-                  onClick={() =>
-                    setForm({
-                      id: wf.id,
-                      name: wf.name,
-                      description: wf.description ?? "",
-                      workflow_json: wf.workflow_json,
-                    })
-                  }
-                >
-                  <Pencil className="w-3.5 h-3.5" />
-                </button>
-                <button
-                  className="p-1 rounded hover:bg-red-500/20 text-muted-foreground hover:text-red-400 transition-colors"
-                  title="Delete"
-                  onClick={() => handleDelete(wf.id)}
-                >
-                  <Trash2 className="w-3.5 h-3.5" />
-                </button>
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-
-      {/* Add / Edit form */}
-      {form && (
-        <div className="rounded-md border border-primary/30 bg-primary/5 p-3 space-y-3">
-          <p className="text-xs font-semibold text-primary">
-            {form.id ? "Edit Workflow" : "New Workflow"}
-          </p>
-          <div className="space-y-2">
-            <Input
-              placeholder="Name (e.g. Portrait)"
-              value={form.name}
-              onChange={(e) => setForm((f) => f && { ...f, name: e.target.value })}
-            />
-            <Input
-              placeholder="Description (optional)"
-              value={form.description}
-              onChange={(e) => setForm((f) => f && { ...f, description: e.target.value })}
-            />
-            <textarea
-              className="w-full rounded-md border border-input bg-background text-foreground text-[11px] font-mono px-3 py-2 min-h-[160px] resize-y placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring"
-              placeholder={'Paste ComfyUI API-format workflow JSON here…\nUse __POSITIVE_PROMPT__ etc. as placeholders.'}
-              value={form.workflow_json}
-              onChange={(e) => setForm((f) => f && { ...f, workflow_json: e.target.value })}
-            />
-          </div>
-          {error && <p className="text-xs text-destructive">{error}</p>}
-          <div className="flex gap-2">
-            <Button size="sm" onClick={handleSave} disabled={saving}>
-              {saving && <Loader2 className="w-3 h-3 mr-1 animate-spin" />}
-              {form.id ? "Update" : "Save"}
-            </Button>
-            <Button size="sm" variant="outline" onClick={() => { setForm(null); setError(null); }}>
-              Cancel
-            </Button>
-          </div>
-        </div>
-      )}
+      </Tabs>
     </div>
   );
 }
@@ -1121,6 +1111,12 @@ const WHISPER_VARIANTS = [
   { id: "cpu",    label: "CPU only",  subtitle: "Any hardware" },
   { id: "cuda11", label: "CUDA 11",   subtitle: "GTX 10/16, RTX 20" },
   { id: "cuda12", label: "CUDA 12",   subtitle: "RTX 30/40/50" },
+] as const;
+
+const TTS_DEVICES = [
+  { id: "cpu",    label: "CPU",      subtitle: "Any hardware" },
+  { id: "cuda11", label: "CUDA 11",  subtitle: "GTX 10/16, RTX 20" },
+  { id: "cuda12", label: "CUDA 12",  subtitle: "RTX 30/40/50" },
 ] as const;
 
 function WhisperBinaryRow({
@@ -1387,6 +1383,315 @@ function WhisperServerControl() {
         </Button>
       )}
       {error && <p className="text-xs text-destructive w-full">{error}</p>}
+    </div>
+  );
+}
+
+// ── KokoroTTS components ──────────────────────────────────────────────────────
+
+interface TtsStatus {
+  enabled: boolean;
+  models_exist: boolean;
+  /** Process is alive */
+  running: boolean;
+  /** Server passed /health check — fully ready */
+  healthy: boolean;
+  port: number;
+  voice: string;
+  speed: number;
+  language: string;
+  device: string;
+}
+
+function KokoroModelsRow() {
+  const [status, setStatus] = useState<TtsStatus | null>(null);
+  const [downloading, setDownloading] = useState(false);
+  const [logLines, setLogLines] = useState<string[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const logRef = useRef<HTMLDivElement>(null);
+
+  const refresh = () =>
+    invoke<TtsStatus>("get_tts_status").then(setStatus).catch(console.error);
+
+  useEffect(() => { refresh(); }, []);
+
+  // Auto-scroll log
+  useEffect(() => {
+    if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
+  }, [logLines]);
+
+  const handleDownload = async () => {
+    setError(null);
+    setDownloading(true);
+    setLogLines([]);
+
+    // download_tts_progress.filename carries a log line (from the Python subprocess)
+    const unlisten = await listen<{ model_id: string; filename: string; downloaded_bytes: number; total_bytes: number | null; status: string }>(
+      "download_tts_progress",
+      (event) => {
+        const line = event.payload.filename;
+        if (line) setLogLines((prev) => [...prev.slice(-199), line]);
+      }
+    );
+
+    try {
+      await invoke("download_tts_models");
+      await refresh();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      unlisten();
+      setDownloading(false);
+    }
+  };
+
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="flex items-center gap-2 flex-wrap">
+        {status?.models_exist ? (
+          <span className="flex items-center gap-1.5 text-xs text-emerald-400">
+            <CheckCircle2 className="w-3.5 h-3.5" />
+            hexgrad/Kokoro-82M downloaded
+          </span>
+        ) : (
+          <span className="text-xs text-muted-foreground">
+            hexgrad/Kokoro-82M — not downloaded (~300 MB)
+          </span>
+        )}
+
+        {downloading ? (
+          <span className="flex items-center gap-1.5 text-xs text-yellow-400">
+            <Loader2 className="w-3 h-3 animate-spin" /> Downloading…
+          </span>
+        ) : (
+          <Button size="sm" variant="outline" onClick={handleDownload} className="h-7 gap-1.5">
+            <Download className="w-3 h-3" />
+            {status?.models_exist ? "Re-download" : "Download model"}
+          </Button>
+        )}
+      </div>
+
+      {/* Live download log */}
+      {(downloading || logLines.length > 0) && (
+        <div
+          ref={logRef}
+          className="text-[10px] font-mono bg-muted/40 rounded p-2 max-h-32 overflow-y-auto text-muted-foreground"
+        >
+          {logLines.length === 0 ? (
+            <span className="opacity-50">Starting download…</span>
+          ) : (
+            logLines.map((l, i) => <div key={i}>{l}</div>)
+          )}
+        </div>
+      )}
+
+      {error && <p className="text-xs text-destructive">{error}</p>}
+    </div>
+  );
+}
+
+function KokoroServerControl() {
+  const [status, setStatus] = useState<TtsStatus | null>(null);
+  const [starting, setStarting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [liveLog, setLiveLog] = useState<string>("");
+  const [showFullLog, setShowFullLog] = useState(false);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const logBoxRef = useRef<HTMLPreElement | null>(null);
+
+  const { settings, saveSettings } = useSettingsStore();
+  const currentDevice = settings?.tts_device ?? "cpu";
+
+  const fetchLog = async () => {
+    try {
+      const result = await invoke<string>("get_tts_log");
+      setLiveLog(result || "");
+    } catch { /* ignore */ }
+  };
+
+  const refresh = async () => {
+    try {
+      const s = await invoke<TtsStatus>("get_tts_status");
+      setStatus(s);
+      return s;
+    } catch {
+      return null;
+    }
+  };
+
+  const stopPolling = () => {
+    if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+  };
+
+  const startPolling = () => {
+    stopPolling();
+    pollRef.current = setInterval(async () => {
+      const s = await refresh();
+      await fetchLog();
+      if (s?.healthy) {
+        setStarting(false);
+        stopPolling();
+      } else if (s && !s.running && starting) {
+        setStarting(false);
+        stopPolling();
+        await fetchLog();
+        setError("Server exited during startup. See the log below for details.");
+      }
+    }, 2500);
+  };
+
+  // Auto-scroll log box to bottom
+  useEffect(() => {
+    if (logBoxRef.current) {
+      logBoxRef.current.scrollTop = logBoxRef.current.scrollHeight;
+    }
+  }, [liveLog]);
+
+  useEffect(() => {
+    refresh();
+    return () => stopPolling();
+  }, []); // eslint-disable-line
+
+  const handleStart = async () => {
+    setError(null);
+    setLiveLog("");
+    setStarting(true);
+    try {
+      await invoke("start_tts_server");
+      await refresh();
+      startPolling();
+    } catch (e) {
+      setStarting(false);
+      setError(String(e));
+    }
+  };
+
+  const handleStop = async () => {
+    stopPolling();
+    setStarting(false);
+    setError(null);
+    try {
+      await invoke("stop_tts_server");
+      await refresh();
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const isStarting = starting || (!!status?.running && !status?.healthy);
+
+  const statusLabel = () => {
+    if (status?.healthy) return `Ready (port ${status.port})`;
+    if (isStarting) return "Starting…";
+    return "Stopped";
+  };
+
+  const statusColor = () => {
+    if (status?.healthy) return "bg-green-500/15 text-green-400";
+    if (isStarting) return "bg-yellow-500/15 text-yellow-400";
+    return "bg-muted text-muted-foreground";
+  };
+
+  // Extract the last meaningful log line to show as a progress hint
+  const lastLogLine = liveLog
+    .split("\n")
+    .filter(l => l.trim().length > 0)
+    .slice(-1)[0]
+    ?.replace(/^\[kokoro-server \d+:\d+:\d+\]\s*/, "") ?? "";
+
+  return (
+    <div className="space-y-2">
+      {/* Device selector */}
+      <div className="flex flex-wrap gap-2">
+        {TTS_DEVICES.map(({ id, label, subtitle }) => {
+          const isSelected = currentDevice === id;
+          const isRunning = status?.running || status?.healthy;
+          return (
+            <Button
+              key={id}
+              size="sm"
+              variant={isSelected ? "default" : "outline"}
+              disabled={starting}
+              onClick={async () => {
+                if (isRunning) {
+                  // Stop the server so it restarts with the new device
+                  await invoke("stop_tts_server").catch(() => {});
+                  await refresh();
+                }
+                await saveSettings({ tts_device: id });
+              }}
+              className={cn("flex-col h-auto py-1.5 px-3 gap-0", isSelected && "ring-1 ring-primary")}
+            >
+              <span className="text-xs font-medium">{label}</span>
+              <span className="text-[9px] opacity-60">{subtitle}</span>
+            </Button>
+          );
+        })}
+        {status?.running && status.device !== currentDevice && (
+          <p className="self-center text-[10px] text-yellow-400">
+            Restart the server to apply the new device.
+          </p>
+        )}
+      </div>
+
+      <div className="flex items-center gap-3 flex-wrap">
+        <span className={cn("text-xs px-2 py-0.5 rounded-full font-medium", statusColor())}>
+          {isStarting ? (
+            <span className="flex items-center gap-1">
+              <Loader2 className="w-3 h-3 animate-spin inline" /> {statusLabel()}
+            </span>
+          ) : statusLabel()}
+        </span>
+
+        {(status?.running || status?.healthy) ? (
+          <Button size="sm" variant="outline" onClick={handleStop} className="h-7 gap-1.5">
+            <Square className="w-3 h-3" /> Stop
+          </Button>
+        ) : (
+          <Button size="sm" variant="outline" onClick={handleStart} disabled={starting} className="h-7 gap-1.5">
+            {starting ? <Loader2 className="w-3 h-3 animate-spin" /> : <Play className="w-3 h-3" />}
+            {starting ? "Starting…" : "Start"}
+          </Button>
+        )}
+
+        <button
+          className="text-xs text-muted-foreground hover:text-foreground underline underline-offset-2 transition-colors"
+          onClick={() => { fetchLog(); setShowFullLog(v => !v); }}
+        >
+          {showFullLog ? "Hide log" : "View log"}
+        </button>
+      </div>
+
+      {isStarting && (
+        <div className="space-y-1">
+          <p className="text-xs text-muted-foreground">
+            First launch installs Python dependencies and loads the model.
+            This can take <strong>5–15 minutes</strong> on first run — please wait.
+          </p>
+          {lastLogLine && (
+            <p className="text-xs text-yellow-400/80 font-mono truncate">
+              ↳ {lastLogLine}
+            </p>
+          )}
+        </div>
+      )}
+
+      {error && (
+        <div className="rounded-lg border border-destructive/30 bg-destructive/5 p-2">
+          <p className="text-xs text-destructive whitespace-pre-wrap break-all">{error}</p>
+        </div>
+      )}
+
+      {showFullLog && (
+        <div className="relative">
+          <pre
+            ref={logBoxRef}
+            className="text-xs bg-muted/50 rounded p-2 max-h-52 overflow-y-auto whitespace-pre-wrap break-all font-mono"
+          >
+            {liveLog || "(log is empty — server may still be starting)"}
+          </pre>
+        </div>
+      )}
     </div>
   );
 }

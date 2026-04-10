@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Instant;
 
+use crate::process_ext::HideWindowStd;
+
 pub struct WhisperManager {
     process: Option<Child>,
     port: u16,
@@ -51,6 +53,7 @@ impl WhisperManager {
         }
 
         let mut cmd = Command::new(&bin);
+        cmd.hide_window();
         if let Some(bin_dir) = bin.parent() {
             cmd.current_dir(bin_dir);
         }

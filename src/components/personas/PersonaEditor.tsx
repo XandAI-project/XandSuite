@@ -14,7 +14,6 @@ import { useModelStore } from "@/stores/modelStore";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
-import { Badge } from "@/components/ui/badge";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
 import type { Persona, CreatePersonaInput, UpdatePersonaInput } from "@/lib/tauri";

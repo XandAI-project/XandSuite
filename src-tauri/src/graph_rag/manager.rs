@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::time::Duration;
 
+use crate::process_ext::HideWindowStd;
+
 /// Manages the graphrag-server sidecar process, mirroring `LlamaServerManager`.
 pub struct GraphRagManager {
     process: Option<Child>,
@@ -55,7 +57,9 @@ impl GraphRagManager {
             );
         }
 
-        let child = Command::new(&bin)
+        let mut cmd = Command::new(&bin);
+        cmd.hide_window();
+        let child = cmd
             .args([
                 "--port", &port.to_string(),
                 "--vector-db", vector_db,

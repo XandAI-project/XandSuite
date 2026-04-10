@@ -1,10 +1,46 @@
-import { invoke } from "@tauri-apps/api/core";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-
-export { invoke, listen };
-export type { UnlistenFn };
+// Re-export invoke and listen from the unified transport layer.
+// In Tauri mode: delegates to @tauri-apps/api (native IPC).
+// In web/headless mode: delegates to HTTP fetch + SSE EventSource.
+export { invoke, listen, isTauri } from "./transport";
+export type { UnlistenFn } from "./transport";
 
 // Type-safe wrappers for Tauri commands
+
+// ── Prompt Templates ─────────────────────────────────────────────────────────
+
+export interface PromptTemplate {
+  id: string;
+  title: string;
+  content: string;
+  description?: string;
+  category?: string;
+  /** Optional slash-command shortcut, e.g. "/sum". */
+  shortcut?: string;
+  /** Optional package name required to use this template, e.g. "ComfyUI Images". */
+  requires?: string;
+  use_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CreateTemplateInput {
+  title: string;
+  content: string;
+  description?: string;
+  category?: string;
+  shortcut?: string;
+  requires?: string;
+}
+
+export interface UpdateTemplateInput {
+  id: string;
+  title?: string;
+  content?: string;
+  description?: string;
+  category?: string;
+  shortcut?: string;
+  requires?: string;
+}
 
 // ── Personas ────────────────────────────────────────────────────────────────
 
@@ -299,7 +335,7 @@ export interface ToolResultEvent {
   turn: number;
 }
 
-export type ArtifactType = "code" | "markdown" | "html" | "text" | "csv" | "json";
+export type ArtifactType = "code" | "markdown" | "html" | "text" | "csv" | "json" | "pdf";
 
 export interface Artifact {
   id: string;
@@ -406,16 +442,6 @@ export interface AppSettings {
   mmproj_path: string | null;
   /** Automatically extract and recall key facts from conversations. */
   memory_enabled: boolean;
-  /** Base URL of a running ComfyUI instance. When set, enables image generation. */
-  comfyui_url: string | null;
-  /** Model filename. Interpreted according to comfyui_model_type. */
-  comfyui_model: string | null;
-  /** "checkpoint" | "unet" | null (auto-detect). */
-  comfyui_model_type: string | null;
-  /** CLIP model filename for UNETLoader workflows (auto-detected when null). */
-  comfyui_clip_name: string | null;
-  /** VAE model filename for UNETLoader workflows (auto-detected when null). */
-  comfyui_vae_name: string | null;
   /** Enable the mobile HTTP/SSE bridge server. */
   mobile_api_enabled: boolean;
   /** Port for the mobile bridge server (default 3847). */
@@ -454,14 +480,19 @@ export interface AppSettings {
   whisper_port: number;
   /** Which whisper-server build to download: "cpu" or "cuda". */
   whisper_variant: string;
-}
 
-export interface ComfyWorkflow {
-  id: string;
-  name: string;
-  description: string | null;
-  workflow_json: string;
-  created_at: string;
+  // Voice output (KokoroTTS)
+  tts_enabled: boolean;
+  /** Port the kokoro_server.py sidecar listens on (default 8766). */
+  tts_port: number;
+  /** Selected voice ID, e.g. "af_heart". */
+  tts_voice: string;
+  /** Speech rate multiplier (1.0 = normal). */
+  tts_speed: number;
+  /** BCP-47 language code for TTS, e.g. "en-us", "pt-br". */
+  tts_language: string;
+  /** Torch device for KokoroTTS: "cpu", "cuda11", or "cuda12". */
+  tts_device: string;
 }
 
 export interface GalleryImage {

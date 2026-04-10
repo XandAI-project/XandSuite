@@ -17,6 +17,15 @@ export default defineConfig(async () => ({
   },
 
   clearScreen: false,
+
+  // Prevent Vite from scanning or pre-bundling anything inside the Rust
+  // build artefacts directory. cargo doc produces tens-of-thousands of HTML
+  // files that exhaust the OS file-handle limit (EMFILE) if Vite's dep
+  // scanner accidentally follows an import into that tree.
+  optimizeDeps: {
+    exclude: ["src-tauri"],
+  },
+
   server: {
     port: 1420,
     strictPort: true,
@@ -29,7 +38,14 @@ export default defineConfig(async () => ({
         }
       : undefined,
     watch: {
-      ignored: ["**/src-tauri/**"],
+      // Keep the file-system watcher away from Rust build artefacts.
+      ignored: ["**/src-tauri/**", "**/src-tauri/target/**"],
+    },
+    fs: {
+      // Restrict the dev-server from serving files outside the project root.
+      // This also prevents the dep scanner from following imports into
+      // src-tauri/target.
+      deny: ["src-tauri/target"],
     },
   },
 

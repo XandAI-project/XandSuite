@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Plus, Trash2, MessageSquare, Settings2, Check, X, Images } from "lucide-react";
+import { Plus, Trash2, MessageSquare, Settings2, Check, X, Images, Zap, Sparkles, Pencil } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
 import { useChatStore } from "@/stores/chatStore";
 import { useRagStore } from "@/stores/ragStore";
@@ -7,8 +7,19 @@ import { useSkillsStore } from "@/stores/skillsStore";
 import { useArtifactStore } from "@/stores/artifactStore";
 import { useGalleryStore } from "@/stores/galleryStore";
 import { usePersonaStore } from "@/stores/personaStore";
+import { useTemplateStore } from "@/stores/templateStore";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { MessageBubble } from "./MessageBubble";
 import { ToolCallMessage } from "./ToolCallMessage";
 import { InputBar } from "./InputBar";
@@ -28,6 +39,7 @@ export function ChatView() {
     createConversation,
     updateConversation,
     deleteConversation,
+    renameConversation,
     retryLastMessage,
     editAndResend,
   } = useChatStore();
@@ -51,6 +63,7 @@ export function ChatView() {
   } = useGalleryStore();
 
   const { personas, fetchPersonas } = usePersonaStore();
+  const { templates, fetchTemplates } = useTemplateStore();
 
   // Resolve the active persona for the current conversation (for avatar display)
   const activePersona = useMemo(() => {
@@ -65,6 +78,21 @@ export function ChatView() {
   const [showSystemPrompt, setShowSystemPrompt] = useState(false);
   const [systemPromptDraft, setSystemPromptDraft] = useState("");
 
+  // Delete confirmation dialog
+  const [deleteTargetId, setDeleteTargetId] = useState<string | null>(null);
+
+  // Inline rename state
+  const [renamingId, setRenamingId] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState("");
+  const renameInputRef = useRef<HTMLInputElement>(null);
+
+  // Focus rename input when it appears
+  useEffect(() => {
+    if (renamingId) {
+      setTimeout(() => renameInputRef.current?.focus(), 30);
+    }
+  }, [renamingId]);
+
   // Track previous streaming state to detect the transition true → false
   const prevStreamingRef = useRef(false);
 
@@ -73,7 +101,18 @@ export function ChatView() {
     fetchCollections();
     fetchTools();
     fetchPersonas();
-  }, []);
+    fetchTemplates();
+  }, []);  // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Pick up to 4 starter template suggestions for the welcome screen
+  const suggestionTemplates = useMemo(() => {
+    const preferred = ["builtin-summarise", "builtin-explain", "builtin-translate", "builtin-report"];
+    const ordered = [
+      ...preferred.map((id) => templates.find((t) => t.id === id)).filter(Boolean),
+      ...templates.filter((t) => !preferred.includes(t.id)),
+    ] as typeof templates;
+    return ordered.slice(0, 4);
+  }, [templates]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -152,6 +191,20 @@ export function ChatView() {
     await openConversation(conv.id);
   };
 
+  const handleConfirmRename = async () => {
+    if (!renamingId || !renameValue.trim()) { setRenamingId(null); return; }
+    await renameConversation(renamingId, renameValue.trim());
+    setRenamingId(null);
+  };
+
+  // Create a new conversation pre-seeded with a template's content in the input
+  const handleSuggestionClick = async (content: string) => {
+    const conv = await createConversation();
+    await openConversation(conv.id);
+    // Dispatch a custom event that InputBar listens for to pre-fill content
+    window.dispatchEvent(new CustomEvent("prefill-input", { detail: { content } }));
+  };
+
   const handleSaveSystemPrompt = async () => {
     if (!activeConversation) return;
     await updateConversation(activeConversation.id, undefined, systemPromptDraft);
@@ -183,36 +236,72 @@ export function ChatView() {
         <ScrollArea className="flex-1">
           <div className="p-2 space-y-1">
             {conversations.length === 0 && (
-              <div className="text-center text-muted-foreground text-xs py-8">
-                No conversations yet.
-                <br />
-                Click + to start one.
-              </div>
+              <button
+                onClick={handleNewChat}
+                className="w-full flex flex-col items-center gap-2 py-8 px-3 rounded-xl border border-dashed border-border text-muted-foreground hover:text-foreground hover:border-primary/40 hover:bg-primary/5 transition-all"
+              >
+                <Plus className="w-5 h-5" />
+                <span className="text-xs font-medium">Start your first chat</span>
+              </button>
             )}
             {conversations.map((conv) => (
               <div
                 key={conv.id}
                 className={cn(
-                  "group flex items-center gap-2 px-3 py-2 rounded-lg cursor-pointer transition-colors overflow-hidden",
+                  "group flex items-center gap-2 px-2 py-1.5 rounded-lg cursor-pointer transition-colors overflow-hidden",
                   activeConversation?.id === conv.id
                     ? "bg-primary/10 text-foreground"
                     : "hover:bg-secondary text-muted-foreground hover:text-foreground"
                 )}
-                onClick={() => openConversation(conv.id)}
+                onClick={() => renamingId !== conv.id && openConversation(conv.id)}
               >
-                <MessageSquare className="w-3.5 h-3.5 shrink-0" />
+                <MessageSquare className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+
                 <div className="flex-1 min-w-0 overflow-hidden">
-                  <div className="text-xs font-medium truncate" title={conv.title}>{conv.title}</div>
-                  <div className="text-[10px] text-muted-foreground truncate">{formatDate(conv.updated_at)}</div>
+                  {renamingId === conv.id ? (
+                    <input
+                      ref={renameInputRef}
+                      value={renameValue}
+                      onChange={(e) => setRenameValue(e.target.value)}
+                      onClick={(e) => e.stopPropagation()}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") handleConfirmRename();
+                        if (e.key === "Escape") setRenamingId(null);
+                      }}
+                      onBlur={handleConfirmRename}
+                      className="w-full text-xs bg-transparent border-b border-primary outline-none py-0.5 text-foreground"
+                    />
+                  ) : (
+                    <>
+                      <div className="text-xs font-medium truncate" title={conv.title}>{conv.title}</div>
+                      <div className="text-[10px] text-muted-foreground truncate">{formatDate(conv.updated_at)}</div>
+                    </>
+                  )}
                 </div>
-                <Button
-                  size="icon"
-                  variant="ghost"
-                  className="h-5 w-5 opacity-0 group-hover:opacity-100 text-destructive hover:text-destructive"
-                  onClick={(e) => { e.stopPropagation(); deleteConversation(conv.id); }}
-                >
-                  <Trash2 className="w-3 h-3" />
-                </Button>
+
+                {/* Hover actions */}
+                {renamingId !== conv.id && (
+                  <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity shrink-0">
+                    <button
+                      className="p-0.5 rounded hover:bg-secondary text-muted-foreground hover:text-foreground transition-colors"
+                      title="Rename"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setRenameValue(conv.title);
+                        setRenamingId(conv.id);
+                      }}
+                    >
+                      <Pencil className="w-3 h-3" />
+                    </button>
+                    <button
+                      className="p-0.5 rounded hover:bg-destructive/10 text-muted-foreground hover:text-destructive transition-colors"
+                      title="Delete"
+                      onClick={(e) => { e.stopPropagation(); setDeleteTargetId(conv.id); }}
+                    >
+                      <Trash2 className="w-3 h-3" />
+                    </button>
+                  </div>
+                )}
               </div>
             ))}
           </div>
@@ -377,16 +466,38 @@ export function ChatView() {
               />
             </>
           ) : (
-            <div className="flex-1 flex flex-col items-center justify-center text-center p-8">
-              <div className="w-16 h-16 rounded-2xl bg-primary/10 flex items-center justify-center mb-4">
-                <MessageSquare className="w-8 h-8 text-primary" />
+            <div className="flex-1 flex flex-col items-center justify-center text-center p-8 gap-0">
+              {/* Logo mark */}
+              <div className="flex items-center justify-center w-14 h-14 rounded-2xl bg-primary/10 mb-5">
+                <Zap className="w-7 h-7 text-primary" />
               </div>
-              <h2 className="text-xl font-semibold mb-2">XandSuite Chat</h2>
-              <p className="text-muted-foreground text-sm max-w-sm mb-6">
-                Select a conversation or create a new one to start chatting with your local AI models.
+              <h2 className="text-2xl font-semibold mb-2 tracking-tight">What can I help with?</h2>
+              <p className="text-muted-foreground text-sm max-w-xs mb-8">
+                Start a new conversation or pick a suggestion below.
               </p>
-              <Button onClick={handleNewChat}>
-                <Plus className="w-4 h-4 mr-2" />
+
+              {/* Suggestion pills from template store */}
+              {suggestionTemplates.length > 0 && (
+                <div className="grid grid-cols-2 gap-2 w-full max-w-sm mb-8">
+                  {suggestionTemplates.map((t) => (
+                    <button
+                      key={t.id}
+                      onClick={() => handleSuggestionClick(t.content)}
+                      className={cn(
+                        "flex items-start gap-2 rounded-xl border border-border bg-card px-4 py-3 text-left",
+                        "text-xs text-foreground/80 hover:border-primary/40 hover:bg-primary/5 hover:text-foreground",
+                        "transition-all duration-150 group"
+                      )}
+                    >
+                      <Sparkles className="w-3.5 h-3.5 shrink-0 mt-0.5 text-primary/60 group-hover:text-primary transition-colors" />
+                      <span className="font-medium leading-snug">{t.title}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              <Button onClick={handleNewChat} className="gap-2">
+                <Plus className="w-4 h-4" />
                 New Conversation
               </Button>
             </div>
@@ -419,6 +530,29 @@ export function ChatView() {
           </div>
         )}
       </div>
+
+      {/* Delete conversation confirmation */}
+      <AlertDialog open={deleteTargetId !== null} onOpenChange={(open) => !open && setDeleteTargetId(null)}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete conversation?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This conversation and all its messages will be permanently deleted. This cannot be undone.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => {
+                if (deleteTargetId) deleteConversation(deleteTargetId);
+                setDeleteTargetId(null);
+              }}
+            >
+              Delete
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

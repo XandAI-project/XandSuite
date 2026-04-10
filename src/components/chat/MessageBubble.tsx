@@ -1,5 +1,6 @@
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import rehypeRaw from "rehype-raw";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { vscDarkPlus } from "react-syntax-highlighter/dist/esm/styles/prism";
 import {
@@ -8,12 +9,13 @@ import {
   FileText, FileCode, FileJson, File,
   Code, Globe, AlignLeft, Terminal, BookOpen,
 } from "lucide-react";
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useMemo } from "react";
 import { cn } from "@/lib/utils";
 import type { Message, ArtifactType, AttachmentMeta, ImageMeta } from "@/lib/tauri";
 import { ArtifactCard } from "./ArtifactCard";
 import { useArtifactStore } from "@/stores/artifactStore";
 import { useSkillsStore } from "@/stores/skillsStore";
+import { useGalleryStore } from "@/stores/galleryStore";
 
 // ── SourcesCard ────────────────────────────────────────────────────────────────
 
@@ -163,6 +165,7 @@ const TYPE_LABEL: Record<ArtifactType, string> = {
   text: "text",
   csv: "CSV",
   json: "JSON",
+  pdf: "PDF",
 };
 
 const TYPE_ICON: Record<ArtifactType, React.ReactNode> = {
@@ -172,6 +175,7 @@ const TYPE_ICON: Record<ArtifactType, React.ReactNode> = {
   text: <AlignLeft className="w-3.5 h-3.5" />,
   csv: <FileText className="w-3.5 h-3.5" />,
   json: <FileJson className="w-3.5 h-3.5" />,
+  pdf: <FileText className="w-3.5 h-3.5" />,
 };
 
 function AnimatedDots() {
@@ -389,6 +393,70 @@ function CodeBlock({ language, children }: { language: string; children: string 
   );
 }
 
+// ── Video URL detection ───────────────────────────────────────────────────────
+
+const VIDEO_EXTENSIONS = /\.(mp4|webm|mov|avi|mkv)$/i;
+const COMFYUI_VIEW_RE = /\/view\?/;
+
+function isVideoUrl(url: string | undefined): boolean {
+  if (!url) return false;
+  if (VIDEO_EXTENSIONS.test(url.split("?")[0])) return true;
+  if (COMFYUI_VIEW_RE.test(url)) {
+    const params = new URLSearchParams(url.split("?")[1] ?? "");
+    const fn = params.get("filename") ?? "";
+    return VIDEO_EXTENSIONS.test(fn);
+  }
+  return false;
+}
+
+function InlineVideo({ src }: { src: string }) {
+  return (
+    <video
+      src={src}
+      controls
+      loop
+      className="rounded-md border border-border max-w-full max-h-96 w-full my-2"
+    />
+  );
+}
+
+// ── Gallery-aware image component ─────────────────────────────────────────────
+//
+// When a markdown image URL matches `http://localhost:{port}/images/{id}`, the
+// Tauri WebView2 cannot load it via HTTP (cross-origin restriction). Instead we
+// look up the gallery entry in the Zustand store and render as a base64 data URL.
+
+const LOCAL_GALLERY_RE = /^http:\/\/localhost:\d+\/images\/([^/?#]+)/;
+
+function GalleryAwareImage({ src, alt }: { src?: string; alt?: string }) {
+  const galleryImages = useGalleryStore((s) => s.images);
+
+  const resolvedSrc = useMemo(() => {
+    if (!src) return src;
+    const match = src.match(LOCAL_GALLERY_RE);
+    if (match) {
+      const id = match[1];
+      const entry = galleryImages.find((img) => img.id === id);
+      if (entry) {
+        const d = entry.image_data;
+        if (d.startsWith("http://") || d.startsWith("https://")) return d;
+        return `data:${entry.mime_type};base64,${d}`;
+      }
+    }
+    return src;
+  }, [src, galleryImages]);
+
+  if (isVideoUrl(resolvedSrc)) return <InlineVideo src={resolvedSrc!} />;
+
+  return (
+    <img
+      src={resolvedSrc}
+      alt={alt ?? ""}
+      className="rounded-md border border-border max-w-full max-h-96 object-contain my-2"
+    />
+  );
+}
+
 // ── Markdown components shared between message + panel ────────────────────────
 
 export const markdownComponents: React.ComponentProps<typeof ReactMarkdown>["components"] = {
@@ -422,11 +490,17 @@ export const markdownComponents: React.ComponentProps<typeof ReactMarkdown>["com
     <th className="border border-border px-3 py-1.5 bg-secondary text-left font-semibold">{children}</th>
   ),
   td: ({ children }) => <td className="border border-border px-3 py-1.5">{children}</td>,
-  a: ({ href, children }) => (
-    <a href={href} target="_blank" rel="noreferrer" className="text-primary underline hover:no-underline">
-      {children}
-    </a>
-  ),
+  a: ({ href, children }) => {
+    if (isVideoUrl(href)) {
+      return <InlineVideo src={href!} />;
+    }
+    return (
+      <a href={href} target="_blank" rel="noreferrer" className="text-primary underline hover:no-underline">
+        {children}
+      </a>
+    );
+  },
+  img: ({ src, alt }) => <GalleryAwareImage src={src} alt={alt} />,
   hr: () => <hr className="border-border my-3" />,
 };
 
@@ -506,14 +580,11 @@ export function MessageBubble({ message, liveThinking, isThinking, onEdit, onReg
     : null;
   const pendingCodeLanguage = pendingCodeStep?.arguments?.language as string | undefined;
 
-  // Auto-open the reasoning section the first time thinking content appears
-  const thinkingHasContent = !!thinkingText;
-  useEffect(() => {
-    if (thinkingHasContent) setThinkOpen(true);
-  }, [thinkingHasContent]);
+  // Keep thinking collapsed by default; open only when user explicitly clicks.
+  // (Removed auto-open to prevent jarring layout jumps during streaming.)
 
   return (
-    <div className={cn("flex gap-3 group", isUser && "flex-row-reverse")}>
+    <div className={cn("flex gap-3 group", isUser && "flex-row-reverse")} tabIndex={0}>
       {/* Avatar */}
       {isUser ? (
         <div className="flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center bg-primary">
@@ -610,7 +681,7 @@ export function MessageBubble({ message, liveThinking, isThinking, onEdit, onReg
           <div className={cn(
             "relative rounded-xl px-4 py-3 text-sm",
             isUser
-              ? "bg-primary text-primary-foreground"
+              ? "glass-primary text-white"
               : "bg-card border border-border text-foreground"
           )}>
             {isUser ? (
@@ -644,7 +715,7 @@ export function MessageBubble({ message, liveThinking, isThinking, onEdit, onReg
               <>
                 <div className="prose prose-invert prose-sm max-w-none">
                   {strippedContent ? (
-                    <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+                    <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeRaw]} components={markdownComponents}>
                       {strippedContent}
                     </ReactMarkdown>
                   ) : isStreamingMsg && !streamingArtifact && !pendingCodeStep && isThinking ? (
@@ -697,55 +768,61 @@ export function MessageBubble({ message, liveThinking, isThinking, onEdit, onReg
               </>
             )}
 
-            {/* Copy button (assistant) */}
-            {!isUser && message.content && (
-              <button
-                onClick={handleCopy}
-                className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity p-1 rounded hover:bg-secondary"
-              >
-                {copied
-                  ? <Check className="w-3 h-3 text-emerald-400" />
-                  : <Copy className="w-3 h-3 text-muted-foreground" />}
-              </button>
-            )}
           </div>
         )}
 
-        {/* Action row */}
+        {/* Inline action bar — always present, subtle by default */}
         {!editing && (
           <div className={cn(
-            "flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity",
+            "flex items-center gap-1 mt-0.5 transition-opacity duration-150",
+            "opacity-0 group-hover:opacity-100 focus-within:opacity-100 group-focus:opacity-100",
             isUser ? "justify-end" : "justify-start pl-1"
           )}>
+            {/* Copy — shown for both user and assistant messages */}
+            {message.content && (
+              <button
+                onClick={handleCopy}
+                className="flex items-center gap-1 text-[10px] text-muted-foreground hover:text-foreground
+                           px-2 py-1 rounded-md hover:bg-secondary transition-colors"
+                title="Copy message"
+              >
+                {copied
+                  ? <><Check className="w-2.5 h-2.5 text-emerald-400" /> Copied</>
+                  : <><Copy className="w-2.5 h-2.5" /> Copy</>
+                }
+              </button>
+            )}
+
+            {/* Edit — user messages only */}
             {isUser && onEdit && (
               <button
                 onClick={() => { setEditText(message.content); setEditing(true); }}
                 className="flex items-center gap-1 text-[10px] text-muted-foreground hover:text-foreground
-                           px-2 py-0.5 rounded hover:bg-secondary transition-colors"
+                           px-2 py-1 rounded-md hover:bg-secondary transition-colors"
+                title="Edit and resend"
               >
                 <Pencil className="w-2.5 h-2.5" /> Edit
               </button>
             )}
+
+            {/* Regenerate — last assistant message only */}
             {!isUser && onRegenerate && message.content && (
               <button
                 onClick={onRegenerate}
                 className="flex items-center gap-1 text-[10px] text-muted-foreground hover:text-foreground
-                           px-2 py-0.5 rounded hover:bg-secondary transition-colors"
+                           px-2 py-1 rounded-md hover:bg-secondary transition-colors"
+                title="Regenerate response"
               >
                 <RefreshCw className="w-2.5 h-2.5" /> Regenerate
               </button>
             )}
+
+            {/* Tokens/s badge */}
             {!isUser && tps != null && (
-              <span className="flex items-center gap-1 text-[10px] text-muted-foreground/50 ml-1">
+              <span className="flex items-center gap-1 text-[10px] text-muted-foreground/50 ml-1 px-1">
                 <Gauge className="w-2.5 h-2.5" /> {tps} tok/s
               </span>
             )}
-          </div>
-        )}
-
-        {editing && !isUser && tps != null && (
-          <div className="flex items-center gap-1 text-[10px] text-muted-foreground/50 pl-1">
-            <Gauge className="w-2.5 h-2.5" /><span>{tps} tok/s</span>
           </div>
         )}
       </div>

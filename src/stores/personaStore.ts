@@ -11,7 +11,7 @@ interface PersonaState {
   deletePersona: (personaId: string) => Promise<void>;
 }
 
-export const usePersonaStore = create<PersonaState>((set, get) => ({
+export const usePersonaStore = create<PersonaState>((set, _get) => ({
   personas: [],
   loading: false,
 

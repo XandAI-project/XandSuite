@@ -1,0 +1,20 @@
+services:
+  xandsuite:
+    build: .
+    image: xandsuite:latest
+    restart: unless-stopped
+    ports:
+      - "${XANDSUITE_PORT:-3847}:3847"
+    volumes:
+      # Persistent data: SQLite DB, downloaded models, cache, agent workspaces
+      - xand_data:/data
+    environment:
+      XANDSUITE_HEADLESS: "1"
+      XANDSUITE_FRONTEND_DIST: /app/dist
+      XANDSUITE_TOOLS_DIR: /app/tools
+      # Optional: lock down the API with a bearer token.
+      # Set this in your .env file or via `docker compose --env-file .env up`.
+      # XANDSUITE_API_TOKEN: your_secret_token_here
+
+volumes:
+  xand_data:

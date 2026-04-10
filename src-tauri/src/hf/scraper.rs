@@ -93,6 +93,13 @@ impl HfScraper {
 
         if !response.status().is_success() {
             let status = response.status();
+            if status == 429 {
+                anyhow::bail!(
+                    "HuggingFace API rate limit reached (429). \
+                     Add your HF API token in Settings → Models to get a higher limit, \
+                     or wait a few minutes and try again."
+                );
+            }
             anyhow::bail!("HuggingFace API returned status {}", status);
         }
 

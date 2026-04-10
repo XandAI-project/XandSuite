@@ -12,15 +12,18 @@ mod graph_rag;
 mod hf;
 mod jobs;
 mod models;
+mod process_ext;
 mod rag;
 mod server;
 mod skills;
 mod skills_init;
 mod state;
+mod tts;
 mod web_fetch;
 mod whisper;
 
 use std::collections::VecDeque;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 use tokio::sync::Mutex as TokioMutex;
@@ -37,6 +40,7 @@ use crate::rag::RagService;
 use crate::server::LlamaServerManager;
 use crate::skills::SkillsManager;
 use crate::state::AppState;
+use crate::tts::KokoroManager;
 use crate::whisper::WhisperManager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -123,13 +127,21 @@ pub fn run() {
             // Initialize internal llama-server manager (tokio Mutex for async start)
             let server = Arc::new(TokioMutex::new(LlamaServerManager::new()));
 
+            // Shared flag: true while an MCP/skills tool call is being dispatched.
+            let tool_active: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+
             // ── Background idle-watcher ──────────────────────────────────────
             // Checks every 60 s whether the server has been idle longer than
             // model_keep_alive_mins; stops it automatically to free VRAM.
             // A keep_alive_mins of 0 disables auto-stop.
+            // When a tool is actively running (tool_active == true), the watcher
+            // resets the idle timer instead of killing the server so that long
+            // external processes (e.g. ComfyUI video generation) don't cause the
+            // next LLM call to fail with "Failed to connect to LLM server".
             {
                 let server_arc = server.clone();
                 let settings_arc = settings.clone();
+                let tool_active_arc = tool_active.clone();
                 tauri::async_runtime::spawn(async move {
                     loop {
                         tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
@@ -140,6 +152,12 @@ pub fn run() {
                             continue;
                         }
                         let mut srv = server_arc.lock().await;
+                        // If a tool is currently executing, reset the idle timer so the
+                        // server is kept alive until the tool finishes.
+                        if tool_active_arc.load(std::sync::atomic::Ordering::Relaxed) {
+                            srv.touch();
+                            continue;
+                        }
                         if srv.is_running() && srv.is_idle(keep_alive) {
                             log::info!(
                                 "llama-server idle for {} min — stopping to free VRAM.",
@@ -247,6 +265,9 @@ pub fn run() {
             // Whisper sidecar manager
             let whisper = Arc::new(TokioMutex::new(WhisperManager::new()));
 
+            // KokoroTTS sidecar manager
+            let tts = Arc::new(TokioMutex::new(KokoroManager::new()));
+
             let app_state = AppState {
                 db,
                 engine,
@@ -260,10 +281,13 @@ pub fn run() {
                 graph_rag,
                 graph_rag_client,
                 whisper,
+                tts,
                 data_dir,
                 event_tx,
                 log_buffer,
                 app_handle,
+                generation_cancelled: Arc::new(AtomicBool::new(false)),
+                tool_active,
             };
 
             // Create an Arc<AppState> for the HTTP server (shares all Arc fields)
@@ -274,11 +298,40 @@ pub fn run() {
             // Also manage Arc<AppState> so HTTP handlers can retrieve it via app.state::<Arc<AppState>>()
             app.manage(state_arc.clone());
 
-            // Spawn the mobile API bridge if enabled in settings
-            if mobile_api_enabled {
+            let headless = std::env::var("XANDSUITE_HEADLESS").is_ok();
+
+            // In headless mode the API server is always started regardless of settings.
+            // In desktop mode respect the persisted mobile_api_enabled toggle.
+            if headless || mobile_api_enabled {
                 let arc_for_task = state_arc.clone();
+                let port = mobile_api_port;
                 tauri::async_runtime::spawn(async move {
-                    crate::api_server::start_api_server(arc_for_task, mobile_api_port).await;
+                    crate::api_server::start_api_server(arc_for_task, port).await;
+                });
+            }
+
+            // In desktop (non-headless) mode create the main application window.
+            if !headless {
+                tauri::WebviewWindowBuilder::new(
+                    app,
+                    "main",
+                    tauri::WebviewUrl::App("index.html".into()),
+                )
+                .title("XandSuite")
+                .inner_size(1280.0, 800.0)
+                .min_inner_size(900.0, 600.0)
+                .decorations(true)
+                .build()
+                .expect("Failed to create main window");
+            }
+
+            // Reconnect previously installed packages (after a small delay so
+            // builtin servers can register first).
+            {
+                let arc_for_pkgs = state_arc.clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                    crate::commands::packages::reconnect_installed_packages(&arc_for_pkgs).await;
                 });
             }
 
@@ -290,9 +343,11 @@ pub fn run() {
             commands::chat::update_conversation,
             commands::chat::get_conversation,
             commands::chat::delete_conversation,
+            commands::chat::rename_conversation,
             commands::chat::truncate_conversation,
             commands::chat::send_message,
             commands::chat::save_message_tool_steps,
+            commands::chat::stop_generation,
             commands::models::list_hf_models,
             commands::models::refresh_hf_models,
             commands::models::download_model,
@@ -332,6 +387,7 @@ pub fn run() {
             commands::settings::get_settings,
             commands::settings::save_settings,
             commands::settings::get_data_dir,
+            commands::settings::get_models_dir,
             commands::server::get_server_status,
             commands::server::start_local_server,
             commands::server::stop_local_server,
@@ -351,6 +407,7 @@ pub fn run() {
             commands::artifacts::delete_artifact,
             commands::artifacts::update_artifact,
             commands::attachments::read_attachment,
+            commands::attachments::read_file_as_base64,
             commands::coding::create_coding_session,
             commands::coding::list_coding_sessions,
             commands::coding::get_coding_session,
@@ -365,9 +422,6 @@ pub fn run() {
             commands::memory::list_memory_entries,
             commands::memory::delete_memory_entry,
             commands::memory::clear_memory_entries,
-            commands::comfyui::list_comfyui_workflows,
-            commands::comfyui::save_comfyui_workflow,
-            commands::comfyui::delete_comfyui_workflow,
             commands::gallery::list_gallery_images,
             commands::gallery::list_all_gallery_images,
             commands::gallery::delete_gallery_image,
@@ -383,7 +437,37 @@ pub fn run() {
             commands::personas::create_persona,
             commands::personas::update_persona,
             commands::personas::delete_persona,
+            commands::templates::list_templates,
+            commands::templates::create_template,
+            commands::templates::update_template,
+            commands::templates::delete_template,
+            commands::templates::increment_template_use,
+            commands::packages::list_official_packages,
+            commands::packages::install_package,
+            commands::packages::uninstall_package,
+            commands::packages::list_custom_packages,
+            commands::packages::save_custom_package,
+            commands::packages::get_custom_package_code,
+            commands::packages::delete_custom_package,
+            commands::packages::install_custom_package,
+            commands::packages::uninstall_custom_package,
+            commands::packages::fetch_comfyui_workflows,
+            commands::tts::get_tts_status,
+            commands::tts::start_tts_server,
+            commands::tts::stop_tts_server,
+            commands::tts::synthesize_speech,
+            commands::tts::download_tts_models,
+            commands::tts::get_tts_log,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running XandSuite");
+        .build(tauri::generate_context!())
+        .expect("error building XandSuite")
+        .run(|_app_handle, event| {
+            // In headless mode prevent the process from exiting when there are
+            // no open windows — the Axum server keeps the runtime alive.
+            if let tauri::RunEvent::ExitRequested { api, .. } = event {
+                if std::env::var("XANDSUITE_HEADLESS").is_ok() {
+                    api.prevent_exit();
+                }
+            }
+        });
 }

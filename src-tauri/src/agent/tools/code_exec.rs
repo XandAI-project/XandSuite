@@ -4,6 +4,8 @@ use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::timeout;
 
+use crate::process_ext::HideWindowTokio;
+
 pub struct CodeExecTool {
     workspace_dir: std::path::PathBuf,
 }
@@ -20,8 +22,9 @@ impl CodeExecTool {
             .context("Failed to create agent workspace")?;
 
         let child = if cfg!(target_os = "windows") {
-            Command::new("cmd")
-                .args(["/C", command])
+            let mut cmd = Command::new("cmd");
+            cmd.hide_window();
+            cmd.args(["/C", command])
                 .current_dir(&self.workspace_dir)
                 .output()
         } else {

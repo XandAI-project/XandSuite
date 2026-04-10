@@ -7,6 +7,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::Instant;
 
 use crate::models::AppSettings;
+use crate::process_ext::HideWindowStd;
 
 pub struct LlamaServerManager {
     process: Option<Child>,
@@ -90,9 +91,8 @@ impl LlamaServerManager {
 
         let port = settings.llama_server_port;
         let mut cmd = Command::new(&bin);
+        cmd.hide_window();
 
-        // Set the bin directory as the working directory so any DLLs next to
-        // the binary (e.g. CUDA runtime DLLs) are found automatically.
         if let Some(bin_dir) = bin.parent() {
             cmd.current_dir(bin_dir);
         }

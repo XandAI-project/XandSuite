@@ -1,0 +1,647 @@
+"""
+XandSuite Package: PDF Tools
+Read and generate PDF files completely offline.
+
+Reading  — pdfplumber: text extraction, table detection, metadata.
+Writing  — fpdf2: styled documents and multi-section reports.
+
+CLI args (set at install time via connector):
+  --output-dir   Directory where generated PDFs are saved.
+                 Defaults to ~/Desktop.
+"""
+
+import argparse
+import json
+import os
+import re
+from typing import Optional
+
+# ---------------------------------------------------------------------------
+# CLI args — parsed before FastMCP takes over sys.argv
+# ---------------------------------------------------------------------------
+
+parser = argparse.ArgumentParser(add_help=False)
+parser.add_argument(
+    "--output-dir",
+    default=os.path.expanduser("~/Desktop"),
+    help="Directory for generated PDF output files.",
+)
+args, _ = parser.parse_known_args()
+
+OUTPUT_DIR: str = args.output_dir
+
+# ---------------------------------------------------------------------------
+# FastMCP server
+# ---------------------------------------------------------------------------
+
+from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP("xandsuite-pdf-tools")
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _parse_page_spec(spec: str, total: int) -> list[int]:
+    """
+    Convert a human-readable page spec to a 0-indexed list.
+
+    Examples:
+        "1"       -> [0]
+        "1,3"     -> [0, 2]
+        "2-5"     -> [1, 2, 3, 4]
+        "1,3-5,7" -> [0, 2, 3, 4, 6]
+        ""        -> [0, 1, ..., total-1]
+    """
+    if not spec.strip():
+        return list(range(total))
+
+    indices: list[int] = []
+    for part in spec.split(","):
+        part = part.strip()
+        m = re.fullmatch(r"(\d+)-(\d+)", part)
+        if m:
+            lo, hi = int(m.group(1)), int(m.group(2))
+            for p in range(lo, hi + 1):
+                idx = p - 1
+                if 0 <= idx < total:
+                    indices.append(idx)
+        elif re.fullmatch(r"\d+", part):
+            idx = int(part) - 1
+            if 0 <= idx < total:
+                indices.append(idx)
+    # Deduplicate preserving order
+    seen: set[int] = set()
+    result = []
+    for i in indices:
+        if i not in seen:
+            seen.add(i)
+            result.append(i)
+    return result
+
+
+def _safe_output_path(filename: str) -> str:
+    """Resolve output path, creating the directory if needed."""
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    name = filename.strip()
+    if not name.lower().endswith(".pdf"):
+        name = name + ".pdf"
+    # Strip any path separators from filename to keep it flat
+    name = os.path.basename(name)
+    return os.path.join(OUTPUT_DIR, name)
+
+
+# ---------------------------------------------------------------------------
+# Reading tools
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def read_pdf(file_path: str, pages: str = "") -> str:
+    """
+    Extract text from a PDF file.
+
+    Works offline. Best results on machine-generated (non-scanned) PDFs.
+
+    Parameters
+    ----------
+    file_path : str
+        Absolute path to the PDF file.
+    pages : str, optional
+        Page range to read. Examples: "1", "1,3", "2-5", "1,3-5,7".
+        Leave empty to read ALL pages.
+
+    Returns JSON with keys:
+        file, total_pages, pages_read, text (per-page list), full_text
+    """
+    try:
+        import pdfplumber
+    except ImportError:
+        return json.dumps({"error": "pdfplumber is not installed. Run: pip install pdfplumber"})
+
+    file_path = os.path.expandvars(os.path.expanduser(file_path))
+    if not os.path.isfile(file_path):
+        return json.dumps({"error": f"File not found: {file_path}"})
+
+    try:
+        with pdfplumber.open(file_path) as pdf:
+            total = len(pdf.pages)
+            indices = _parse_page_spec(pages, total)
+
+            page_texts = []
+            for idx in indices:
+                text = pdf.pages[idx].extract_text() or ""
+                page_texts.append({"page": idx + 1, "text": text})
+
+            full_text = "\n\n".join(
+                f"--- Page {p['page']} ---\n{p['text']}" for p in page_texts
+            )
+
+            return json.dumps({
+                "file": os.path.basename(file_path),
+                "total_pages": total,
+                "pages_read": [p["page"] for p in page_texts],
+                "text": page_texts,
+                "full_text": full_text,
+            }, ensure_ascii=False)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)})
+
+
+@mcp.tool()
+def get_pdf_info(file_path: str) -> str:
+    """
+    Get metadata and structure information about a PDF file.
+
+    Returns page count, page dimensions, and document metadata
+    (title, author, creator, creation date) when available.
+
+    Parameters
+    ----------
+    file_path : str
+        Absolute path to the PDF file.
+    """
+    try:
+        import pdfplumber
+    except ImportError:
+        return json.dumps({"error": "pdfplumber is not installed. Run: pip install pdfplumber"})
+
+    file_path = os.path.expandvars(os.path.expanduser(file_path))
+    if not os.path.isfile(file_path):
+        return json.dumps({"error": f"File not found: {file_path}"})
+
+    try:
+        with pdfplumber.open(file_path) as pdf:
+            total = len(pdf.pages)
+            meta = pdf.metadata or {}
+
+            # Collect page dimensions
+            page_info = []
+            for i, page in enumerate(pdf.pages):
+                page_info.append({
+                    "page": i + 1,
+                    "width_pt": round(page.width, 2),
+                    "height_pt": round(page.height, 2),
+                })
+
+            # Decode bytes metadata fields (PDF stores them as bytes sometimes)
+            def _decode(v):
+                if isinstance(v, bytes):
+                    try:
+                        return v.decode("utf-8", errors="replace")
+                    except Exception:
+                        return str(v)
+                return v
+
+            return json.dumps({
+                "file": os.path.basename(file_path),
+                "file_size_kb": round(os.path.getsize(file_path) / 1024, 1),
+                "total_pages": total,
+                "metadata": {k: _decode(v) for k, v in meta.items()},
+                "pages": page_info,
+            }, ensure_ascii=False)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)})
+
+
+@mcp.tool()
+def extract_pdf_tables(file_path: str, page_number: int = 1) -> str:
+    """
+    Extract all tables from a specific page of a PDF file.
+
+    Works best on machine-generated PDFs with clearly bordered tables.
+    Returns each table as a list of rows (each row is a list of cell strings).
+
+    Parameters
+    ----------
+    file_path   : str
+        Absolute path to the PDF file.
+    page_number : int, optional
+        1-based page number to extract tables from. Defaults to 1.
+    """
+    try:
+        import pdfplumber
+    except ImportError:
+        return json.dumps({"error": "pdfplumber is not installed. Run: pip install pdfplumber"})
+
+    file_path = os.path.expandvars(os.path.expanduser(file_path))
+    if not os.path.isfile(file_path):
+        return json.dumps({"error": f"File not found: {file_path}"})
+
+    try:
+        with pdfplumber.open(file_path) as pdf:
+            total = len(pdf.pages)
+            idx = page_number - 1
+            if idx < 0 or idx >= total:
+                return json.dumps({
+                    "error": f"Page {page_number} out of range. PDF has {total} pages."
+                })
+
+            page = pdf.pages[idx]
+            raw_tables = page.extract_tables()
+
+            # Clean None cells
+            tables = []
+            for raw in raw_tables:
+                cleaned = [
+                    [cell if cell is not None else "" for cell in row]
+                    for row in raw
+                ]
+                tables.append(cleaned)
+
+            return json.dumps({
+                "file": os.path.basename(file_path),
+                "page": page_number,
+                "total_tables": len(tables),
+                "tables": tables,
+            }, ensure_ascii=False)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)})
+
+
+# ---------------------------------------------------------------------------
+# Generation tools
+# ---------------------------------------------------------------------------
+
+def _new_pdf():
+    """Create a pre-configured FPDF instance."""
+    from fpdf import FPDF
+
+    class _PDF(FPDF):
+        def header(self):
+            pass  # Custom headers handled per-document
+
+        def footer(self):
+            self.set_y(-12)
+            self.set_font("Helvetica", "I", 8)
+            self.set_text_color(150, 150, 150)
+            self.cell(0, 10, f"Page {self.page_no()}", align="C")
+
+    pdf = _PDF()
+    pdf.set_auto_page_break(auto=True, margin=18)
+    pdf.set_margins(20, 20, 20)
+    return pdf
+
+
+# ---------------------------------------------------------------------------
+# Markdown helpers
+# ---------------------------------------------------------------------------
+
+def _strip_inline_md(text: str) -> str:
+    """Remove inline markdown markers (bold, italic, code), returning plain text."""
+    # Bold before italic to avoid partial matches
+    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
+    text = re.sub(r'__(.+?)__', r'\1', text)
+    text = re.sub(r'\*(.+?)\*', r'\1', text)
+    text = re.sub(r'_(.+?)_', r'\1', text)
+    text = re.sub(r'`(.+?)`', r'\1', text)
+    return text
+
+
+def _write_inline(pdf, text: str, row_h: int = 6):
+    """
+    Write a single line with **bold** and *italic* inline support.
+    Uses write() with font switching so text wraps inside the page margins.
+    Appends a newline at the end.
+    """
+    fam = pdf.font_family or "Helvetica"
+    sz = pdf.font_size_pt or 11
+    # Split on **bold** or *italic* spans
+    parts = re.split(r'(\*\*[^*\n]+?\*\*|\*[^*\n]+?\*)', text)
+    for part in parts:
+        if not part:
+            continue
+        if part.startswith('**') and part.endswith('**') and len(part) > 4:
+            pdf.set_font(fam, 'B', sz)
+            pdf.write(row_h, part[2:-2])
+            pdf.set_font(fam, '', sz)
+        elif part.startswith('*') and part.endswith('*') and len(part) > 2:
+            pdf.set_font(fam, 'I', sz)
+            pdf.write(row_h, part[1:-1])
+            pdf.set_font(fam, '', sz)
+        else:
+            pdf.write(row_h, part)
+    pdf.ln(row_h)
+
+
+def _render_markdown(pdf, text: str):
+    """
+    Render basic markdown as styled PDF content.
+
+    Supported syntax:
+      # H1 / ## H2 / ### H3   — styled headings
+      - item / * item          — bulleted list with indent
+      **bold** / *italic*      — inline emphasis (in paragraphs)
+      ---                      — horizontal rule
+      blank lines              — paragraph spacing
+    """
+    row_h = 6
+    in_list = False
+
+    for raw in text.split('\n'):
+        line = raw.rstrip()
+
+        # ── Blank line ────────────────────────────────────────────────────
+        if not line.strip():
+            if in_list:
+                in_list = False
+            pdf.ln(3)
+            continue
+
+        # ── Horizontal rule ───────────────────────────────────────────────
+        if re.match(r'^[-_*]{3,}$', line.strip()):
+            if in_list:
+                in_list = False
+            pdf.set_draw_color(180, 180, 200)
+            pdf.set_line_width(0.4)
+            y = pdf.get_y() + 2
+            pdf.line(pdf.l_margin, y, pdf.w - pdf.r_margin, y)
+            pdf.ln(6)
+            continue
+
+        # ── H3 ───────────────────────────────────────────────────────────
+        if line.startswith('### '):
+            if in_list:
+                in_list = False
+            pdf.set_font("Helvetica", "B", 12)
+            pdf.set_text_color(50, 60, 120)
+            pdf.multi_cell(0, 7, _strip_inline_md(line[4:].strip()))
+            pdf.set_text_color(30, 30, 30)
+            pdf.ln(1)
+            continue
+
+        # ── H2 ───────────────────────────────────────────────────────────
+        if line.startswith('## '):
+            if in_list:
+                in_list = False
+            pdf.set_font("Helvetica", "B", 14)
+            pdf.set_text_color(30, 40, 100)
+            pdf.multi_cell(0, 8, _strip_inline_md(line[3:].strip()))
+            pdf.set_text_color(30, 30, 30)
+            pdf.ln(2)
+            continue
+
+        # ── H1 ───────────────────────────────────────────────────────────
+        if line.startswith('# '):
+            if in_list:
+                in_list = False
+            pdf.set_font("Helvetica", "B", 18)
+            pdf.set_text_color(20, 20, 80)
+            pdf.multi_cell(0, 9, _strip_inline_md(line[2:].strip()))
+            pdf.set_text_color(30, 30, 30)
+            pdf.ln(3)
+            continue
+
+        # ── Bullet list item ──────────────────────────────────────────────
+        m = re.match(r'^[-*+]\s+(.*)', line)
+        if m:
+            in_list = True
+            content = _strip_inline_md(m.group(1))
+            pdf.set_font("Helvetica", "", 11)
+            pdf.set_text_color(30, 30, 30)
+            indent_mm = 8
+            bullet_w = 5
+            text_x = pdf.l_margin + indent_mm + bullet_w
+            usable_w = pdf.w - text_x - pdf.r_margin
+            # Bullet glyph
+            pdf.set_x(pdf.l_margin + indent_mm)
+            pdf.cell(bullet_w, row_h, "\u2022")
+            # Text (multi_cell handles long line wrap within usable width)
+            pdf.set_x(text_x)
+            pdf.multi_cell(usable_w, row_h, content)
+            pdf.ln(0.5)
+            continue
+
+        # ── Regular paragraph ─────────────────────────────────────────────
+        if in_list:
+            in_list = False
+            pdf.ln(1)
+        pdf.set_font("Helvetica", "", 11)
+        pdf.set_text_color(30, 30, 30)
+        _write_inline(pdf, line, row_h)
+
+
+@mcp.tool()
+def create_pdf_document(
+    filename: str,
+    title: str,
+    content: str,
+    author: str = "",
+) -> str:
+    """
+    Create a simple styled PDF document and save it to the output directory.
+
+    Use for memos, notes, letters, summaries, or any plain text document.
+
+    Parameters
+    ----------
+    filename : str
+        Output filename (with or without .pdf extension).
+    title    : str
+        Document title displayed as a large heading on the first page.
+    content  : str
+        Body text in Markdown. Supports # headings, - bullets, **bold**,
+        *italic*, --- horizontal rules, and blank lines for spacing.
+    author   : str, optional
+        Author name shown below the title.
+
+    Returns JSON with the saved file path and page count.
+    """
+    try:
+        from fpdf import FPDF  # noqa: F401 — trigger import error early
+    except ImportError:
+        return json.dumps({"error": "fpdf2 is not installed. Run: pip install fpdf2"})
+
+    try:
+        pdf = _new_pdf()
+        pdf.add_page()
+
+        # Title block
+        pdf.set_font("Helvetica", "B", 22)
+        pdf.set_text_color(20, 20, 60)
+        pdf.multi_cell(0, 10, title, align="L")
+        pdf.ln(2)
+
+        if author:
+            pdf.set_font("Helvetica", "I", 10)
+            pdf.set_text_color(100, 100, 120)
+            pdf.cell(0, 6, f"By {author}")
+            pdf.ln(2)
+
+        # Horizontal rule
+        pdf.set_draw_color(180, 180, 200)
+        pdf.set_line_width(0.4)
+        pdf.line(pdf.get_x(), pdf.get_y() + 2, pdf.w - 20, pdf.get_y() + 2)
+        pdf.ln(6)
+
+        # Body — render markdown formatting
+        _render_markdown(pdf, content)
+
+        out_path = _safe_output_path(filename)
+        pdf.output(out_path)
+
+        return json.dumps({
+            "status": "created",
+            "filename": os.path.basename(out_path),
+            "path": out_path,
+            "pages": pdf.page,
+        }, ensure_ascii=False)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)})
+
+
+@mcp.tool()
+def create_pdf_report(
+    filename: str,
+    title: str,
+    sections: list,
+    author: str = "",
+) -> str:
+    """
+    Create a structured multi-section PDF report and save it to the output directory.
+
+    Use for business reports, research summaries, analyses, or any document
+    with distinct sections, headings, and optional data tables.
+
+    Parameters
+    ----------
+    filename : str
+        Output filename (with or without .pdf extension).
+    title    : str
+        Report title on the cover / first page.
+    author   : str, optional
+        Author name.
+    sections : list of dicts
+        Each section dict may have:
+          - "heading" (str)          Section heading.
+          - "body"    (str)          Body text in Markdown (headings, bullets,
+                                     **bold**, *italic*, ---, blank lines).
+          - "table"   (list, opt)    Table data as list of rows.
+                                     First row is treated as the header row.
+                                     Each row is a list of strings.
+
+    Example sections value:
+        [
+          {"heading": "Executive Summary", "body": "Revenue grew 12%..."},
+          {
+            "heading": "Quarterly Data",
+            "body": "See table below.",
+            "table": [["Quarter","Revenue","Growth"],["Q1","$1.2M","+8%"],["Q2","$1.4M","+12%"]]
+          }
+        ]
+
+    Returns JSON with the saved file path and page count.
+    """
+    try:
+        from fpdf import FPDF  # noqa: F401
+    except ImportError:
+        return json.dumps({"error": "fpdf2 is not installed. Run: pip install fpdf2"})
+
+    if not sections:
+        return json.dumps({"error": "sections list is required and must not be empty."})
+
+    try:
+        pdf = _new_pdf()
+        pdf.add_page()
+
+        # ── Cover block ──────────────────────────────────────────────────────
+        pdf.ln(10)
+        pdf.set_font("Helvetica", "B", 26)
+        pdf.set_text_color(20, 20, 60)
+        pdf.multi_cell(0, 12, title, align="L")
+        pdf.ln(2)
+
+        if author:
+            pdf.set_font("Helvetica", "I", 11)
+            pdf.set_text_color(100, 100, 120)
+            pdf.cell(0, 7, f"By {author}")
+            pdf.ln(2)
+
+        pdf.set_draw_color(80, 100, 200)
+        pdf.set_line_width(1.0)
+        pdf.line(20, pdf.get_y() + 3, pdf.w - 20, pdf.get_y() + 3)
+        pdf.ln(10)
+
+        # ── Sections ─────────────────────────────────────────────────────────
+        for section in sections:
+            heading = str(section.get("heading", "")).strip()
+            body = str(section.get("body", "")).strip()
+            table_data = section.get("table")
+
+            # Section heading
+            if heading:
+                pdf.set_font("Helvetica", "B", 14)
+                pdf.set_text_color(20, 20, 60)
+                pdf.set_fill_color(240, 242, 250)
+                pdf.cell(0, 8, heading, fill=True, ln=True)
+                pdf.ln(2)
+
+            # Body text — render markdown formatting
+            if body:
+                _render_markdown(pdf, body)
+
+            # Optional table
+            if table_data and isinstance(table_data, list) and len(table_data) > 0:
+                _render_table(pdf, table_data)
+                pdf.ln(4)
+
+            pdf.ln(4)
+
+        out_path = _safe_output_path(filename)
+        pdf.output(out_path)
+
+        return json.dumps({
+            "status": "created",
+            "filename": os.path.basename(out_path),
+            "path": out_path,
+            "pages": pdf.page,
+        }, ensure_ascii=False)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)})
+
+
+def _render_table(pdf, table_data: list):
+    """Render a table using fpdf2 with a styled header row."""
+    if not table_data:
+        return
+
+    usable_w = pdf.w - pdf.l_margin - pdf.r_margin
+    n_cols = max(len(row) for row in table_data)
+    if n_cols == 0:
+        return
+    col_w = usable_w / n_cols
+    row_h = 7
+
+    for ri, row in enumerate(table_data):
+        is_header = ri == 0
+        if is_header:
+            pdf.set_fill_color(60, 80, 160)
+            pdf.set_text_color(255, 255, 255)
+            pdf.set_font("Helvetica", "B", 9)
+        else:
+            fill = ri % 2 == 0
+            pdf.set_fill_color(245, 246, 252) if fill else pdf.set_fill_color(255, 255, 255)
+            pdf.set_text_color(30, 30, 30)
+            pdf.set_font("Helvetica", "", 9)
+
+        # Pad row to n_cols
+        padded = list(row) + [""] * (n_cols - len(row))
+
+        x_start = pdf.get_x()
+        # Check if we need a page break before this row
+        if pdf.get_y() + row_h > pdf.h - pdf.b_margin:
+            pdf.add_page()
+
+        for ci, cell in enumerate(padded):
+            pdf.cell(col_w, row_h, str(cell)[:40],
+                     border=1, fill=(ri == 0 or ri % 2 == 0),
+                     align="C" if is_header else "L")
+        pdf.ln()
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    mcp.run(transport="stdio")

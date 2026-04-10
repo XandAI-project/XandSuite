@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::broadcast;
@@ -15,6 +16,7 @@ use crate::rag::embeddings::Embedder;
 use crate::rag::RagService;
 use crate::server::LlamaServerManager;
 use crate::skills::SkillsManager;
+use crate::tts::KokoroManager;
 use crate::whisper::WhisperManager;
 
 /// Central application state shared across Tauri commands and HTTP handlers.
@@ -43,6 +45,8 @@ pub struct AppState {
     pub graph_rag_client: Option<Arc<GraphRagClient>>,
     /// Whisper speech-to-text sidecar process manager
     pub whisper: Arc<TokioMutex<WhisperManager>>,
+    /// KokoroTTS text-to-speech sidecar process manager
+    pub tts: Arc<TokioMutex<KokoroManager>>,
     /// Persistent data directory
     pub data_dir: PathBuf,
     /// Broadcast channel for forwarding Tauri events to HTTP/SSE clients
@@ -51,6 +55,12 @@ pub struct AppState {
     pub log_buffer: Arc<Mutex<VecDeque<serde_json::Value>>>,
     /// Tauri AppHandle — used by HTTP handlers to invoke the same chat pipeline
     pub app_handle: tauri::AppHandle,
+    /// Set to true by `stop_generation`; the streaming loop checks this to abort early.
+    pub generation_cancelled: Arc<AtomicBool>,
+    /// Set to true while a MCP/skills tool call is being dispatched.
+    /// The idle-watcher uses this to avoid killing the LLM server while a
+    /// long-running tool (e.g. video generation) is still in progress.
+    pub tool_active: Arc<AtomicBool>,
 }
 
 // Safety: all fields are wrapped in Arc<Mutex<...>> or are Send+Sync
@@ -72,10 +82,13 @@ impl Clone for AppState {
             graph_rag: self.graph_rag.clone(),
             graph_rag_client: self.graph_rag_client.clone(),
             whisper: self.whisper.clone(),
+            tts: self.tts.clone(),
             data_dir: self.data_dir.clone(),
             event_tx: self.event_tx.clone(),
             log_buffer: self.log_buffer.clone(),
             app_handle: self.app_handle.clone(),
+            generation_cancelled: self.generation_cancelled.clone(),
+            tool_active: self.tool_active.clone(),
         }
     }
 }

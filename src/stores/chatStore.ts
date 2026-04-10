@@ -25,8 +25,12 @@ interface ChatStore {
   createConversation: (systemPrompt?: string, personaId?: string) => Promise<Conversation>;
   /** Update the title and/or system prompt of a conversation. */
   updateConversation: (id: string, title?: string, systemPrompt?: string) => Promise<void>;
+  /** Rename a conversation (inline rename in sidebar). */
+  renameConversation: (id: string, title: string) => Promise<void>;
   deleteConversation: (id: string) => Promise<void>;
   sendMessage: (content: string, useRag?: boolean, ragCollectionId?: string, useSkills?: boolean, attachments?: string[]) => Promise<void>;
+  /** Abort the currently active generation. */
+  stopGeneration: () => Promise<void>;
   /** Remove the last assistant reply and re-send the user message that preceded it. */
   retryLastMessage: () => Promise<void>;
   /** Truncate the conversation from `messageId` onwards and re-send with `newContent`. */
@@ -104,6 +108,19 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     if (get().activeConversation?.id === id) {
       await get().openConversation(id);
     }
+  },
+
+  renameConversation: async (id: string, title: string) => {
+    await invoke("rename_conversation", { conversationId: id, title });
+    set((state) => ({
+      conversations: state.conversations.map((c) =>
+        c.id === id ? { ...c, title } : c
+      ),
+      activeConversation:
+        state.activeConversation?.id === id
+          ? { ...state.activeConversation, title }
+          : state.activeConversation,
+    }));
   },
 
   deleteConversation: async (id: string) => {
@@ -188,7 +205,17 @@ export const useChatStore = create<ChatStore>((set, get) => ({
 
     set((state) => ({
       activeConversation: state.activeConversation
-        ? { ...state.activeConversation, messages: [...state.activeConversation.messages, userMsg, assistantMsg] }
+        ? {
+            ...state.activeConversation,
+            // Scrub any orphaned streaming placeholder from a previous aborted
+            // generation before appending the new messages, preventing ghost
+            // messages and duplicate-looking entries in the chat.
+            messages: [
+              ...state.activeConversation.messages.filter((m) => m.id !== "streaming"),
+              userMsg,
+              assistantMsg,
+            ],
+          }
         : null,
       isStreaming: true,
       isThinking: false,
@@ -199,9 +226,11 @@ export const useChatStore = create<ChatStore>((set, get) => ({
 
     type TokenPayload = { conversation_id: string; token: string; done: boolean };
     type ThinkPayload = { conversation_id: string; token: string };
+    type ThinkClearPayload = { conversation_id: string };
 
     let unlistenToken: (() => void) | undefined;
     let unlistenThink: (() => void) | undefined;
+    let unlistenThinkClear: (() => void) | undefined;
 
     // Timing / throughput tracking
     let firstTokenAt: number | null = null;
@@ -216,6 +245,13 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         streamingThinking: s.streamingThinking + p.token,
         isThinking: true,
       }));
+    });
+
+    // Thinking clear — backend promoted thinking content to the response body.
+    // Discard accumulated thinking so the reasoning block is not shown.
+    unlistenThinkClear = await listen<ThinkClearPayload>("chat_thinking_clear", (event) => {
+      if (event.payload.conversation_id !== conv.id) return;
+      set({ streamingThinking: "", isThinking: false });
     });
 
     // Response tokens
@@ -285,6 +321,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
 
         unlistenToken?.();
         unlistenThink?.();
+        unlistenThinkClear?.();
 
         // Auto-title: rename the conversation on the first exchange.
         if (prevUserMsgCount === 0 && conv.title === "New chat") {
@@ -340,9 +377,23 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         }).catch((e) => console.warn("Failed to save tool steps:", e));
       }
     } catch (e) {
-      set({ isStreaming: false, isThinking: false, error: String(e) });
+      set((s) => ({
+        activeConversation: s.activeConversation
+          ? {
+              ...s.activeConversation,
+              messages: s.activeConversation.messages.filter((m) => m.id !== "streaming"),
+            }
+          : null,
+        isStreaming: false,
+        isThinking: false,
+        streamingContent: "",
+        streamingThinking: "",
+        streamingConversationId: null,
+        error: String(e),
+      }));
       unlistenToken?.();
       unlistenThink?.();
+      unlistenThinkClear?.();
     }
   },
 
@@ -397,4 +448,25 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   },
 
   clearError: () => set({ error: null }),
+
+  stopGeneration: async () => {
+    await invoke("stop_generation");
+    // Immediately unblock the UI — don't wait for the backend [DONE] event.
+    // The backend will still send [DONE] eventually; when it arrives the
+    // done-handler will see no "streaming" message and reload from DB so
+    // any partial content that was persisted shows up correctly.
+    set((s) => ({
+      activeConversation: s.activeConversation
+        ? {
+            ...s.activeConversation,
+            messages: s.activeConversation.messages.filter((m) => m.id !== "streaming"),
+          }
+        : null,
+      isStreaming: false,
+      isThinking: false,
+      streamingContent: "",
+      streamingThinking: "",
+      streamingConversationId: null,
+    }));
+  },
 }));

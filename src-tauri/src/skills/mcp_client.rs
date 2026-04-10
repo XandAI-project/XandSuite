@@ -12,9 +12,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+use crate::process_ext::HideWindowTokio;
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
+use tokio::time::Duration;
 
 // ── JSON-RPC 2.0 primitives ────────────────────────────────────────────────
 
@@ -91,10 +94,21 @@ enum Transport {
 
 // ── McpClient ─────────────────────────────────────────────────────────────
 
+/// Default per-tool-call timeout: 30 minutes.
+///
+/// Video generation (and other long-running ComfyUI/diffusion workflows) can
+/// legitimately take 10-12+ minutes.  This ceiling prevents the OS or a silent
+/// network proxy from silently killing idle stdio/HTTP connections before the
+/// tool has had a chance to finish.
+const DEFAULT_TOOL_CALL_TIMEOUT_SECS: u64 = 1800;
+
 pub struct McpClient {
     transport: Transport,
     id_counter: Arc<AtomicU64>,
     pub server_id: String,
+    /// Maximum wall-clock time allowed for a single `tools/call` round-trip.
+    /// Defaults to [`DEFAULT_TOOL_CALL_TIMEOUT_SECS`] (30 min).
+    tool_call_timeout_secs: u64,
 }
 
 impl McpClient {
@@ -106,16 +120,20 @@ impl McpClient {
         env_vars: Vec<(String, String)>,
     ) -> Result<Self> {
         let mut cmd = Command::new(command);
+        cmd.hide_window();
         cmd.args(args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null()); // suppress Python noise
+            .stderr(std::process::Stdio::piped());
 
         for (k, v) in env_vars {
             cmd.env(k, v);
         }
 
-        let mut child = cmd.spawn().context("Failed to spawn MCP subprocess")?;
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("Failed to spawn MCP subprocess '{}' — is '{}' on your PATH?", args.first().map(|s| s.as_str()).unwrap_or("?"), command))?;
+
         let stdin = child
             .stdin
             .take()
@@ -124,6 +142,7 @@ impl McpClient {
             .stdout
             .take()
             .context("Failed to capture subprocess stdout")?;
+        let mut stderr_pipe = child.stderr.take();
 
         let mut client = Self {
             transport: Transport::Stdio {
@@ -133,10 +152,40 @@ impl McpClient {
             },
             id_counter: Arc::new(AtomicU64::new(1)),
             server_id,
+            tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
         };
 
-        client.initialize().await?;
-        Ok(client)
+        // Apply a generous timeout so a hung script doesn't block forever.
+        match tokio::time::timeout(Duration::from_secs(15), client.initialize()).await {
+            Ok(Ok(())) => Ok(client),
+            Ok(Err(init_err)) => {
+                // Drain stderr for at most 500 ms so we get the Python traceback.
+                let stderr_text = if let Some(ref mut se) = stderr_pipe {
+                    tokio::time::timeout(Duration::from_millis(500), async {
+                        let mut buf = String::new();
+                        let _ = se.read_to_string(&mut buf).await;
+                        buf
+                    })
+                    .await
+                    .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                let stderr_text = stderr_text.trim().to_string();
+                if stderr_text.is_empty() {
+                    Err(init_err)
+                } else {
+                    Err(init_err.context(format!(
+                        "Python process wrote to stderr:\n{}",
+                        stderr_text
+                    )))
+                }
+            }
+            Err(_) => bail!(
+                "MCP subprocess timed out during initialization (15 s). \
+                 Check that the script starts and responds on stdin/stdout."
+            ),
+        }
     }
 
     /// Connect to a remote MCP server via HTTP (streamable-http transport).
@@ -149,6 +198,7 @@ impl McpClient {
             },
             id_counter: Arc::new(AtomicU64::new(1)),
             server_id,
+            tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
         };
         client.initialize().await?;
         Ok(client)
@@ -250,12 +300,25 @@ impl McpClient {
     }
 
     /// Execute a tool and return the result.
+    ///
+    /// The call is bounded by `tool_call_timeout_secs` (default 30 min) so that
+    /// long-running tools such as video generation are given enough time to
+    /// complete while still guarding against truly hung processes.
     pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<McpToolResult> {
         let params = json!({
             "name": name,
             "arguments": arguments
         });
-        let result = self.send_request("tools/call", params).await?;
+        let timeout = Duration::from_secs(self.tool_call_timeout_secs);
+        let result = tokio::time::timeout(timeout, self.send_request("tools/call", params))
+            .await
+            .map_err(|_| anyhow::anyhow!(
+                "MCP tool '{}' timed out after {} s ({} min). \
+                 If this tool is expected to run longer, increase the tool call timeout.",
+                name,
+                self.tool_call_timeout_secs,
+                self.tool_call_timeout_secs / 60,
+            ))??;
         let tool_result: McpToolResult = serde_json::from_value(result)?;
         Ok(tool_result)
     }

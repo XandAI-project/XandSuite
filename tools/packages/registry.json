@@ -1,0 +1,301 @@
+{
+  "version": "1",
+  "packages": [
+    {
+      "id": "jellyfin",
+      "name": "Jellyfin Media Server",
+      "description": "Search and browse your Jellyfin media library by title, genre, year, and media type. Enables the LLM to find movies, TV shows, and more from your personal server.",
+      "category": "Media",
+      "icon": "Tv",
+      "script": "${TOOLS_DIR}/packages/official/jellyfin.py",
+      "requires": ["requests"],
+      "args_schema": [
+        {
+          "name": "url",
+          "label": "Server URL",
+          "type": "string",
+          "required": true,
+          "placeholder": "http://your-server:8096",
+          "arg_prefix": "--url"
+        },
+        {
+          "name": "api_key",
+          "label": "API Key (optional)",
+          "type": "string",
+          "required": false,
+          "placeholder": "your-api-key",
+          "arg_prefix": "--api-key"
+        },
+        {
+          "name": "user_id",
+          "label": "User ID (optional)",
+          "type": "string",
+          "required": false,
+          "placeholder": "leave blank to use first available user",
+          "arg_prefix": "--user-id"
+        }
+      ]
+    },
+    {
+      "id": "comfyui_image",
+      "name": "ComfyUI Image Generation",
+      "description": "Generate images using any ComfyUI image workflow (Stable Diffusion, Flux, SDXL, etc.). Provide a workflow exported from ComfyUI in API format — prompts are injected automatically into CLIPTextEncode nodes, no manual editing required.",
+      "category": "Creative",
+      "icon": "Image",
+      "script": "${TOOLS_DIR}/packages/official/comfyui_image.py",
+      "requires": ["requests"],
+      "args_schema": [
+        {
+          "name": "url",
+          "label": "ComfyUI Server URL",
+          "type": "string",
+          "required": true,
+          "placeholder": "http://localhost:8188",
+          "arg_prefix": "--url"
+        },
+        {
+          "name": "workflow_file",
+          "label": "Workflow File (API format JSON)",
+          "type": "file",
+          "required": true,
+          "file_extensions": ["json"],
+          "placeholder": "Browse for your API-format workflow JSON…",
+          "arg_prefix": "--workflow-file"
+        },
+        {
+          "name": "default_width",
+          "label": "Default Width (px)",
+          "type": "string",
+          "required": false,
+          "placeholder": "1024",
+          "arg_prefix": "--width"
+        },
+        {
+          "name": "default_height",
+          "label": "Default Height (px)",
+          "type": "string",
+          "required": false,
+          "placeholder": "1024",
+          "arg_prefix": "--height"
+        },
+        {
+          "name": "default_steps",
+          "label": "Default Steps",
+          "type": "string",
+          "required": false,
+          "placeholder": "20",
+          "arg_prefix": "--steps"
+        },
+        {
+          "name": "timeout",
+          "label": "Generation Timeout (seconds)",
+          "type": "string",
+          "required": false,
+          "placeholder": "120",
+          "arg_prefix": "--timeout"
+        }
+      ]
+    },
+    {
+      "id": "comfyui_image_edit",
+      "name": "ComfyUI Image Editing",
+      "description": "Edit and transform images using any ComfyUI img2img workflow. Provide a reference image and describe the changes — the package uploads the image, injects it into the LoadImage node, and returns the edited result. Great for style transfer, recolouring, and iterative refinement.",
+      "category": "Creative",
+      "icon": "PencilLine",
+      "script": "${TOOLS_DIR}/packages/official/comfyui_image_edit.py",
+      "requires": ["requests"],
+      "args_schema": [
+        {
+          "name": "url",
+          "label": "ComfyUI Server URL",
+          "type": "string",
+          "required": true,
+          "placeholder": "http://localhost:8188",
+          "arg_prefix": "--url"
+        },
+        {
+          "name": "workflow_file",
+          "label": "img2img Workflow File (API format JSON)",
+          "type": "file",
+          "required": true,
+          "file_extensions": ["json"],
+          "placeholder": "Browse for your API-format img2img workflow JSON…",
+          "arg_prefix": "--workflow-file"
+        },
+        {
+          "name": "default_width",
+          "label": "Default Width (px)",
+          "type": "string",
+          "required": false,
+          "placeholder": "1024",
+          "arg_prefix": "--width"
+        },
+        {
+          "name": "default_height",
+          "label": "Default Height (px)",
+          "type": "string",
+          "required": false,
+          "placeholder": "1024",
+          "arg_prefix": "--height"
+        },
+        {
+          "name": "default_steps",
+          "label": "Default Steps",
+          "type": "string",
+          "required": false,
+          "placeholder": "20",
+          "arg_prefix": "--steps"
+        },
+        {
+          "name": "default_denoise",
+          "label": "Default Denoise (0.0–1.0)",
+          "type": "string",
+          "required": false,
+          "placeholder": "0.7",
+          "arg_prefix": "--denoise"
+        },
+        {
+          "name": "timeout",
+          "label": "Generation Timeout (seconds)",
+          "type": "string",
+          "required": false,
+          "placeholder": "120",
+          "arg_prefix": "--timeout"
+        }
+      ]
+    },
+    {
+      "id": "comfyui_video",
+      "name": "ComfyUI Video Generation",
+      "description": "Generate videos using any ComfyUI video workflow (WAN, AnimateDiff, CogVideoX, HunyuanVideo, LTX-Video, etc.). Provide a workflow exported from ComfyUI in API format with placeholder tokens for dynamic parameters.",
+      "category": "Creative",
+      "icon": "Video",
+      "script": "${TOOLS_DIR}/packages/official/comfyui_video.py",
+      "requires": ["requests"],
+      "args_schema": [
+        {
+          "name": "url",
+          "label": "ComfyUI Server URL",
+          "type": "string",
+          "required": true,
+          "placeholder": "http://localhost:8188",
+          "arg_prefix": "--url"
+        },
+        {
+          "name": "workflow_file",
+          "label": "Workflow File (API format JSON)",
+          "type": "file",
+          "required": true,
+          "file_extensions": ["json"],
+          "placeholder": "Browse for your API-format workflow JSON…",
+          "arg_prefix": "--workflow-file"
+        },
+        {
+          "name": "default_width",
+          "label": "Default Width (px)",
+          "type": "string",
+          "required": false,
+          "placeholder": "848",
+          "arg_prefix": "--width"
+        },
+        {
+          "name": "default_height",
+          "label": "Default Height (px)",
+          "type": "string",
+          "required": false,
+          "placeholder": "480",
+          "arg_prefix": "--height"
+        },
+        {
+          "name": "default_frames",
+          "label": "Default Frame Count",
+          "type": "string",
+          "required": false,
+          "placeholder": "25",
+          "arg_prefix": "--frames"
+        },
+        {
+          "name": "timeout",
+          "label": "Generation Timeout (seconds)",
+          "type": "string",
+          "required": false,
+          "placeholder": "1800",
+          "arg_prefix": "--timeout"
+        }
+      ]
+    },
+    {
+      "id": "comfyui_img2video",
+      "name": "ComfyUI Image to Video",
+      "description": "Animate a still image into a video using a ComfyUI i2v workflow (LTX-Video, WAN i2v, AnimateDiff, etc.). Provide the source image and a motion prompt — the package uploads the image, injects it into the workflow, and returns the generated video URL.",
+      "category": "Creative",
+      "icon": "Clapperboard",
+      "script": "${TOOLS_DIR}/packages/official/comfyui_img2video.py",
+      "requires": ["requests"],
+      "args_schema": [
+        {
+          "name": "url",
+          "label": "ComfyUI Server URL",
+          "type": "string",
+          "required": true,
+          "placeholder": "http://localhost:8188",
+          "arg_prefix": "--url"
+        },
+        {
+          "name": "workflow_file",
+          "label": "i2v Workflow File (API format JSON)",
+          "type": "file",
+          "required": true,
+          "file_extensions": ["json"],
+          "placeholder": "Browse for your API-format i2v workflow JSON…",
+          "arg_prefix": "--workflow-file"
+        },
+        {
+          "name": "default_frames",
+          "label": "Default Frame Count",
+          "type": "string",
+          "required": false,
+          "placeholder": "242",
+          "arg_prefix": "--frames"
+        },
+        {
+          "name": "timeout",
+          "label": "Generation Timeout (seconds)",
+          "type": "string",
+          "required": false,
+          "placeholder": "1800",
+          "arg_prefix": "--timeout"
+        }
+      ]
+    },
+    {
+      "id": "rich_responses",
+      "name": "Rich Responses",
+      "description": "Generate charts, tables, and visual cards inline in chat. Provides line/bar/pie charts (SVG, offline), metric cards, comparison grids, and styled data tables — no configuration needed.",
+      "category": "Productivity",
+      "icon": "LayoutDashboard",
+      "script": "${TOOLS_DIR}/packages/official/rich_responses.py",
+      "requires": [],
+      "args_schema": []
+    },
+    {
+      "id": "pdf_tools",
+      "name": "PDF Tools",
+      "description": "Read and generate PDF files completely offline. Extract text, tables, and metadata from any PDF; create styled documents and multi-section reports with tables. No internet required.",
+      "category": "Productivity",
+      "icon": "FileText",
+      "script": "${TOOLS_DIR}/packages/official/pdf_tools.py",
+      "requires": ["pdfplumber", "fpdf2"],
+      "args_schema": [
+        {
+          "name": "output_dir",
+          "label": "PDF Output Directory",
+          "type": "string",
+          "required": false,
+          "placeholder": "C:\\Users\\YourName\\Desktop",
+          "arg_prefix": "--output-dir"
+        }
+      ]
+    }
+  ]
+}

@@ -1,5 +1,6 @@
 use tauri::State;
 
+use crate::commands::models::resolve_models_dir;
 use crate::models::AppSettings;
 use crate::state::AppState;
 
@@ -21,4 +22,14 @@ pub fn save_settings(settings: AppSettings, state: State<'_, AppState>) -> Resul
 #[tauri::command]
 pub fn get_data_dir(state: State<'_, AppState>) -> Result<String, String> {
     Ok(state.data_dir.to_string_lossy().to_string())
+}
+
+/// Return the absolute, resolved models directory path.
+/// Respects `settings.models_directory` — absolute paths are used as-is,
+/// relative paths are joined with the app data directory.
+#[tauri::command]
+pub fn get_models_dir(state: State<'_, AppState>) -> Result<String, String> {
+    let dir = state.settings.lock().unwrap().models_directory.clone();
+    let resolved = resolve_models_dir(&state.data_dir, &dir);
+    Ok(resolved.to_string_lossy().to_string())
 }

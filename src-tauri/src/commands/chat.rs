@@ -1,6 +1,7 @@
 use chrono::Utc;
 use rusqlite::params;
 use serde::Serialize;
+use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -317,6 +318,22 @@ pub fn delete_conversation(
     Ok(())
 }
 
+/// Rename a conversation (inline rename in the sidebar).
+#[tauri::command]
+pub fn rename_conversation(
+    conversation_id: String,
+    title: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let db = state.db.lock().unwrap();
+    db.conn.execute(
+        "UPDATE conversations SET title = ?1, updated_at = ?2 WHERE id = ?3",
+        params![title.trim(), now, conversation_id],
+    ).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Delete `from_message_id` and every message inserted after it in `conversation_id`.
 /// Used by the frontend to implement "edit & resend" and "regenerate".
 #[tauri::command]
@@ -416,6 +433,36 @@ pub async fn send_message_inner(
             }
         }
     }
+
+    // Save attached images to the local gallery so they get a stable local URL
+    // (http://localhost:{port}/images/{id}).  The URL is injected into the LLM
+    // message text so the model can pass it directly to edit_image / generate_image
+    // tools without needing to re-upload from code.
+    //
+    // image_blocks: (filename, mime, b64, path)
+    // image_local_urls: (filename, local_url)
+    let image_local_urls: Vec<(String, String)> = {
+        let api_port = state.settings.lock().unwrap().mobile_api_port;
+        let mut urls = Vec::new();
+        for (filename, mime, b64, _path) in &image_blocks {
+            let gid = Uuid::new_v4().to_string();
+            let ts = Utc::now().to_rfc3339();
+            let saved = {
+                let db = state.db.lock().unwrap();
+                db.conn.execute(
+                    "INSERT INTO gallery_images \
+                     (id, conversation_id, source, filename, image_data, mime_type, created_at) \
+                     VALUES (?1, ?2, 'upload', ?3, ?4, ?5, ?6)",
+                    params![gid, conversation_id, filename, b64, mime, ts],
+                ).is_ok()
+            };
+            if saved {
+                let local_url = format!("http://localhost:{}/images/{}", api_port, gid);
+                urls.push((filename.clone(), local_url));
+            }
+        }
+        urls
+    };
 
     // Build metadata JSON — text attachment basenames + image full paths stored
     // so the frontend can reload thumbnails from chat history.
@@ -573,9 +620,23 @@ pub async fn send_message_inner(
         // Replace the last user message content with a multimodal marker JSON
         // so build_messages in remote.rs can construct the VLM content array.
         if let Some(last_user) = messages.iter_mut().rev().find(|(role, _)| role == "user") {
+            // Append a URL hint block so the LLM can pass the image directly to
+            // tools like edit_image without needing to run code.
+            let url_hints: String = image_local_urls
+                .iter()
+                .map(|(fname, url)| format!("[Attached image: {} — local URL: {}]", fname, url))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            let full_text = if url_hints.is_empty() {
+                last_user.1.clone()
+            } else {
+                format!("{}\n\n{}", url_hints, last_user.1)
+            };
+
             let text_part = serde_json::json!({
                 "type": "text",
-                "text": last_user.1
+                "text": full_text
             });
             let mut parts = vec![text_part];
             for (_, mime, b64, _) in &image_blocks {
@@ -782,31 +843,9 @@ pub async fn send_message_inner(
     }
 
     // Read feature flags before building system prompt additions.
-    let (code_execution_enabled, comfyui_url, comfyui_model, comfyui_model_type, comfyui_clip_name, comfyui_vae_name) = {
+    let code_execution_enabled = {
         let s = state.settings.lock().unwrap();
-        (
-            s.enable_code_execution,
-            s.comfyui_url.clone(),
-            s.comfyui_model.clone(),
-            s.comfyui_model_type.clone(),
-            s.comfyui_clip_name.clone(),
-            s.comfyui_vae_name.clone(),
-        )
-    };
-
-    // Load saved ComfyUI workflows from DB (id, name, workflow_json)
-    let comfyui_workflows: Vec<(String, String, String)> = if comfyui_url.is_some() {
-        let db = state.db.lock().unwrap();
-        let mut stmt = db.conn
-            .prepare("SELECT id, name, workflow_json FROM comfyui_workflows ORDER BY name ASC")
-            .unwrap_or_else(|_| db.conn.prepare("SELECT id, name, workflow_json FROM comfyui_workflows LIMIT 0").unwrap());
-        stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
-        })
-        .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        .unwrap_or_default()
-    } else {
-        vec![]
+        s.enable_code_execution
     };
 
     // Always inject artifact instructions so the model knows to wrap standalone
@@ -952,41 +991,16 @@ pub async fn send_message_inner(
         cfg
     };
 
-    // Append ComfyUI instruction if image generation is configured.
-    if let Some(ref url) = comfyui_url {
-        let workflow_list: Vec<String> = std::iter::once("Default".to_string())
-            .chain(comfyui_workflows.iter().map(|(_, name, _)| name.clone()))
-            .collect();
-        let img_instruction = format!(
-            "\n\nYou have access to an image generation tool called `comfyui__generate_image` \
-             powered by a local ComfyUI/Stable Diffusion instance at {}. \
-             Call it with a detailed `prompt` whenever the user asks for an image, illustration, \
-             photo, artwork, or any visual content. \
-             Write a rich, descriptive prompt (style, lighting, subject, composition). \
-             Available workflows: {}. \
-             Pass the workflow name in the `workflow` parameter (default: 'Default'). \
-             The generated image will be displayed automatically in the chat — \
-             do NOT wrap the result in an artifact tag.",
-            url,
-            workflow_list.join(", ")
-        );
-        if let Some(sys_msg) = messages.iter_mut().find(|(role, _)| role == "system") {
-            sys_msg.1.push_str(&img_instruction);
-        } else {
-            messages.insert(0, ("system".to_string(), img_instruction));
-        }
-    }
-
     // Activate the agentic executor when:
     //  a) The frontend explicitly enables skills AND MCP tools are connected, OR
-    //  b) Code execution is enabled in settings (always forces tool mode), OR
-    //  c) ComfyUI image generation is configured.
+    //  b) Code execution is enabled in settings (always forces tool mode).
     let has_mcp_tools = use_skills.unwrap_or(false)
         && !skills_arc.all_tools().await.is_empty();
-    let has_tools = has_mcp_tools || code_execution_enabled || comfyui_url.is_some();
+    let has_tools = has_mcp_tools || code_execution_enabled;
 
     let app_clone = app.clone();
     let conv_id_clone = conv_id.clone();
+    let cancelled_clone = Arc::clone(&state.generation_cancelled);
     tauri::async_runtime::spawn(async move {
         if has_tools {
             // Use the agentic executor (handles tool_calls loop internally)
@@ -994,15 +1008,9 @@ pub async fn send_message_inner(
             if code_execution_enabled {
                 executor = executor.with_code_runner(db_arc, conv_id_clone.clone());
             }
-            if let Some(url) = comfyui_url {
-                executor = executor
-                    .with_comfyui(url, comfyui_model)
-                    .with_comfyui_model_type(comfyui_model_type, comfyui_clip_name, comfyui_vae_name)
-                    .with_comfyui_workflows(comfyui_workflows);
-            }
             if let Some(remote) = engine.get_remote() {
                 if let Err(e) = executor
-                    .run(messages, &config, &remote, &app_clone, &conv_id_clone, token_tx)
+                    .run(messages, &config, &remote, &app_clone, &conv_id_clone, token_tx, cancelled_clone)
                     .await
                 {
                     log::error!("Skills executor error: {}", e);
@@ -1036,11 +1044,20 @@ pub async fn send_message_inner(
         }
     });
 
+    // Reset any leftover cancellation flag from a previous aborted request.
+    state.generation_cancelled.store(false, std::sync::atomic::Ordering::Relaxed);
+
     let thinking_prefix = crate::engine::remote::THINKING_PREFIX;
     let mut full_response = String::new();
     let mut full_thinking = String::new();
+    let mut was_cancelled = false;
     while let Some(token) = token_rx.recv().await {
         if token == "[DONE]" {
+            break;
+        }
+        // User pressed Stop — drain the channel and finish cleanly.
+        if state.generation_cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+            was_cancelled = true;
             break;
         }
         if let Some(thought) = token.strip_prefix(thinking_prefix) {
@@ -1077,6 +1094,55 @@ pub async fn send_message_inner(
                 }
             }
         }
+    }
+
+    // Reset cancellation flag now that streaming has ended (cancelled or natural).
+    state.generation_cancelled.store(false, std::sync::atomic::Ordering::Relaxed);
+
+    // If the user stopped generation mid-stream, emit done:true immediately so
+    // the frontend exits streaming state, then persist whatever was received so far.
+    if was_cancelled {
+        let _ = app.emit("chat_token", serde_json::json!({
+            "conversation_id": conv_id,
+            "token": "",
+            "done": true,
+        }));
+    }
+
+    // ── Thinking-only response recovery ──────────────────────────────────────
+    // Some reasoning models (and models responding after tool calls) emit their
+    // entire answer through reasoning_content / <think> tags, leaving the
+    // visible content channel empty.  When this happens promote the thinking
+    // text to the visible response so the answer is never silently hidden.
+    if full_response.is_empty() && !full_thinking.is_empty() {
+        emit_log("info", format!(
+            "[chat] Response was empty but thinking had {} chars — promoting to response",
+            full_thinking.len()
+        ));
+        full_response = full_thinking.clone();
+        // Push the content to the frontend so `streamingContent` becomes non-empty.
+        let _ = app.emit("chat_token", serde_json::json!({
+            "conversation_id": conv_id,
+            "token": full_response,
+            "done": false,
+        }));
+        {
+            use tauri::Manager;
+            if let Some(st) = app.try_state::<crate::state::AppState>() {
+                let _ = st.event_tx.send(crate::api_server::events::ApiEvent::ChatToken {
+                    conversation_id: conv_id.clone(),
+                    token: full_response.clone(),
+                    done: false,
+                });
+            }
+        }
+        // Clear the accumulated thinking so the UI does not show the same text twice
+        // (once in the reasoning block and once as the message body).
+        full_thinking.clear();
+        // Tell the frontend to discard whatever it accumulated in streamingThinking.
+        let _ = app.emit("chat_thinking_clear", serde_json::json!({
+            "conversation_id": conv_id,
+        }));
     }
 
     // Reset idle timer — model is warm, keep it loaded
@@ -1335,4 +1401,14 @@ pub fn save_message_tool_steps(
         )
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Signal the currently active generation to stop.
+/// The streaming loop checks this flag on every token and exits cleanly.
+#[tauri::command]
+pub fn stop_generation(state: State<'_, AppState>) {
+    state
+        .generation_cancelled
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    log::info!("[chat] Generation stop requested by user");
 }

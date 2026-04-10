@@ -13,6 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
+
+use crate::process_ext::HideWindowTokio;
 use tokio::time::timeout;
 
 use crate::db::AppDb;
@@ -205,19 +207,15 @@ async fn spawn_python(path: &std::path::Path) -> Result<tokio::process::Child> {
     // Try `python3` first, then `python`.
     let interpreters = ["python3", "python"];
     for interp in &interpreters {
-        if let Ok(child) = Command::new(interp)
-            // -u: unbuffered so all output is captured even on crash
-            .arg("-u")
+        let mut cmd = Command::new(interp);
+        cmd.hide_window();
+        cmd.arg("-u")
             .arg(path)
-            // Force UTF-8 I/O on all platforms (critical on Windows where the
-            // default cp1252 codec can't encode emoji / non-latin characters,
-            // causing a secondary UnicodeEncodeError that hides the real error).
             .env("PYTHONIOENCODING", "utf-8")
             .env("PYTHONUTF8", "1")
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-        {
+            .stderr(std::process::Stdio::piped());
+        if let Ok(child) = cmd.spawn() {
             return Ok(child);
         }
     }
@@ -225,24 +223,24 @@ async fn spawn_python(path: &std::path::Path) -> Result<tokio::process::Child> {
 }
 
 async fn spawn_node(path: &std::path::Path) -> Result<tokio::process::Child> {
-    Command::new("node")
-        .arg(path)
-        // Ensure UTF-8 output on Windows
-        .env("NODE_ICU_DATA", "")  // avoid icu issues
+    let mut cmd = Command::new("node");
+    cmd.hide_window();
+    cmd.arg(path)
+        .env("NODE_ICU_DATA", "")
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
+        .stderr(std::process::Stdio::piped());
+    cmd.spawn()
         .map_err(|_| anyhow::anyhow!("Node.js interpreter not found. Please install Node.js and ensure it is on your PATH."))
 }
 
 async fn spawn_shell(path: &std::path::Path) -> Result<tokio::process::Child> {
     #[cfg(target_os = "windows")]
     {
-        Command::new("powershell")
-            .args([
+        let mut cmd = Command::new("powershell");
+        cmd.hide_window();
+        cmd.args([
                 "-NoProfile",
                 "-NonInteractive",
-                // Switch console to UTF-8 so emoji and non-ASCII output is captured correctly
                 "-Command",
                 &format!(
                     "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; \
@@ -252,8 +250,8 @@ async fn spawn_shell(path: &std::path::Path) -> Result<tokio::process::Child> {
                 ),
             ])
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
+            .stderr(std::process::Stdio::piped());
+        cmd.spawn()
             .map_err(|e| anyhow::anyhow!("Failed to launch PowerShell: {}", e))
     }
     #[cfg(not(target_os = "windows"))]

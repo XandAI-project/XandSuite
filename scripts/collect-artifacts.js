@@ -7,6 +7,9 @@
  *
  *   version/executables/<version>/
  *
+ * This directory is also where the /api/download endpoint looks for
+ * installer binaries to serve to users.
+ *
  * Supported outputs:
  *   Windows  →  nsis/*.exe
  *   macOS    →  dmg/*.dmg
@@ -72,4 +75,27 @@ if (copied === 0) {
   process.exit(1);
 }
 
-console.log(`\nDone — ${copied} artifact(s) collected into version/executables/${version}/\n`);
+console.log(`\nDone — ${copied} artifact(s) collected into version/executables/${version}/`);
+
+// Also copy to an "installers" directory next to the release binary
+// so the /api/download endpoint can find them at runtime.
+const RELEASE_INSTALLERS = join(ROOT, "src-tauri", "target", "release", "installers");
+mkdirSync(RELEASE_INSTALLERS, { recursive: true });
+
+let linked = 0;
+const outFiles = readdirSync(OUT_DIR).filter((f) => {
+  const lower = f.toLowerCase();
+  return lower.endsWith(".exe") || lower.endsWith(".dmg") || lower.endsWith(".appimage");
+});
+
+for (const f of outFiles) {
+  const src = join(OUT_DIR, f);
+  const dest = join(RELEASE_INSTALLERS, f);
+  copyFileSync(src, dest);
+  console.log(`  link  ${f}  →  src-tauri/target/release/installers/`);
+  linked++;
+}
+
+if (linked > 0) {
+  console.log(`\n${linked} installer(s) also staged for /api/download endpoint.\n`);
+}

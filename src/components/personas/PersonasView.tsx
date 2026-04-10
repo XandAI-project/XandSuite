@@ -10,6 +10,16 @@ import {
   UserCircle2,
   Loader2,
 } from "lucide-react";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { useNavigate } from "react-router-dom";
 import { usePersonaStore } from "@/stores/personaStore";
 import { useChatStore } from "@/stores/chatStore";
@@ -79,6 +89,7 @@ function PersonaCard({
   const { downloadedModels } = useModelStore();
   const { collections } = useRagStore();
   const [deleting, setDeleting] = useState(false);
+  const [confirmOpen, setConfirmOpen] = useState(false);
 
   const modelName = persona.model_id
     ? downloadedModels.find((m) => m.path === persona.model_id)?.filename ??
@@ -91,7 +102,6 @@ function PersonaCard({
   ).length;
 
   const handleDelete = async () => {
-    if (!confirm(`Delete persona "${persona.name}"?`)) return;
     setDeleting(true);
     try {
       await onDelete();
@@ -148,12 +158,7 @@ function PersonaCard({
           <MessageSquare className="w-3.5 h-3.5" />
           Chat
         </Button>
-        <Button
-          size="sm"
-          variant="outline"
-          className="gap-1.5"
-          onClick={onEdit}
-        >
+        <Button size="sm" variant="outline" className="gap-1.5" onClick={onEdit}>
           <Pencil className="w-3.5 h-3.5" />
           Edit
         </Button>
@@ -161,12 +166,27 @@ function PersonaCard({
           size="sm"
           variant="outline"
           className="text-destructive hover:text-destructive hover:bg-destructive/10"
-          onClick={handleDelete}
+          onClick={() => setConfirmOpen(true)}
           disabled={deleting}
         >
           {deleting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Trash2 className="w-3.5 h-3.5" />}
         </Button>
       </div>
+
+      <AlertDialog open={confirmOpen} onOpenChange={setConfirmOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete "{persona.name}"?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This persona and its dedicated memory collection will be permanently deleted. Conversations using this persona will not be affected.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={handleDelete}>Delete</AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

@@ -16,9 +16,22 @@ import { cn } from "@/lib/utils";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-function imgSrc(img: GalleryImage): string {
+function isVideo(img: GalleryImage): boolean {
+  return img.mime_type.startsWith("video/");
+}
+
+function mediaSrc(img: GalleryImage): string {
+  if (isVideo(img)) {
+    return img.image_data; // videos store the URL directly, not base64
+  }
+  // Package-generated images also store a URL (ComfyUI /view endpoint) rather than base64
+  if (img.image_data.startsWith("http://") || img.image_data.startsWith("https://")) {
+    return img.image_data;
+  }
   return `data:${img.mime_type};base64,${img.image_data}`;
 }
+
+// imgSrc alias removed — use mediaSrc directly
 
 function formatDate(iso: string): string {
   try {
@@ -74,10 +87,15 @@ function Lightbox({
   }, [onClose, images.length]);
 
   const handleDownload = () => {
-    const a = document.createElement("a");
-    a.href = imgSrc(img);
-    a.download = img.filename;
-    a.click();
+    const src = mediaSrc(img);
+    if (isVideo(img)) {
+      window.open(src, "_blank");
+    } else {
+      const a = document.createElement("a");
+      a.href = src;
+      a.download = img.filename;
+      a.click();
+    }
   };
 
   return (
@@ -115,12 +133,22 @@ function Lightbox({
           </div>
         </div>
 
-        {/* Image */}
-        <img
-          src={imgSrc(img)}
-          alt={img.prompt ?? img.filename}
-          className="max-w-[90vw] max-h-[75vh] object-contain rounded-md border border-white/10"
-        />
+        {/* Media */}
+        {isVideo(img) ? (
+          <video
+            src={mediaSrc(img)}
+            controls
+            loop
+            autoPlay
+            className="max-w-[90vw] max-h-[75vh] object-contain rounded-md border border-white/10"
+          />
+        ) : (
+          <img
+            src={mediaSrc(img)}
+            alt={img.prompt ?? img.filename}
+            className="max-w-[90vw] max-h-[75vh] object-contain rounded-md border border-white/10"
+          />
+        )}
 
         {/* Prompt */}
         {img.prompt && (
@@ -172,10 +200,15 @@ function ImageTile({
 
   const handleDownload = (e: React.MouseEvent) => {
     e.stopPropagation();
-    const a = document.createElement("a");
-    a.href = imgSrc(image);
-    a.download = image.filename;
-    a.click();
+    const src = mediaSrc(image);
+    if (isVideo(image)) {
+      window.open(src, "_blank");
+    } else {
+      const a = document.createElement("a");
+      a.href = src;
+      a.download = image.filename;
+      a.click();
+    }
   };
 
   return (
@@ -189,12 +222,23 @@ function ImageTile({
       title={image.prompt ?? image.filename}
     >
       <div className="aspect-square">
-        <img
-          src={imgSrc(image)}
-          alt={image.prompt ?? image.filename}
-          className="w-full h-full object-cover"
-          loading="lazy"
-        />
+        {isVideo(image) ? (
+          <video
+            src={mediaSrc(image)}
+            muted
+            loop
+            className="w-full h-full object-cover"
+            onMouseEnter={(e) => e.currentTarget.play()}
+            onMouseLeave={(e) => { e.currentTarget.pause(); e.currentTarget.currentTime = 0; }}
+          />
+        ) : (
+          <img
+            src={mediaSrc(image)}
+            alt={image.prompt ?? image.filename}
+            className="w-full h-full object-cover"
+            loading="lazy"
+          />
+        )}
       </div>
 
       {/* Hover overlay */}
@@ -348,7 +392,7 @@ export function GalleryPanel() {
                 className={cn(
                   "px-2 py-1 transition-colors",
                   scope === "conversation"
-                    ? "bg-primary text-primary-foreground"
+                    ? "glass-primary text-white"
                     : "text-muted-foreground hover:bg-secondary"
                 )}
                 onClick={() => setScope("conversation")}
@@ -359,7 +403,7 @@ export function GalleryPanel() {
                 className={cn(
                   "px-2 py-1 transition-colors",
                   scope === "all"
-                    ? "bg-primary text-primary-foreground"
+                    ? "glass-primary text-white"
                     : "text-muted-foreground hover:bg-secondary"
                 )}
                 onClick={() => setScope("all")}

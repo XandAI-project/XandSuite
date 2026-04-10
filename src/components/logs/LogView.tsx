@@ -143,7 +143,7 @@ export function LogView() {
             className={cn(
               "px-2.5 py-0.5 rounded-full text-xs font-medium transition-colors whitespace-nowrap",
               filter === id
-                ? "bg-primary text-primary-foreground"
+                ? "glass-primary text-white"
                 : "bg-secondary text-muted-foreground hover:bg-secondary/80",
             )}
           >

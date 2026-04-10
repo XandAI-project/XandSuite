@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
@@ -6,8 +7,9 @@ import { vscDarkPlus } from "react-syntax-highlighter/dist/esm/styles/prism";
 import {
   X, Copy, Check, Download, Pencil, Save, Trash2,
   Code, FileText, Globe, AlignLeft, FileDown, Loader2, FileJson,
-  ChevronDown, ChevronRight,
+  ChevronDown, ChevronRight, ExternalLink, FolderOpen,
 } from "lucide-react";
+import { openPath } from "@tauri-apps/plugin-opener";
 import { useArtifactStore } from "@/stores/artifactStore";
 import { cn } from "@/lib/utils";
 import type { Artifact, ArtifactType } from "@/lib/tauri";
@@ -20,6 +22,7 @@ const TYPE_META: Record<ArtifactType, { label: string; icon: React.ReactNode }> 
   text: { label: "Text", icon: <AlignLeft className="w-3.5 h-3.5" /> },
   csv: { label: "CSV", icon: <FileText className="w-3.5 h-3.5" /> },
   json: { label: "JSON", icon: <FileJson className="w-3.5 h-3.5" /> },
+  pdf: { label: "PDF", icon: <FileDown className="w-3.5 h-3.5" /> },
 };
 
 // ── CSV renderer ─────────────────────────────────────────────────────────────
@@ -235,6 +238,109 @@ function JsonViewer({ content }: { content: string }) {
   );
 }
 
+// ── PDF viewer ────────────────────────────────────────────────────────────────
+
+function PdfViewer({ content, title }: { content: string; title: string }) {
+  const [dataUri, setDataUri] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const meta = (() => {
+    try { return JSON.parse(content) as { path: string; filename: string; pages: number }; }
+    catch { return null; }
+  })();
+
+  const path = meta?.path ?? "";
+  const filename = meta?.filename ?? title;
+  const pages = meta?.pages ?? 0;
+
+  // Load PDF bytes from disk as base64 and build a data URI for the iframe
+  useEffect(() => {
+    if (!path) return;
+    setLoading(true);
+    setError(null);
+    invoke<string>("read_file_as_base64", { path })
+      .then((b64) => setDataUri(`data:application/pdf;base64,${b64}`))
+      .catch((e) => setError(String(e)))
+      .finally(() => setLoading(false));
+  }, [path]);
+
+  const openFolder = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!path) return;
+    const dir = path.replace(/[\\/][^\\/]+$/, "");
+    openPath(dir).catch(console.error);
+  };
+
+  const openFile = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!path) return;
+    openPath(path).catch(console.error);
+  };
+
+  return (
+    <div className="flex flex-col h-full">
+      {/* Thin toolbar above the PDF */}
+      <div className="flex items-center gap-2 px-3 py-1.5 border-b border-border bg-card shrink-0">
+        <FileDown className="w-3.5 h-3.5 text-red-400 shrink-0" />
+        <span className="text-xs font-medium truncate flex-1 text-foreground">{filename}</span>
+        {pages > 0 && (
+          <span className="text-[10px] text-muted-foreground shrink-0">{pages}p</span>
+        )}
+        <button
+          onClick={openFile}
+          className="flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground
+                     px-2 py-1 rounded hover:bg-secondary transition-colors shrink-0"
+          title="Open with system viewer"
+        >
+          <ExternalLink className="w-3 h-3" />
+          Open
+        </button>
+        <button
+          onClick={openFolder}
+          className="flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground
+                     px-2 py-1 rounded hover:bg-secondary transition-colors shrink-0"
+          title="Show in folder"
+        >
+          <FolderOpen className="w-3 h-3" />
+          Folder
+        </button>
+      </div>
+
+      {/* PDF content area */}
+      <div className="flex-1 overflow-hidden bg-[#525659]">
+        {loading && (
+          <div className="flex flex-col items-center justify-center h-full gap-3">
+            <Loader2 className="w-6 h-6 text-muted-foreground animate-spin" />
+            <p className="text-xs text-muted-foreground">Loading PDF…</p>
+          </div>
+        )}
+        {error && (
+          <div className="flex flex-col items-center justify-center h-full gap-3 p-6">
+            <FileDown className="w-8 h-8 text-red-400/60" />
+            <p className="text-xs text-muted-foreground text-center">{error}</p>
+            <button
+              onClick={openFile}
+              className="flex items-center gap-2 px-3 py-1.5 bg-red-500/20 hover:bg-red-500/30
+                         border border-red-500/30 text-red-300 rounded-lg text-xs transition-colors"
+            >
+              <ExternalLink className="w-3.5 h-3.5" />
+              Open with system viewer
+            </button>
+          </div>
+        )}
+        {!loading && !error && dataUri && (
+          <iframe
+            src={dataUri}
+            className="w-full h-full border-none"
+            title={filename}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ── ArtifactContent ────────────────────────────────────────────────────────────
 
 interface ArtifactContentProps {
@@ -244,6 +350,10 @@ interface ArtifactContentProps {
 
 function ArtifactContent({ artifact, iframeRef }: ArtifactContentProps) {
   const type = artifact.artifact_type as ArtifactType;
+
+  if (type === "pdf") {
+    return <PdfViewer content={artifact.content} title={artifact.title} />;
+  }
 
   if (type === "code") {
     return (
@@ -389,6 +499,14 @@ export function ArtifactPanel() {
 
   const handleDownload = () => {
     if (!active) return;
+    // PDFs are already on disk — open them with the system viewer instead
+    if (active.artifact_type === "pdf") {
+      try {
+        const meta = JSON.parse(active.content) as { path?: string };
+        if (meta.path) openPath(meta.path).catch(console.error);
+      } catch { /* ignore parse errors */ }
+      return;
+    }
     const ext =
       active.artifact_type === "code"
         ? active.language ?? "txt"
@@ -514,25 +632,29 @@ export function ArtifactPanel() {
             </>
           ) : (
             <>
-              <button onClick={handleCopy} className="p-1.5 rounded hover:bg-secondary transition-colors" title="Copy source">
-                {copied ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5 text-muted-foreground" />}
-              </button>
-              <button
-                onClick={handleExportPdf}
-                className="p-1.5 rounded hover:bg-secondary transition-colors"
-                title="Export as PDF"
-                disabled={exporting}
-              >
-                {exporting
-                  ? <Loader2 className="w-3.5 h-3.5 text-muted-foreground animate-spin" />
-                  : <FileDown className="w-3.5 h-3.5 text-muted-foreground" />}
-              </button>
-              <button onClick={handleDownload} className="p-1.5 rounded hover:bg-secondary transition-colors" title="Download source">
-                <Download className="w-3.5 h-3.5 text-muted-foreground" />
-              </button>
-              <button onClick={startEditing} className="p-1.5 rounded hover:bg-secondary transition-colors" title="Edit">
-                <Pencil className="w-3.5 h-3.5 text-muted-foreground" />
-              </button>
+              {active.artifact_type !== "pdf" && (
+                <>
+                  <button onClick={handleCopy} className="p-1.5 rounded hover:bg-secondary transition-colors" title="Copy source">
+                    {copied ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5 text-muted-foreground" />}
+                  </button>
+                  <button
+                    onClick={handleExportPdf}
+                    className="p-1.5 rounded hover:bg-secondary transition-colors"
+                    title="Export as PDF"
+                    disabled={exporting}
+                  >
+                    {exporting
+                      ? <Loader2 className="w-3.5 h-3.5 text-muted-foreground animate-spin" />
+                      : <FileDown className="w-3.5 h-3.5 text-muted-foreground" />}
+                  </button>
+                  <button onClick={handleDownload} className="p-1.5 rounded hover:bg-secondary transition-colors" title="Download source">
+                    <Download className="w-3.5 h-3.5 text-muted-foreground" />
+                  </button>
+                  <button onClick={startEditing} className="p-1.5 rounded hover:bg-secondary transition-colors" title="Edit">
+                    <Pencil className="w-3.5 h-3.5 text-muted-foreground" />
+                  </button>
+                </>
+              )}
               <button onClick={handleDelete} className="p-1.5 rounded hover:bg-secondary transition-colors" title="Delete artifact">
                 <Trash2 className="w-3.5 h-3.5 text-muted-foreground hover:text-destructive" />
               </button>

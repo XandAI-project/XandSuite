@@ -1,6 +1,7 @@
 import { useState, useRef, KeyboardEvent, useMemo, useEffect } from "react";
 import {
   Send,
+  Square,
   BookOpen,
   Wrench,
   Paperclip,
@@ -16,6 +17,8 @@ import {
   AlertCircle,
   Mic,
   MicOff,
+  LayoutTemplate,
+  AudioLines,
 } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { readFile } from "@tauri-apps/plugin-fs";
@@ -24,10 +27,14 @@ import { useChatStore } from "@/stores/chatStore";
 import { useSkillsStore } from "@/stores/skillsStore";
 import { useServerStore } from "@/stores/serverStore";
 import { useSettingsStore } from "@/stores/settingsStore";
+import { useTemplateStore } from "@/stores/templateStore";
 import { Button } from "@/components/ui/button";
 import { cn, bytesToBase64, imageMime } from "@/lib/utils";
 import { useVoiceInput } from "@/hooks/useVoiceInput";
-import type { RagCollection } from "@/lib/tauri";
+import { TemplatePicker } from "./TemplatePicker";
+import { VariableFiller } from "./VariableFiller";
+import { VoiceModal } from "@/components/voice/VoiceModal";
+import type { RagCollection, PromptTemplate } from "@/lib/tauri";
 
 interface Props {
   collections: RagCollection[];
@@ -89,19 +96,28 @@ export function InputBar({ collections, disabled }: Props) {
   const [selectedCollection, setSelectedCollection] = useState<string | null>(null);
   const [attachedPaths, setAttachedPaths] = useState<string[]>([]);
   const [showNoModelModal, setShowNoModelModal] = useState(false);
+  // Template picker state
+  const [showTemplatePicker, setShowTemplatePicker] = useState(false);
+  const [templatePickerQuery, setTemplatePickerQuery] = useState("");
+  const [pendingTemplate, setPendingTemplate] = useState<PromptTemplate | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const imagePreviews = useImagePreviews(attachedPaths);
   const sendMessage = useChatStore((s) => s.sendMessage);
+  const stopGeneration = useChatStore((s) => s.stopGeneration);
+  const isStreaming = useChatStore((s) => s.isStreaming);
   const { tools, skillsEnabled, toggleSkills, clearToolSteps } = useSkillsStore();
+  const { templates, fetchTemplates, incrementUse } = useTemplateStore();
   const navigate = useNavigate();
 
   // Server / model state
   const { status, isStarting, engineMode, lastModel, startServer } = useServerStore();
 
-  // Voice input (Whisper)
+  // Voice input (Whisper) + TTS
   const { settings } = useSettingsStore();
   const whisperEnabled = settings?.whisper_enabled ?? false;
+  const ttsEnabled = settings?.tts_enabled ?? false;
   const [micError, setMicError] = useState<string | null>(null);
+  const [voiceModalOpen, setVoiceModalOpen] = useState(false);
 
   // True when we're in local mode and the server isn't up yet
   const needsLoad = engineMode === "local" && !status.running && !isStarting;
@@ -151,6 +167,25 @@ export function InputBar({ collections, disabled }: Props) {
   // Keep ref current so the stale onTranscript closure always stops the right session
   stopVoiceRef.current = stopVoice;
 
+  // Load templates once on mount (lazy — only if not already loaded)
+  useEffect(() => {
+    if (templates.length === 0) fetchTemplates();
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Pre-fill content from the welcome screen suggestion pills
+  useEffect(() => {
+    const onPrefill = (e: Event) => {
+      const text = (e as CustomEvent<{ content: string }>).detail.content;
+      setContent(text);
+      setTimeout(() => {
+        handleInput();
+        textareaRef.current?.focus();
+      }, 50);
+    };
+    window.addEventListener("prefill-input", onPrefill);
+    return () => window.removeEventListener("prefill-input", onPrefill);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
   const handleLoadAndSend = async () => {
     const text = content.trim();
     if (!text || !lastModel) return;
@@ -183,6 +218,14 @@ export function InputBar({ collections, disabled }: Props) {
   };
 
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
+    // Let TemplatePicker handle its own arrow/enter/escape
+    if (showTemplatePicker) {
+      if (["ArrowUp", "ArrowDown", "Enter", "Escape"].includes(e.key)) return;
+    }
+    if (e.key === "Escape" && showTemplatePicker) {
+      setShowTemplatePicker(false);
+      return;
+    }
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       if (needsLoad) {
@@ -191,6 +234,48 @@ export function InputBar({ collections, disabled }: Props) {
         handleSend();
       }
     }
+  };
+
+  const handleContentChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    if (disabled) return;
+    const val = e.target.value;
+    setContent(val);
+    // Slash-command: open picker when user types "/" at start or after newline
+    if (/(?:^|\n)\/$/.test(val) || val === "/") {
+      setTemplatePickerQuery("/");
+      setShowTemplatePicker(true);
+    } else if (showTemplatePicker) {
+      // Extract the current word after the last "/"
+      const match = val.match(/(?:^|\n)\/(\S*)$/);
+      if (match) {
+        setTemplatePickerQuery("/" + match[1]);
+      } else {
+        setShowTemplatePicker(false);
+      }
+    }
+  };
+
+  const handleTemplateSelect = (template: PromptTemplate) => {
+    const hasVars = /\{\{(\w+)\}\}/.test(template.content);
+    setShowTemplatePicker(false);
+    setTemplatePickerQuery("");
+    if (hasVars) {
+      setPendingTemplate(template);
+    } else {
+      // Strip the trigger slash from the textarea before inserting
+      const withoutTrigger = content.replace(/(?:^|\n)\/\S*$/, "");
+      setContent(withoutTrigger + template.content);
+      void incrementUse(template.id);
+      setTimeout(() => textareaRef.current?.focus(), 0);
+    }
+  };
+
+  const handleVariableFilled = (filledText: string) => {
+    const withoutTrigger = content.replace(/(?:^|\n)\/\S*$/, "");
+    setContent(withoutTrigger + filledText);
+    if (pendingTemplate) void incrementUse(pendingTemplate.id);
+    setPendingTemplate(null);
+    setTimeout(() => textareaRef.current?.focus(), 0);
   };
 
   // Detect URLs in the current message for the visual preview chips.
@@ -249,66 +334,16 @@ export function InputBar({ collections, disabled }: Props) {
   const placeholderText = (() => {
     if (disabled) return "Generating…";
     if (isStarting) return "Starting model…";
-    if (needsLoad) return "Type a message — press Enter or Send to load a model first";
-    return "Message XandSuite… (Enter to send, Shift+Enter for newline)";
+    if (needsLoad) return "Type a message — Enter to send, model will load automatically";
+    return "Message… (/ for templates · Enter to send · Shift+Enter for newline)";
   })();
 
+  const hasContextToggles = collections.length > 0 || tools.length > 0;
+  const isInputDisabled = disabled || isStarting;
+
   return (
-    <div className="px-4 pb-4 pt-2 border-t border-border shrink-0">
-      {/* Toggle row (RAG + Skills) */}
-      {(collections.length > 0 || tools.length > 0) && (
-        <div className="flex items-center gap-2 mb-2">
-          {/* RAG toggle */}
-          {collections.length > 0 && (
-            <>
-              <button
-                className={cn(
-                  "flex items-center gap-1 px-2 py-1 rounded-md text-xs transition-colors",
-                  useRag
-                    ? "bg-primary/20 text-primary border border-primary/30"
-                    : "bg-secondary text-muted-foreground hover:text-foreground"
-                )}
-                onClick={() => setUseRag((v) => !v)}
-              >
-                <BookOpen className="w-3 h-3" />
-                RAG
-              </button>
-
-              {useRag && (
-                <select
-                  className="text-xs bg-secondary border border-border rounded-md px-2 py-1 text-foreground"
-                  value={selectedCollection || ""}
-                  onChange={(e) => setSelectedCollection(e.target.value || null)}
-                >
-                  <option value="">All collections</option>
-                  {collections.map((c) => (
-                    <option key={c.id} value={c.id}>{c.name}</option>
-                  ))}
-                </select>
-              )}
-            </>
-          )}
-
-          {/* Skills / Tools toggle */}
-          {tools.length > 0 && (
-            <button
-              className={cn(
-                "flex items-center gap-1 px-2 py-1 rounded-md text-xs transition-colors",
-                skillsEnabled
-                  ? "bg-violet-500/20 text-violet-300 border border-violet-500/30"
-                  : "bg-secondary text-muted-foreground hover:text-foreground"
-              )}
-              onClick={toggleSkills}
-              title={skillsEnabled ? `${tools.length} tool${tools.length !== 1 ? "s" : ""} enabled` : "Enable skills"}
-            >
-              <Wrench className="w-3 h-3" />
-              Tools {skillsEnabled && <span className="text-[10px] opacity-70">({tools.length})</span>}
-            </button>
-          )}
-        </div>
-      )}
-
-      {/* URL fetch chips — shown when the message contains HTTP/S links */}
+    <div className="relative px-4 pb-4 pt-2 border-t border-border shrink-0">
+      {/* URL fetch chips */}
       {detectedUrls.length > 0 && (
         <div className="flex flex-wrap gap-1.5 mb-2">
           {detectedUrls.map((url) => {
@@ -341,12 +376,7 @@ export function InputBar({ collections, disabled }: Props) {
                 <div key={path} className="relative group">
                   <div className="w-14 h-14 rounded-lg border border-border overflow-hidden bg-secondary">
                     {preview ? (
-                      <img
-                        src={preview}
-                        alt={name}
-                        className="w-full h-full object-cover"
-                        title={name}
-                      />
+                      <img src={preview} alt={name} className="w-full h-full object-cover" title={name} />
                     ) : (
                       <div className="w-full h-full flex items-center justify-center text-muted-foreground">
                         <ImageIcon className="w-5 h-5" />
@@ -386,97 +416,202 @@ export function InputBar({ collections, disabled }: Props) {
         </div>
       )}
 
-      {/* Input area */}
-      <div className={cn(
-        "flex items-end gap-2 rounded-xl border border-border bg-card px-3 py-2 transition-colors",
-        disabled ? "opacity-60" : "focus-within:border-primary/50"
-      )}>
-        {/* Action buttons group */}
-        <div className="flex items-center gap-1 pb-1 shrink-0">
-          {/* Attach button */}
-          <button
-            className={cn(
-              "flex items-center justify-center w-7 h-7 rounded-lg transition-all",
-              disabled || isStarting
-                ? "text-muted-foreground/40 cursor-not-allowed"
-                : "text-muted-foreground hover:text-foreground hover:bg-secondary"
-            )}
-            onClick={handleAttach}
-            disabled={disabled || isStarting}
-            title="Attach file"
-          >
-            <Paperclip className="w-4 h-4" />
-          </button>
+      {/* Template picker popover — anchored above the input area */}
+      {showTemplatePicker && (
+        <TemplatePicker
+          query={templatePickerQuery}
+          onSelect={handleTemplateSelect}
+          onClose={() => setShowTemplatePicker(false)}
+        />
+      )}
 
-          {/* Microphone button — only shown when Whisper is enabled in settings */}
-          {whisperEnabled && (
+      {/* ── Unified input card ─────────────────────────────────────────────── */}
+      <div className={cn(
+        "rounded-xl border border-border bg-card transition-all duration-150",
+        isInputDisabled && "opacity-50",
+        // Keep pointer-events-none only when NOT streaming so the stop button
+        // remains clickable during generation. During streaming the individual
+        // elements (textarea, send button) already guard against interaction.
+        isInputDisabled && !isStreaming && "pointer-events-none",
+        !isInputDisabled && "focus-within:border-primary/60 focus-within:shadow-sm focus-within:shadow-primary/10"
+      )}>
+        {/* Main textarea row */}
+        <div className="flex items-end gap-2 px-3 pt-2 pb-1">
+          {/* Left icon buttons */}
+          <div className="flex items-center gap-0.5 pb-1 shrink-0">
+            <button
+              className="flex items-center justify-center w-7 h-7 rounded-lg text-muted-foreground hover:text-foreground hover:bg-secondary transition-all"
+              onClick={handleAttach}
+              title="Attach file"
+            >
+              <Paperclip className="w-4 h-4" />
+            </button>
+
+            {whisperEnabled && (
+              <button
+                className={cn(
+                  "relative flex items-center justify-center w-7 h-7 rounded-lg transition-all",
+                  transcribing
+                    ? "text-primary bg-primary/10 cursor-wait"
+                    : recording
+                    ? "text-red-400 bg-red-500/10 hover:bg-red-500/20"
+                    : "text-muted-foreground hover:text-foreground hover:bg-secondary"
+                )}
+                onClick={handleMic}
+                title={
+                  transcribing ? "Transcribing…"
+                  : recording ? "Voice active — speak freely. Click to stop."
+                  : "Start voice input"
+                }
+              >
+                {transcribing ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : recording ? (
+                  <>
+                    <MicOff className="w-4 h-4" />
+                    <span className="absolute top-0.5 right-0.5 w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse" />
+                  </>
+                ) : (
+                  <Mic className="w-4 h-4" />
+                )}
+              </button>
+            )}
+
+            {whisperEnabled && ttsEnabled && (
+              <button
+                className={cn(
+                  "relative flex items-center justify-center w-7 h-7 rounded-lg transition-all",
+                  voiceModalOpen
+                    ? "text-primary bg-primary/10"
+                    : "text-muted-foreground hover:text-foreground hover:bg-secondary"
+                )}
+                onClick={() => setVoiceModalOpen(true)}
+                title="Voice to voice conversation"
+              >
+                <AudioLines className="w-4 h-4" />
+              </button>
+            )}
+
             <button
               className={cn(
-                "relative flex items-center justify-center w-7 h-7 rounded-lg transition-all",
-                disabled || isStarting
-                  ? "text-muted-foreground/40 cursor-not-allowed"
-                  : transcribing
-                  ? "text-primary bg-primary/10 cursor-wait"
-                  : recording
-                  ? "text-red-400 bg-red-500/10 hover:bg-red-500/20"
+                "flex items-center justify-center w-7 h-7 rounded-lg transition-all",
+                showTemplatePicker
+                  ? "text-primary bg-primary/10"
                   : "text-muted-foreground hover:text-foreground hover:bg-secondary"
               )}
-              onClick={handleMic}
-              disabled={disabled || isStarting}
-              title={
-                disabled
-                  ? "Cannot use voice while generating"
-                  : transcribing
-                  ? "Transcribing…"
-                  : recording
-                  ? "Voice active — speak freely. Click to stop."
-                  : "Start voice input"
-              }
+              onClick={() => {
+                if (showTemplatePicker) {
+                  setShowTemplatePicker(false);
+                } else {
+                  setTemplatePickerQuery("");
+                  setShowTemplatePicker(true);
+                }
+              }}
+              title="Prompt templates (or type /)"
             >
-              {transcribing ? (
-                <Loader2 className="w-4 h-4 animate-spin" />
-              ) : recording ? (
-                <>
-                  <MicOff className="w-4 h-4" />
-                  {/* Live recording indicator dot */}
-                  <span className="absolute top-0.5 right-0.5 w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse" />
-                </>
-              ) : (
-                <Mic className="w-4 h-4" />
-              )}
+              <LayoutTemplate className="w-4 h-4" />
             </button>
+          </div>
+
+          <textarea
+            ref={textareaRef}
+            className="flex-1 bg-transparent text-sm resize-none outline-none placeholder:text-muted-foreground/70 min-h-[36px] max-h-[200px] leading-relaxed py-1"
+            placeholder={placeholderText}
+            value={content}
+            readOnly={!!disabled}
+            onChange={handleContentChange}
+            onKeyDown={handleKeyDown}
+            onInput={handleInput}
+            rows={1}
+          />
+
+          {/* Send / Stop button */}
+          {isStreaming ? (
+            <Button
+              size="icon"
+              className="h-8 w-8 shrink-0 mb-0.5"
+              onClick={() => stopGeneration()}
+              title="Stop generation"
+              variant="outline"
+            >
+              <Square className="w-3.5 h-3.5 fill-current" />
+            </Button>
+          ) : (
+            <Button
+              size="icon"
+              className="h-8 w-8 shrink-0 mb-0.5"
+              onClick={() => !sendButtonIsStarting && handleSend()}
+              disabled={sendButtonDisabled}
+              title={isStarting ? "Starting model…" : needsLoad ? "Load a model first" : "Send message (Enter)"}
+            >
+              {sendButtonIsStarting
+                ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                : <Send className="w-3.5 h-3.5" />
+              }
+            </Button>
           )}
         </div>
 
-        <textarea
-          ref={textareaRef}
-          className="flex-1 bg-transparent text-sm resize-none outline-none placeholder:text-muted-foreground min-h-[36px] max-h-[200px] leading-relaxed"
-          placeholder={placeholderText}
-          value={content}
-          onChange={(e) => setContent(e.target.value)}
-          onKeyDown={handleKeyDown}
-          onInput={handleInput}
-          disabled={disabled || isStarting}
-          rows={1}
-        />
+        {/* Context toggles strip — inside the card, only when toggles are available */}
+        {hasContextToggles && (
+          <div className="flex items-center gap-2 px-3 py-2 border-t border-border/50">
+            {collections.length > 0 && (
+              <>
+                <button
+                  className={cn(
+                    "flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium transition-all",
+                    useRag
+                      ? "bg-primary/15 text-primary border border-primary/30"
+                      : "text-muted-foreground hover:text-foreground hover:bg-secondary"
+                  )}
+                  onClick={() => setUseRag((v) => !v)}
+                  title={useRag ? "Disable knowledge search" : "Search knowledge base"}
+                >
+                  <BookOpen className="w-3 h-3" />
+                  Knowledge
+                </button>
 
-        {/* Send button — always visible; shows spinner while model is starting */}
-        <Button
-          size="icon"
-          className="h-8 w-8 shrink-0"
-          onClick={() => sendButtonIsStarting ? undefined : handleSend()}
-          disabled={sendButtonDisabled}
-          title={
-            isStarting ? "Starting model…" :
-            needsLoad ? "Load a model first" :
-            "Send message"
-          }
-        >
-          {sendButtonIsStarting
-            ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
-            : <Send className="w-3.5 h-3.5" />
-          }
-        </Button>
+                {useRag && (
+                  <select
+                    className="text-xs bg-secondary border border-border rounded-md px-2 py-1 text-foreground"
+                    value={selectedCollection || ""}
+                    onChange={(e) => setSelectedCollection(e.target.value || null)}
+                  >
+                    <option value="">All collections</option>
+                    {collections.map((c) => (
+                      <option key={c.id} value={c.id}>{c.name}</option>
+                    ))}
+                  </select>
+                )}
+              </>
+            )}
+
+            {tools.length > 0 && (
+              <button
+                className={cn(
+                  "flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium transition-all",
+                  skillsEnabled
+                    ? "bg-violet-500/15 text-violet-300 border border-violet-500/30"
+                    : "text-muted-foreground hover:text-foreground hover:bg-secondary"
+                )}
+                onClick={toggleSkills}
+                title={skillsEnabled ? `${tools.length} tool${tools.length !== 1 ? "s" : ""} enabled` : "Enable tools"}
+              >
+                <Wrench className="w-3 h-3" />
+                Tools
+                {skillsEnabled && (
+                  <span className="ml-0.5 px-1 py-0.5 text-[9px] leading-none rounded bg-violet-500/20 text-violet-300 font-bold">
+                    {tools.length}
+                  </span>
+                )}
+              </button>
+            )}
+
+            <span className="ml-auto text-[10px] text-muted-foreground/40 select-none hidden sm:block">
+              {needsLoad ? "Model will load on send" : "Shift+Enter for newline"}
+            </span>
+          </div>
+        )}
       </div>
       {/* Mic error toast */}
       {micError && (
@@ -488,6 +623,13 @@ export function InputBar({ collections, disabled }: Props) {
           </button>
         </div>
       )}
+
+      {/* Variable filler modal */}
+      <VariableFiller
+        template={pendingTemplate}
+        onConfirm={handleVariableFilled}
+        onClose={() => setPendingTemplate(null)}
+      />
 
       {/* No-model modal */}
       {showNoModelModal && (
@@ -545,6 +687,11 @@ export function InputBar({ collections, disabled }: Props) {
             </div>
           </div>
         </div>
+      )}
+
+      {/* Voice-to-voice modal */}
+      {voiceModalOpen && (
+        <VoiceModal onClose={() => setVoiceModalOpen(false)} />
       )}
     </div>
   );

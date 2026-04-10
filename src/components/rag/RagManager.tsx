@@ -373,7 +373,7 @@ function ExternalCollectionsTab() {
                   className={cn(
                     "flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-colors",
                     selectedCollection.retrieval_mode !== "graph"
-                      ? "bg-primary text-primary-foreground"
+                      ? "glass-primary text-white"
                       : "bg-secondary text-muted-foreground hover:text-foreground"
                   )}
                 >

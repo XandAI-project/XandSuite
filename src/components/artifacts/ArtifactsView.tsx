@@ -19,6 +19,9 @@ const TYPE_META: Record<ArtifactType, { label: string; icon: React.ReactNode; co
   markdown: { label: "Document", icon: <FileText  className="w-3.5 h-3.5" />, color: "text-emerald-400 bg-emerald-400/10 border-emerald-400/20" },
   html:     { label: "HTML",     icon: <Globe     className="w-3.5 h-3.5" />, color: "text-orange-400 bg-orange-400/10 border-orange-400/20" },
   text:     { label: "Text",     icon: <AlignLeft className="w-3.5 h-3.5" />, color: "text-muted-foreground bg-secondary border-border" },
+  csv:      { label: "CSV",      icon: <FileText  className="w-3.5 h-3.5" />, color: "text-teal-400 bg-teal-400/10 border-teal-400/20" },
+  json:     { label: "JSON",     icon: <Code      className="w-3.5 h-3.5" />, color: "text-yellow-400 bg-yellow-400/10 border-yellow-400/20" },
+  pdf:      { label: "PDF",      icon: <FileText  className="w-3.5 h-3.5" />, color: "text-red-400 bg-red-400/10 border-red-400/20" },
 };
 
 function formatDate(iso: string) {

@@ -392,6 +392,190 @@ impl AppDb {
             VALUES ('xand_internal_memory', 'Internal Memory', 'Auto-generated from conversations', datetime('now'));
         "#).context("Failed to run seed migrations")?;
 
+        // Prompt templates table (idempotent)
+        self.conn.execute_batch(r#"
+            CREATE TABLE IF NOT EXISTS prompt_templates (
+                id          TEXT PRIMARY KEY,
+                title       TEXT NOT NULL,
+                content     TEXT NOT NULL,
+                description TEXT,
+                category    TEXT,
+                shortcut    TEXT,
+                use_count   INTEGER NOT NULL DEFAULT 0,
+                created_at  TEXT NOT NULL,
+                updated_at  TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_prompt_templates_category
+                ON prompt_templates(category);
+
+            -- Built-in starter templates (skipped if already present)
+            INSERT OR IGNORE INTO prompt_templates
+                (id, title, content, description, category, shortcut, use_count, created_at, updated_at)
+            VALUES
+                ('builtin-summarise',  'Summarise text',
+                 'Please summarise the following text concisely, preserving the key points:
+
+{{text}}',
+                 'Condense long text into key points', 'Writing', '/sum', 0, datetime('now'), datetime('now')),
+
+                ('builtin-explain',    'Explain code',
+                 'Explain the following code step by step in plain English:
+
+{{code}}',
+                 'Break down code in plain English', 'Code', '/explain', 0, datetime('now'), datetime('now')),
+
+                ('builtin-translate',  'Translate to {{language}}',
+                 'Translate the following text to {{language}}. Keep the tone and formatting intact:
+
+{{text}}',
+                 'Translate text to any language', 'Writing', '/translate', 0, datetime('now'), datetime('now')),
+
+                ('builtin-tests',      'Write unit tests for {{function}}',
+                 'Write comprehensive unit tests for the {{language}} function named {{function}}. Cover edge cases, happy paths, and error conditions:
+
+{{code}}',
+                 'Generate unit tests for any function', 'Code', '/test', 0, datetime('now'), datetime('now')),
+
+                ('builtin-report',     'Research report on {{topic}}',
+                 'Write a structured research report on the topic: {{topic}}
+
+Include:
+1. Overview
+2. Key findings
+3. Pros and cons
+4. Conclusion',
+                 'Generate a structured research report', 'Research', '/report', 0, datetime('now'), datetime('now')),
+
+                ('builtin-concise',    'Rewrite more concisely',
+                 'Rewrite the following text to be more concise without losing meaning:
+
+{{text}}',
+                 'Shorten verbose text', 'Writing', '/concise', 0, datetime('now'), datetime('now'));
+        "#).context("Failed to create prompt_templates table")?;
+
+        // ── Migration: add requires column (safe no-op if already present) ──
+        let _ = self.conn.execute(
+            "ALTER TABLE prompt_templates ADD COLUMN requires TEXT",
+            [],
+        );
+
+        // ── Built-in package-powered templates ────────────────────────────────
+        self.conn.execute_batch(r#"
+            INSERT OR IGNORE INTO prompt_templates
+                (id, title, content, description, category, shortcut, requires, use_count, created_at, updated_at)
+            VALUES
+
+            -- Image Generation
+            ('builtin-img-portrait', 'Photorealistic portrait',
+             'Generate a photorealistic portrait photo of {{subject, e.g. a young woman with red hair}}.
+Style: {{style, e.g. studio lighting, golden hour, cinematic}}
+Mood: {{mood, e.g. confident, serene, mysterious}}
+Background: {{background, e.g. blurred bokeh studio, outdoor nature, plain white}}',
+             'Generate a photorealistic person portrait', 'Creative', '/portrait',
+             'ComfyUI Images', 0, datetime('now'), datetime('now')),
+
+            ('builtin-img-cinematic', 'Cinematic scene',
+             'Generate a cinematic, high-quality image of {{scene description, e.g. a futuristic city at night}}.
+Lighting: {{lighting, e.g. dramatic side lighting, neon glow, golden sunset}}
+Camera style: {{camera, e.g. wide angle, close-up, aerial drone shot}}
+Mood: {{mood, e.g. epic, tense, peaceful, mysterious}}
+Art direction: photorealistic, 4K, film grain, cinematic colour grading',
+             'Generate a cinematic movie-style image', 'Creative', '/cinematic',
+             'ComfyUI Images', 0, datetime('now'), datetime('now')),
+
+            ('builtin-img-concept', 'Concept art',
+             'Create detailed concept art for {{subject, e.g. a mech warrior, a fantasy castle, an alien creature}}.
+Genre: {{genre, e.g. sci-fi, fantasy, cyberpunk, post-apocalyptic}}
+Colour palette: {{palette, e.g. warm earth tones, cool blues and greens, vibrant neons}}
+Style: digital painting, highly detailed, professional concept art, dramatic lighting',
+             'Generate professional concept art', 'Creative', '/concept',
+             'ComfyUI Images', 0, datetime('now'), datetime('now')),
+
+            -- Image Editing
+            ('builtin-imgedit-style', 'Artistic style transfer',
+             'Edit the attached image and repaint it in the style of {{art style, e.g. Van Gogh oil painting, Japanese watercolour, anime illustration, Studio Ghibli}}.
+Preserve the original subject and composition exactly. Transform only the colours, textures, and brush strokes to match the chosen style while keeping the subject fully recognisable.',
+             'Repaint an image in a famous art style', 'Creative', '/style',
+             'ComfyUI Image Edit', 0, datetime('now'), datetime('now')),
+
+            ('builtin-imgedit-costume', 'Character costume redesign',
+             'Edit the character in the attached image: replace their current outfit with {{new costume, e.g. cyberpunk armour with neon accents, Victorian ball gown, futuristic spacesuit}}.
+Keep the character''s face, skin, pose, and body proportions exactly the same. Only change the clothing, accessories, and any related props. Maintain the same lighting and background.',
+             'Swap a character outfit keeping face and pose', 'Creative', '/costume',
+             'ComfyUI Image Edit', 0, datetime('now'), datetime('now')),
+
+            ('builtin-imgedit-bg', 'Background replacement',
+             'Edit the attached image and replace the background with {{new background, e.g. a sunset beach, a neon-lit cyberpunk alley, a snowy mountain range, a professional studio backdrop}}.
+Keep the foreground subject perfectly intact — same lighting, edges, and details. Blend the subject naturally into the new environment.',
+             'Replace image background keeping foreground intact', 'Creative', '/background',
+             'ComfyUI Image Edit', 0, datetime('now'), datetime('now')),
+
+            -- Video Generation
+            ('builtin-vid-cinematic', 'Cinematic video clip',
+             'Generate a short cinematic video clip of {{scene description, e.g. a spaceship flying over a ringed planet, waves crashing on a rocky coast at sunset}}.
+Camera motion: {{camera motion, e.g. slow push-in, smooth pan, aerial descend}}
+Style: cinematic, high quality, smooth motion, film grain
+Mood: {{mood, e.g. epic and grand, calm and meditative, tense and dramatic}}',
+             'Generate a high-quality cinematic video clip', 'Creative', '/video',
+             'ComfyUI Video', 0, datetime('now'), datetime('now')),
+
+            ('builtin-vid-animate', 'Animate a scene',
+             'Generate a smooth looping animation of {{scene description, e.g. a bonfire in a dark forest, a waterfall with mist, leaves blowing in the wind}}.
+Motion elements: {{motion, e.g. flickering fire, flowing water, swaying branches}}
+Animation style: {{style, e.g. photorealistic, hand-drawn 2D, stylised 3D}}
+Loop: seamless, ~3–5 seconds',
+             'Generate a seamlessly looping animated scene', 'Creative', '/animate',
+             'ComfyUI Video', 0, datetime('now'), datetime('now')),
+
+            -- Jellyfin
+            ('builtin-jf-search', 'Search media library',
+             'Search my Jellyfin media library for {{what to find, e.g. action movies from the 90s, documentaries about space, episodes of Breaking Bad}}.
+Show me the results with titles, years, and short descriptions. If there are many results, group them by type (Movies, TV Shows, etc.).',
+             'Search your Jellyfin library for content', 'Media', '/media',
+             'Jellyfin', 0, datetime('now'), datetime('now')),
+
+            ('builtin-jf-recent', 'What''s recently added',
+             'Show me what''s been recently added to my Jellyfin library.
+Display the latest {{count, e.g. 10}} items, grouped by type (Movies, TV Shows, Music) if possible. Include titles, years, and a one-line description for each.',
+             'Show recently added items in Jellyfin', 'Media', '/recent',
+             'Jellyfin', 0, datetime('now'), datetime('now')),
+
+            -- Rich Responses
+            ('builtin-rich-chart', 'Visualise data as a chart',
+             'Analyse the following data and visualise it as a {{chart type, e.g. line chart, bar chart, pie chart}}:
+
+{{data — paste numbers, a table, or describe the dataset}}
+
+Chart title: {{title}}
+Label the axes clearly. Use colours that highlight trends or comparisons. Add a brief 1–2 sentence interpretation below the chart.',
+             'Turn raw data into an SVG chart', 'Productivity', '/chart',
+             'Rich Responses', 0, datetime('now'), datetime('now')),
+
+            ('builtin-rich-table', 'Format data as a table',
+             'Format the following data as a clean, styled table:
+
+{{data — paste rows, CSV, or describe the dataset}}
+
+Columns: {{columns, e.g. Name, Revenue, Growth %, Region}}
+Highlight the {{highlight column, e.g. Growth % column}} to show positive values in green and negative values in red.
+Add a brief summary sentence below the table.',
+             'Render structured data as a styled table', 'Productivity', '/table',
+             'Rich Responses', 0, datetime('now'), datetime('now')),
+
+            ('builtin-rich-metrics', 'KPI metric cards',
+             'Create a set of KPI metric cards for the following data:
+
+{{metrics — e.g. Revenue: $1.2M (+8%), Active Users: 45,230 (+12.5%), Churn Rate: 3.1% (-0.4%)}}
+
+For each metric show:
+- A clear label
+- The main value in large text
+- A change indicator (green for positive, red for negative)
+Display them in a responsive grid. Add a one-line summary after the cards.',
+             'Display key numbers as visual metric cards', 'Productivity', '/metrics',
+             'Rich Responses', 0, datetime('now'), datetime('now'));
+        "#).context("Failed to seed package templates")?;
+
         Ok(())
     }
 

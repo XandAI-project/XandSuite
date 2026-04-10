@@ -5,7 +5,7 @@ use axum::{
         IntoResponse,
     },
 };
-use futures_util::stream::{self, StreamExt};
+use futures_util::stream::StreamExt;
 use serde::Deserialize;
 use std::sync::Arc;
 use tokio_stream::wrappers::BroadcastStream;

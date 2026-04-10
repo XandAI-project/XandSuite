@@ -184,6 +184,10 @@ pub async fn set_collection_retrieval_mode(
     Ok(())
 }
 
+pub async fn reindex_collection_inner(collection_id: String, state: &AppState) -> Result<(), String> {
+    reindex_collection_impl(collection_id, state).await
+}
+
 /// Re-index all documents in a collection into the GraphRAG server.
 /// Marks `graph_indexed = true` when all documents have been ingested.
 /// This is the operation that drives the "Indexing…" → "Indexed" transition.
@@ -192,6 +196,10 @@ pub async fn reindex_collection(
     collection_id: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    reindex_collection_impl(collection_id, &state).await
+}
+
+async fn reindex_collection_impl(collection_id: String, state: &AppState) -> Result<(), String> {
     rag_log!(state, "info", "[rag] Starting GraphRAG re-index for collection id={}", collection_id);
 
     let client = state.graph_rag_client.as_ref().ok_or_else(|| {
