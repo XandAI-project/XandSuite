@@ -3,6 +3,7 @@ use futures::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crate::models::InferenceConfig;
@@ -122,8 +123,17 @@ impl RemoteEngine {
         api_key: Option<String>,
         model_name: Option<String>,
     ) -> Self {
+        // No global timeout — streaming responses can take arbitrarily long.
+        // We set only a *connection* timeout so a dead server is detected quickly,
+        // and a *pool idle* timeout to avoid reusing stale connections after
+        // the LLM server restarts.
+        let client = Client::builder()
+            .connect_timeout(Duration::from_secs(30))
+            .pool_idle_timeout(Duration::from_secs(90))
+            .build()
+            .unwrap_or_default();
         Self {
-            client: Client::new(),
+            client,
             server_url,
             api_key,
             model_name: model_name.unwrap_or_else(|| "local-model".to_string()),

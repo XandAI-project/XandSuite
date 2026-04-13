@@ -7,6 +7,9 @@ use std::time::Instant;
 
 use crate::process_ext::HideWindowStd;
 
+/// Must match _STAMP_VERSION in kokoro_server.py
+const STAMP_VERSION: &str = "2";
+
 pub struct KokoroManager {
     process: Option<Child>,
     port: u16,
@@ -60,11 +63,25 @@ impl KokoroManager {
         let hub_dir = Self::hf_home(data_dir)
             .join("hub")
             .join("models--hexgrad--Kokoro-82M");
-        // snapshot_download creates a `snapshots/` subdirectory with the model
         hub_dir.join("snapshots").exists()
     }
 
+    /// Returns true when Python deps have been fully installed for the given
+    /// device variant.  Reads the stamp file written by kokoro_server.py after
+    /// a successful `_ensure_deps` run.
+    pub fn deps_ready(data_dir: &Path, device: &str) -> bool {
+        let stamp = Self::hf_home(data_dir)
+            .join("tts-venv")
+            .join(format!(".deps-ok-{}", device));
+        match std::fs::read_to_string(&stamp) {
+            Ok(content) => content.trim() == STAMP_VERSION,
+            Err(_) => false,
+        }
+    }
+
     /// Spawn kokoro_server.py in the background (non-blocking).
+    /// When deps are already installed (stamp file valid), passes --skip-deps
+    /// for near-instant startup.
     /// Poll [`is_healthy`] to know when it is ready.
     pub fn spawn(&mut self, port: u16, data_dir: &Path, device: &str) -> Result<()> {
         self.stop();
@@ -79,6 +96,7 @@ impl KokoroManager {
         }
 
         let hf_home = Self::hf_home(data_dir);
+        let skip_deps = Self::deps_ready(data_dir, device);
 
         // Log file
         let log_path = data_dir.join("kokoro-server.log");
@@ -103,19 +121,24 @@ impl KokoroManager {
             cmd.hide_window();
             cmd.env("PYTHONUNBUFFERED", "1");
             cmd.env("PYTHONUTF8", "1");
-            // Disable HuggingFace tqdm progress bars so log output stays clean
             cmd.env("HF_HUB_DISABLE_PROGRESS_BARS", "1");
-            cmd.args([
-                script.to_string_lossy().as_ref(),
-                "--port",
-                &port.to_string(),
-                "--hf-home",
-                &hf_home.to_string_lossy(),
-                "--device",
-                device,
-                "--log-file",
-                &actual_log_path.to_string_lossy(),
-            ]);
+
+            let mut args = vec![
+                script.to_string_lossy().to_string(),
+                "--port".to_string(),
+                port.to_string(),
+                "--hf-home".to_string(),
+                hf_home.to_string_lossy().to_string(),
+                "--device".to_string(),
+                device.to_string(),
+                "--log-file".to_string(),
+                actual_log_path.to_string_lossy().to_string(),
+            ];
+            if skip_deps {
+                args.push("--skip-deps".to_string());
+            }
+
+            cmd.args(&args);
             cmd.stdout(Stdio::null()).stderr(stderr_stdio);
 
             if let Ok(c) = cmd.spawn() {
@@ -133,8 +156,55 @@ impl KokoroManager {
         self.last_start = Some(Instant::now());
         self.log_path = Some(actual_log_path);
 
-        log::info!("kokoro-server spawned on port {} (waiting for /health)", port);
+        log::info!(
+            "kokoro-server spawned on port {} (skip_deps={}, waiting for /health)",
+            port,
+            skip_deps
+        );
         Ok(())
+    }
+
+    /// Spawn in setup mode: installs deps for the given device, writes stamp,
+    /// and exits.  Returns the child process — caller should wait on it.
+    pub fn spawn_setup(data_dir: &Path, device: &str, log_path: &Path) -> Result<Child> {
+        let script = Self::script_path();
+        if !script.exists() {
+            anyhow::bail!("kokoro_server.py not found at {:?}", script);
+        }
+
+        let hf_home = Self::hf_home(data_dir);
+        let _ = std::fs::write(log_path, "");
+
+        for interp in &["python", "python3"] {
+            let stderr_stdio: Stdio = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log_path)
+                .map(Stdio::from)
+                .unwrap_or_else(|_| Stdio::null());
+
+            let mut cmd = Command::new(interp);
+            cmd.hide_window();
+            cmd.env("PYTHONUNBUFFERED", "1");
+            cmd.env("PYTHONUTF8", "1");
+            cmd.env("HF_HUB_DISABLE_PROGRESS_BARS", "1");
+            cmd.args([
+                script.to_string_lossy().as_ref(),
+                "--setup",
+                "--hf-home",
+                &hf_home.to_string_lossy(),
+                "--device",
+                device,
+                "--log-file",
+                &log_path.to_string_lossy(),
+            ]);
+            cmd.stdout(Stdio::null()).stderr(stderr_stdio);
+
+            if let Ok(child) = cmd.spawn() {
+                return Ok(child);
+            }
+        }
+        anyhow::bail!("Failed to spawn Python — is Python 3 on your PATH?")
     }
 
     /// Spawn in download mode: runs `kokoro_server.py --download --hf-home <path>`.

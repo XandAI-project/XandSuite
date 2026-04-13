@@ -1009,6 +1009,10 @@ pub async fn send_message_inner(
                 executor = executor.with_code_runner(db_arc, conv_id_clone.clone());
             }
             if let Some(remote) = engine.get_remote() {
+                // Keep a clone so we can send an error sentinel if run() fails.
+                // token_tx is consumed by run(), so the clone is the only way
+                // to reach the receiver after a stream error.
+                let error_tx = token_tx.clone();
                 if let Err(e) = executor
                     .run(messages, &config, &remote, &app_clone, &conv_id_clone, token_tx, cancelled_clone)
                     .await
@@ -1019,9 +1023,13 @@ pub async fn send_message_inner(
                         "message": format!("Skills executor error: {}", e),
                         "ts": chrono::Utc::now().to_rfc3339(),
                     }));
+                    // Signal the consumer that generation failed so it discards
+                    // any partial tokens instead of saving them as a real response.
+                    let _ = error_tx.send(format!("[ERROR:{}]", e)).await;
                 }
             } else {
                 // No remote engine — fall back to plain streaming
+                let error_tx = token_tx.clone();
                 if let Err(e) = engine.chat_stream(messages, config, token_tx).await {
                     log::error!("Inference error: {}", e);
                     let _ = app_clone.emit("app_log", serde_json::json!({
@@ -1029,10 +1037,12 @@ pub async fn send_message_inner(
                         "message": format!("Inference error: {}", e),
                         "ts": chrono::Utc::now().to_rfc3339(),
                     }));
+                    let _ = error_tx.send(format!("[ERROR:{}]", e)).await;
                 }
             }
         } else {
             // No tools connected — plain streaming chat
+            let error_tx = token_tx.clone();
             if let Err(e) = engine.chat_stream(messages, config, token_tx).await {
                 log::error!("Inference error: {}", e);
                 let _ = app_clone.emit("app_log", serde_json::json!({
@@ -1040,6 +1050,7 @@ pub async fn send_message_inner(
                     "message": format!("Inference error: {}", e),
                     "ts": chrono::Utc::now().to_rfc3339(),
                 }));
+                let _ = error_tx.send(format!("[ERROR:{}]", e)).await;
             }
         }
     });
@@ -1051,8 +1062,21 @@ pub async fn send_message_inner(
     let mut full_response = String::new();
     let mut full_thinking = String::new();
     let mut was_cancelled = false;
+    // Set when the generation task signals a hard stream error (e.g. "Failed to
+    // read response stream").  Any partial tokens accumulated before the error
+    // are discarded — they're typically just raw model thinking text, not a
+    // real response, and saving them would confuse the user and produce a
+    // spurious "No artifact tags found" warning.
+    let mut stream_error: Option<String> = None;
     while let Some(token) = token_rx.recv().await {
         if token == "[DONE]" {
+            break;
+        }
+        // Generation task signalled a hard failure — discard partial output.
+        if let Some(err) = token.strip_prefix("[ERROR:").and_then(|s| s.strip_suffix(']')) {
+            stream_error = Some(err.to_string());
+            // Drain any remaining tokens so the spawned task can finish.
+            while token_rx.try_recv().is_ok() {}
             break;
         }
         // User pressed Stop — drain the channel and finish cleanly.
@@ -1098,6 +1122,37 @@ pub async fn send_message_inner(
 
     // Reset cancellation flag now that streaming has ended (cancelled or natural).
     state.generation_cancelled.store(false, std::sync::atomic::Ordering::Relaxed);
+
+    // ── Hard stream error ─────────────────────────────────────────────────────
+    // The generation task signalled that the HTTP stream broke before completion
+    // (e.g. "Failed to read response stream").  The partial tokens accumulated
+    // so far are typically just raw model thinking/planning text — not a real
+    // response.  Discard them, emit done:true so the frontend exits streaming
+    // state, and surface the error in the chat via a system message.
+    if let Some(err) = stream_error {
+        let _ = app.emit("chat_token", serde_json::json!({
+            "conversation_id": conv_id,
+            "token": "",
+            "done": true,
+        }));
+        // Surface a brief error note in the chat so the user knows to retry.
+        let err_note = format!(
+            "_Generation failed: the LLM server closed the stream unexpectedly. \
+             Please try again. ({}…)_",
+            err.chars().take(120).collect::<String>()
+        );
+        let err_msg_id = uuid::Uuid::new_v4().to_string();
+        let now_err = chrono::Utc::now().to_rfc3339();
+        {
+            let db = state.db.lock().unwrap();
+            let _ = db.conn.execute(
+                "INSERT INTO messages (id, conversation_id, role, content, created_at)
+                 VALUES (?1, ?2, 'assistant', ?3, ?4)",
+                rusqlite::params![err_msg_id, conv_id, err_note, now_err],
+            );
+        }
+        return Ok(err_msg_id);
+    }
 
     // If the user stopped generation mid-stream, emit done:true immediately so
     // the frontend exits streaming state, then persist whatever was received so far.
@@ -1156,19 +1211,41 @@ pub async fn send_message_inner(
     } else {
         None
     };
+    // Track whether the conversation still exists so downstream code
+    // (artifacts, memory extraction) can skip work if it was deleted.
+    let conversation_alive;
     {
         let db = state.db.lock().unwrap();
-        match db.conn.execute(
-            "INSERT INTO messages (id, conversation_id, role, content, created_at, metadata)
-             VALUES (?1, ?2, 'assistant', ?3, ?4, ?5)",
-            params![assistant_msg_id, conversation_id, full_response, now2, assistant_metadata],
-        ) {
-            Ok(_) => emit_log("info", format!(
-                "[chat] Assistant message saved (id={}, {} chars)", assistant_msg_id, full_response.len()
-            )),
-            Err(e) => {
-                emit_log("error", format!("[chat] Failed to save assistant message: {}", e));
-                return Err(e.to_string());
+        // Check if the conversation still exists — it may have been deleted
+        // from the sidebar while the LLM was streaming.
+        let exists: bool = db.conn.query_row(
+            "SELECT COUNT(*) FROM conversations WHERE id = ?1",
+            params![conversation_id],
+            |row| row.get::<_, i64>(0),
+        ).unwrap_or(0) > 0;
+
+        if !exists {
+            emit_log("warn", format!(
+                "[chat] Conversation {} was deleted during streaming — assistant message not saved",
+                conversation_id
+            ));
+            conversation_alive = false;
+        } else {
+            match db.conn.execute(
+                "INSERT INTO messages (id, conversation_id, role, content, created_at, metadata)
+                 VALUES (?1, ?2, 'assistant', ?3, ?4, ?5)",
+                params![assistant_msg_id, conversation_id, full_response, now2, assistant_metadata],
+            ) {
+                Ok(_) => {
+                    emit_log("info", format!(
+                        "[chat] Assistant message saved (id={}, {} chars)", assistant_msg_id, full_response.len()
+                    ));
+                    conversation_alive = true;
+                }
+                Err(e) => {
+                    emit_log("error", format!("[chat] Failed to save assistant message: {}", e));
+                    return Err(e.to_string());
+                }
             }
         }
     }
@@ -1176,7 +1253,7 @@ pub async fn send_message_inner(
     // ── Background memory extraction ─────────────────────────────────────────
     // Spawn a background task to extract key facts from the exchange and ingest
     // them into the internal memory collection.  Does NOT block the response.
-    if memory_enabled && !full_response.is_empty() {
+    if conversation_alive && memory_enabled && !full_response.is_empty() {
         let rag_arc = state.rag.clone();
         let embedder_arc = state.embedder.clone();
         let user_msg_clone = content.clone();
@@ -1241,7 +1318,7 @@ pub async fn send_message_inner(
 
     // ── Parse and persist artifacts ───────────────────────────────────────────
     // Done *before* emitting done:true so the frontend re-fetch always sees them.
-    {
+    if conversation_alive {
         emit_log("info", format!(
             "[artifacts] Response complete ({} chars, {} thinking chars). Scanning for artifact tags…",
             full_response.len(), full_thinking.len()

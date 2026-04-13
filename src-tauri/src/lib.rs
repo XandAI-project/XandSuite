@@ -458,6 +458,7 @@ pub fn run() {
             commands::tts::synthesize_speech,
             commands::tts::download_tts_models,
             commands::tts::get_tts_log,
+            commands::tts::setup_tts_deps,
         ])
         .build(tauri::generate_context!())
         .expect("error building XandSuite")

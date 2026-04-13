@@ -431,20 +431,40 @@ const LOCAL_GALLERY_RE = /^http:\/\/localhost:\d+\/images\/([^/?#]+)/;
 function GalleryAwareImage({ src, alt }: { src?: string; alt?: string }) {
   const galleryImages = useGalleryStore((s) => s.images);
 
+  const galleryId = src ? (src.match(LOCAL_GALLERY_RE)?.[1] ?? null) : null;
+  const entry = galleryId ? galleryImages.find((img) => img.id === galleryId) : null;
+
+  // When a gallery URL can't be resolved from the current store snapshot, actively
+  // re-fetch. Uses getState() inside the callbacks so we always read fresh values
+  // regardless of React's render cycle or closure staleness.
+  useEffect(() => {
+    if (!galleryId || entry) return;
+
+    const tryFetch = () => {
+      const s = useGalleryStore.getState();
+      if (s.scope === "all") {
+        s.fetchAllImages();
+      } else if (s.activeConversationId) {
+        s.fetchImages(s.activeConversationId);
+      }
+    };
+
+    tryFetch();
+    // Retry after 1 s in case the first fetch races with the DB write
+    const timer = setTimeout(tryFetch, 1000);
+    return () => clearTimeout(timer);
+  }, [galleryId]); // intentionally excludes `entry` to avoid re-triggering once found
+
   const resolvedSrc = useMemo(() => {
     if (!src) return src;
-    const match = src.match(LOCAL_GALLERY_RE);
-    if (match) {
-      const id = match[1];
-      const entry = galleryImages.find((img) => img.id === id);
-      if (entry) {
-        const d = entry.image_data;
-        if (d.startsWith("http://") || d.startsWith("https://")) return d;
-        return `data:${entry.mime_type};base64,${d}`;
-      }
+    if (entry) {
+      const d = entry.image_data;
+      if (d.startsWith("http://") || d.startsWith("https://")) return d;
+      return `data:${entry.mime_type};base64,${d}`;
     }
+    // Fallback: the API server serves the image at this URL without auth
     return src;
-  }, [src, galleryImages]);
+  }, [src, entry]);
 
   if (isVideoUrl(resolvedSrc)) return <InlineVideo src={resolvedSrc!} />;
 

@@ -5,7 +5,6 @@ import {
   Cpu,
   Database,
   FileText,
-  GitBranch,
   Settings,
   Zap,
   Wrench,
@@ -35,7 +34,6 @@ const aiNavItems = [
   { to: "/personas",   icon: UserCircle2,    label: "Personas" },
   { to: "/templates",  icon: LayoutTemplate, label: "Templates" },
   ...(codingEnabled ? [{ to: "/coding", icon: Code2, label: "Coding" }] : []),
-  { to: "/flows",      icon: GitBranch,      label: "Flows" },
   { to: "/skills",     icon: Wrench,         label: "Skills" },
 ];
 

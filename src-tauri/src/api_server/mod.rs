@@ -146,6 +146,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/tts/stop", post(tts::stop_tts_server))
         .route("/tts/synthesize", post(tts::synthesize_speech))
         .route("/tts/download-models", post(tts::download_tts_models))
+        .route("/tts/setup-deps", post(tts::setup_tts_deps))
         .route("/tts/log", get(tts::get_tts_log))
         // ── Attachments / file reading ────────────────────────────────────
         .route("/files/base64", post(misc::read_file_as_base64))

@@ -1392,6 +1392,8 @@ function WhisperServerControl() {
 interface TtsStatus {
   enabled: boolean;
   models_exist: boolean;
+  /** Python deps fully installed for current device */
+  deps_ready: boolean;
   /** Process is alive */
   running: boolean;
   /** Server passed /health check — fully ready */
@@ -1537,7 +1539,7 @@ function KokoroServerControl() {
         await fetchLog();
         setError("Server exited during startup. See the log below for details.");
       }
-    }, 2500);
+    }, 1500);
   };
 
   // Auto-scroll log box to bottom
@@ -1598,6 +1600,62 @@ function KokoroServerControl() {
     .filter(l => l.trim().length > 0)
     .slice(-1)[0]
     ?.replace(/^\[kokoro-server \d+:\d+:\d+\]\s*/, "") ?? "";
+
+  // Parse download progress from log lines.
+  // Format: "Downloading — 500/2400 MB (21%) [4.5 MB/s, ETA 7m03s]"
+  const downloadProgress = (() => {
+    const lines = liveLog.split("\n").filter(l => l.trim().length > 0);
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const l = lines[i];
+
+      // Our custom progress format: "Downloading — 500/2400 MB (21%) [4.5 MB/s, ETA 7m03s]"
+      const dlMatch = l.match(/Downloading\s*—\s*([\d.]+)\/([\d.]+)\s*MB\s*\((\d+)%\)\s*\[([^\]]+)\]/);
+      if (dlMatch) {
+        const done = parseFloat(dlMatch[1]);
+        const total = parseFloat(dlMatch[2]);
+        const pct = parseInt(dlMatch[3], 10);
+        const extra = dlMatch[4]; // "4.5 MB/s, ETA 7m03s"
+        return { pct, label: `${done.toFixed(0)} / ${total.toFixed(0)} MB — ${extra}` };
+      }
+
+      // Fractional progress like "1234.5/2345.6 MiB" or "1.0/2.3 GiB"
+      const fracMatch = l.match(/([\d.]+)\s*\/\s*([\d.]+)\s*(MiB|GiB|MB|GB)/i);
+      if (fracMatch) {
+        const done = parseFloat(fracMatch[1]);
+        const total = parseFloat(fracMatch[2]);
+        if (total > 0) {
+          const unit = fracMatch[3];
+          const pct = Math.min(100, Math.round((done / total) * 100));
+          return { pct, label: `${done.toFixed(1)} / ${total.toFixed(1)} ${unit}` };
+        }
+      }
+
+      // Percentage like "45%"
+      const pctMatch = l.match(/\b(\d{1,3})%/);
+      if (pctMatch) {
+        const pct = parseInt(pctMatch[1], 10);
+        if (pct >= 0 && pct <= 100) {
+          return { pct, label: `${pct}%` };
+        }
+      }
+
+      // Stall warning
+      if (/download appears stalled/i.test(l)) {
+        return { pct: -2, label: "Download stalled — retrying…" };
+      }
+
+      // Waiting for download to start
+      if (/waiting for download to start/i.test(l)) {
+        return { pct: -1, label: "Resolving packages…" };
+      }
+
+      // "Downloading torch" but no progress yet
+      if (/downloading.*torch/i.test(l) || /torch CUDA.*attempt/i.test(l)) {
+        return { pct: -1, label: "Downloading torch CUDA (~2.3 GB)…" };
+      }
+    }
+    return null;
+  })();
 
   return (
     <div className="space-y-2">
@@ -1663,12 +1721,38 @@ function KokoroServerControl() {
       </div>
 
       {isStarting && (
-        <div className="space-y-1">
+        <div className="space-y-1.5">
           <p className="text-xs text-muted-foreground">
-            First launch installs Python dependencies and loads the model.
-            This can take <strong>5–15 minutes</strong> on first run — please wait.
+            {status?.deps_ready
+              ? "Loading model — this usually takes a few seconds."
+              : <>First launch installs Python dependencies and loads the model.
+                  This can take <strong>5–15 minutes</strong> on first run — please wait.</>}
           </p>
-          {lastLogLine && (
+          {downloadProgress && (
+            <div className="space-y-1">
+              <div className="flex items-center justify-between text-[10px] font-mono text-yellow-400/80">
+                <span className="truncate mr-2">
+                  {downloadProgress.pct >= 0
+                    ? `Downloading torch CUDA — ${downloadProgress.label}`
+                    : downloadProgress.label}
+                </span>
+                {downloadProgress.pct >= 0 && <span className="shrink-0">{downloadProgress.pct}%</span>}
+              </div>
+              <div className="h-1.5 w-full rounded-full bg-muted overflow-hidden">
+                {downloadProgress.pct >= 0 ? (
+                  <div
+                    className="h-full rounded-full bg-yellow-400 transition-all duration-700 ease-out"
+                    style={{ width: `${Math.max(1, downloadProgress.pct)}%` }}
+                  />
+                ) : downloadProgress.pct === -2 ? (
+                  <div className="h-full w-full rounded-full bg-red-400/40 animate-pulse" />
+                ) : (
+                  <div className="h-full w-1/3 rounded-full bg-yellow-400/60 animate-[pulse_1.5s_ease-in-out_infinite]" />
+                )}
+              </div>
+            </div>
+          )}
+          {!downloadProgress && lastLogLine && (
             <p className="text-xs text-yellow-400/80 font-mono truncate">
               ↳ {lastLogLine}
             </p>

@@ -169,6 +169,7 @@ const CMD_MAP: Record<string, RouteEntry> = {
   stop_tts_server:           { method: "POST",   path: "/api/tts/stop" },
   synthesize_speech:         { method: "POST",   path: "/api/tts/synthesize" },
   download_tts_models:       { method: "POST",   path: "/api/tts/download-models" },
+  setup_tts_deps:            { method: "POST",   path: "/api/tts/setup-deps" },
   get_tts_log:               { method: "GET",    path: "/api/tts/log" },
 
   // ── Logs ───────────────────────────────────────────────────────────────────

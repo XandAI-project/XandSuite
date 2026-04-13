@@ -104,9 +104,10 @@ export function useVoiceConversation(): UseVoiceConversationHandle {
   const silenceTimerRef = useRef<number | null>(null);
   const vadIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // TTS playback
+  // TTS playback (pipelined: synthesize chunk N+1 while playing chunk N)
   const ttsCtxRef = useRef<AudioContext | null>(null);
   const ttsSourceRef = useRef<AudioBufferSourceNode | null>(null);
+  const ttsCancelledRef = useRef(false);
 
   // LLM event listener cleanup
   const unlistenRef = useRef<(() => void) | null>(null);
@@ -167,6 +168,7 @@ export function useVoiceConversation(): UseVoiceConversationHandle {
   // ── TTS stop ──────────────────────────────────────────────────────────────
 
   const stopTTS = useCallback(() => {
+    ttsCancelledRef.current = true;
     try { ttsSourceRef.current?.stop(); } catch { /* already ended */ }
     ttsSourceRef.current = null;
   }, []);
@@ -223,9 +225,23 @@ export function useVoiceConversation(): UseVoiceConversationHandle {
     goPhase("thinking");
 
     // ── Send to LLM ────────────────────────────────────────────────────────
-    const store = chatStoreRef.current;
+    let store = chatStoreRef.current;
     if (!store.activeConversation) {
-      log("No active conversation");
+      log("No active conversation — creating one");
+      try {
+        const conv = await useChatStore.getState().createConversation();
+        await useChatStore.getState().openConversation(conv.id);
+        // Re-read the store after creating the conversation
+        store = useChatStore.getState();
+      } catch (e) {
+        log(`Failed to create conversation: ${e}`);
+        if (activeRef.current) { goPhase("listening"); startMic(); } // eslint-disable-line @typescript-eslint/no-use-before-define
+        return;
+      }
+    }
+
+    if (!store.activeConversation) {
+      log("Still no active conversation after creation — aborting");
       if (activeRef.current) { goPhase("listening"); startMic(); } // eslint-disable-line @typescript-eslint/no-use-before-define
       return;
     }
@@ -286,58 +302,129 @@ export function useVoiceConversation(): UseVoiceConversationHandle {
 
   // ── TTS playback ─────────────────────────────────────────────────────────
 
+  /**
+   * Split text into sentence-level chunks for pipelined TTS.
+   * Splits on sentence-ending punctuation followed by a space, keeping each
+   * chunk a reasonable length for low-latency synthesis.
+   */
+  const splitTTSChunks = useCallback((text: string): string[] => {
+    // Split on sentence boundaries (. ! ? followed by space or end of string).
+    // Also split on semicolons and colons for long compound sentences.
+    const raw = text.match(/[^.!?;:]+[.!?;:]*/g) ?? [text];
+    const chunks: string[] = [];
+    let buf = "";
+
+    for (const seg of raw) {
+      buf += seg;
+      // Flush when we have a reasonable chunk (>40 chars) or it's the last segment.
+      if (buf.trim().length >= 40) {
+        chunks.push(buf.trim());
+        buf = "";
+      }
+    }
+    if (buf.trim()) chunks.push(buf.trim());
+    return chunks.filter(Boolean);
+  }, []);
+
+  /**
+   * Play a single WAV buffer and return a promise that resolves when it ends.
+   * The promise rejects if TTS is cancelled (user interrupted).
+   */
+  const playWavBuffer = useCallback((wavBytes: number[]): Promise<void> => {
+    return new Promise(async (resolve, reject) => {
+      if (ttsCancelledRef.current || !activeRef.current) { reject(new Error("cancelled")); return; }
+
+      try {
+        if (!ttsCtxRef.current || ttsCtxRef.current.state === "closed") {
+          ttsCtxRef.current = new AudioContext();
+        }
+        const ctx = ttsCtxRef.current;
+        const uint8 = new Uint8Array(wavBytes);
+        const audioBuf = await ctx.decodeAudioData(uint8.buffer.slice(0));
+
+        if (ttsCancelledRef.current || !activeRef.current) { reject(new Error("cancelled")); return; }
+
+        const src = ctx.createBufferSource();
+        src.buffer = audioBuf;
+        src.connect(ctx.destination);
+        ttsSourceRef.current = src;
+
+        src.onended = () => {
+          ttsSourceRef.current = null;
+          resolve();
+        };
+
+        src.start();
+      } catch (e) {
+        reject(e);
+      }
+    });
+  }, []);
+
+  /**
+   * Pipelined TTS: split text into sentence chunks, synthesize chunk N+1
+   * while playing chunk N, so the user hears audio almost immediately.
+   */
   const playTTS = useCallback(async (text: string) => {
     const s = settingsRef.current;
     const voice = s?.tts_voice ?? "af_heart";
     const speed = s?.tts_speed ?? 1.0;
-    log(`TTS voice=${voice} speed=${speed}`);
 
-    let wavBytes: number[];
-    try {
-      wavBytes = await invoke<number[]>("synthesize_speech", { text, voice, speed });
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      log(`TTS error: ${msg}`);
-      setError(msg);
-      if (activeRef.current) { goPhase("listening"); startMic(); } // eslint-disable-line @typescript-eslint/no-use-before-define
-      return;
+    const chunks = splitTTSChunks(text);
+    log(`TTS voice=${voice} speed=${speed} chunks=${chunks.length}`);
+
+    ttsCancelledRef.current = false;
+
+    // Pre-fetch the first chunk immediately.
+    let nextSynthesis: Promise<number[]> | null = null;
+
+    for (let i = 0; i < chunks.length; i++) {
+      if (ttsCancelledRef.current || !activeRef.current) break;
+
+      const chunk = chunks[i];
+      log(`TTS chunk ${i + 1}/${chunks.length}: "${chunk.slice(0, 50)}${chunk.length > 50 ? "…" : ""}"`);
+
+      // Either use the pre-fetched synthesis or start a new one.
+      let wavBytes: number[];
+      try {
+        if (nextSynthesis) {
+          wavBytes = await nextSynthesis;
+          nextSynthesis = null;
+        } else {
+          wavBytes = await invoke<number[]>("synthesize_speech", { text: chunk, voice, speed });
+        }
+      } catch (e) {
+        if (ttsCancelledRef.current) break;
+        const msg = e instanceof Error ? e.message : String(e);
+        log(`TTS error on chunk ${i + 1}: ${msg}`);
+        setError(msg);
+        break;
+      }
+
+      if (ttsCancelledRef.current || !activeRef.current) break;
+
+      // Start synthesizing the NEXT chunk in the background while we play this one.
+      if (i + 1 < chunks.length) {
+        const nextChunk = chunks[i + 1];
+        nextSynthesis = invoke<number[]>("synthesize_speech", { text: nextChunk, voice, speed });
+      }
+
+      // Play the current chunk and wait for it to finish.
+      try {
+        await playWavBuffer(wavBytes);
+      } catch {
+        break; // cancelled or decode error
+      }
     }
 
-    if (!activeRef.current) return;
-
-    try {
-      if (!ttsCtxRef.current || ttsCtxRef.current.state === "closed") {
-        ttsCtxRef.current = new AudioContext();
-      }
-      const ctx = ttsCtxRef.current;
-      const uint8 = new Uint8Array(wavBytes);
-      const audioBuf = await ctx.decodeAudioData(uint8.buffer.slice(0));
-
-      if (!activeRef.current) return;
-
-      const src = ctx.createBufferSource();
-      src.buffer = audioBuf;
-      src.connect(ctx.destination);
-      ttsSourceRef.current = src;
-
-      src.onended = () => {
-        ttsSourceRef.current = null;
-        if (activeRef.current && phaseRef.current === "speaking") {
-          log("TTS ended — back to listening");
-          goPhase("listening");
-          startMic(); // eslint-disable-line @typescript-eslint/no-use-before-define
-        }
-      };
-
-      src.start();
-      log("TTS playing");
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      log(`TTS decode error: ${msg}`);
-      if (activeRef.current) { goPhase("listening"); startMic(); } // eslint-disable-line @typescript-eslint/no-use-before-define
+    // All chunks done (or cancelled) — transition back to listening.
+    if (activeRef.current && phaseRef.current === "speaking") {
+      log("TTS ended — back to listening");
+      goPhase("listening");
+      startMic(); // eslint-disable-line @typescript-eslint/no-use-before-define
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [goPhase, log, stopTTS]);
+  }, [goPhase, log, stopTTS, splitTTSChunks, playWavBuffer]);
 
   // ── Start microphone + VAD ────────────────────────────────────────────────
 

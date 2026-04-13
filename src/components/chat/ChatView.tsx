@@ -401,7 +401,7 @@ export function ChatView() {
 
               {/* Messages */}
               <ScrollArea className="flex-1 px-4 py-4">
-                <div className="max-w-3xl mx-auto space-y-4">
+                <div className="max-w-5xl mx-auto space-y-4">
                   {activeConversation.messages
                     .filter((m) => m.role !== "system")
                     .map((message, idx, arr) => {

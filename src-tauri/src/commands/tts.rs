@@ -12,6 +12,8 @@ use crate::tts::downloader;
 pub struct TtsStatus {
     pub enabled: bool,
     pub models_exist: bool,
+    /// Python deps fully installed for the current device (stamp file valid).
+    pub deps_ready: bool,
     /// Process is alive (does not mean it has finished loading yet).
     pub running: bool,
     /// Server responded to /health (fully ready to synthesize).
@@ -35,8 +37,8 @@ pub async fn get_tts_status(state: State<'_, AppState>) -> Result<TtsStatus, Str
 
     Ok(TtsStatus {
         enabled: settings.tts_enabled,
-        // True when the HF model snapshot has been downloaded to the local cache
         models_exist: crate::tts::KokoroManager::models_exist(&state.data_dir),
+        deps_ready: crate::tts::KokoroManager::deps_ready(&state.data_dir, &settings.tts_device),
         running,
         healthy,
         port: settings.tts_port,
@@ -170,4 +172,66 @@ pub async fn download_tts_models(
     downloader::download_kokoro_models(&data_dir, &device, tx)
         .await
         .map_err(|e| e.to_string())
+}
+
+// ── Dependency setup ──────────────────────────────────────────────────────
+
+/// Run `kokoro_server.py --setup` to install Python deps for the current
+/// device variant.  Writes a stamp file on success so subsequent server
+/// starts skip the dep check entirely.
+/// Emits `setup_tts_progress` events with log lines while running.
+#[tauri::command]
+pub async fn setup_tts_deps(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let data_dir = state.data_dir.clone();
+    let device = state.settings.lock().unwrap().tts_device.clone();
+
+    let log_path = std::env::temp_dir().join("kokoro-setup.log");
+    let mut child = crate::tts::KokoroManager::spawn_setup(&data_dir, &device, &log_path)
+        .map_err(|e| e.to_string())?;
+
+    let app_clone = app.clone();
+    let log_path_clone = log_path.clone();
+
+    tauri::async_runtime::spawn(async move {
+        let mut last_byte: u64 = 0;
+        loop {
+            match child.try_wait() {
+                Ok(Some(exit_status)) => {
+                    if let Ok(contents) = std::fs::read_to_string(&log_path_clone) {
+                        let bytes = contents.len() as u64;
+                        if bytes > last_byte {
+                            for line in contents[last_byte as usize..].lines() {
+                                let _ = app_clone.emit("setup_tts_progress", line);
+                            }
+                        }
+                    }
+                    if !exit_status.success() {
+                        let _ = app_clone.emit(
+                            "setup_tts_progress",
+                            format!("Setup failed with exit code {}", exit_status),
+                        );
+                    }
+                    return;
+                }
+                Ok(None) => {
+                    if let Ok(contents) = std::fs::read_to_string(&log_path_clone) {
+                        let bytes = contents.len() as u64;
+                        if bytes > last_byte {
+                            for line in contents[last_byte as usize..].lines() {
+                                let _ = app_clone.emit("setup_tts_progress", line);
+                            }
+                            last_byte = bytes;
+                        }
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                }
+                Err(_) => return,
+            }
+        }
+    });
+
+    Ok(())
 }
