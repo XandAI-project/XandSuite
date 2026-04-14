@@ -45,6 +45,7 @@ __pycache__/
 *.db-wal
 models/
 !src/**/models/
+!src-tauri/src/**/models/
 *.gguf
 
 /version/executables
