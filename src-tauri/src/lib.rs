@@ -456,6 +456,7 @@ pub fn run() {
             commands::tts::start_tts_server,
             commands::tts::stop_tts_server,
             commands::tts::synthesize_speech,
+            commands::tts::synthesize_speech_stream,
             commands::tts::download_tts_models,
             commands::tts::get_tts_log,
             commands::tts::setup_tts_deps,

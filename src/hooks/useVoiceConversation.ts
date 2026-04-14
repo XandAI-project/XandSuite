@@ -78,6 +78,126 @@ function pcmToWav(samples: Float32Array, sampleRate: number): Uint8Array {
   return new Uint8Array(buf);
 }
 
+/**
+ * Wrap raw 16-bit signed LE PCM bytes into a valid WAV container.
+ * Used to convert streaming PCM chunks from Kokoro into something
+ * `AudioContext.decodeAudioData` can handle.
+ */
+function rawPcmToWav(pcmBytes: Uint8Array, sampleRate = 24000): Uint8Array {
+  const dataSize = pcmBytes.length;
+  const header = new ArrayBuffer(44);
+  const v = new DataView(header);
+  const ws = (o: number, s: string) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  ws(0, "RIFF"); v.setUint32(4, 36 + dataSize, true); ws(8, "WAVE");
+  ws(12, "fmt "); v.setUint32(16, 16, true); v.setUint16(20, 1, true);
+  v.setUint16(22, 1, true); v.setUint32(24, sampleRate, true);
+  v.setUint32(28, sampleRate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  ws(36, "data"); v.setUint32(40, dataSize, true);
+  const wav = new Uint8Array(44 + dataSize);
+  wav.set(new Uint8Array(header), 0);
+  wav.set(pcmBytes, 44);
+  return wav;
+}
+
+// ── Sentence buffer for streaming TTS ─────────────────────────────────────────
+
+/**
+ * Accumulates LLM tokens and emits complete sentences as soon as they are
+ * detected.  Strips `<think>` blocks and XML tags so TTS only receives
+ * clean, speakable text.
+ *
+ * Sentence boundary: `.` `!` `?` followed by whitespace or end-of-string,
+ * with guards against decimals (3.14) and ellipses (...).
+ */
+class SentenceBuffer {
+  private buf = "";
+  private inThink = false;
+
+  /** Minimum characters before a sentence boundary triggers a flush. */
+  private static MIN_CHUNK = 40;
+
+  /**
+   * Push a new token.  Returns a flushed sentence string when a boundary is
+   * detected, or `null` if more tokens are needed.
+   */
+  push(token: string): string | null {
+    for (const ch of token) {
+      if (this.processChar(ch)) continue;
+    }
+
+    // Check for a sentence boundary in the cleaned buffer.
+    return this.tryExtract();
+  }
+
+  /** Drain whatever remains in the buffer (call on `done:true`). */
+  flush(): string {
+    const text = this.buf
+      .replace(/<[^>]+>/g, "")
+      .trim();
+    this.buf = "";
+    return text;
+  }
+
+  // -- internals --
+
+  private processChar(ch: string): boolean {
+    this.buf += ch;
+
+    // Track <think>…</think> blocks — discard their content.
+    if (!this.inThink && this.buf.endsWith("<think>")) {
+      this.buf = this.buf.slice(0, -7);
+      this.inThink = true;
+      return true;
+    }
+    if (this.inThink) {
+      if (this.buf.endsWith("</think>")) {
+        this.buf = this.buf.slice(0, -8);
+        this.inThink = false;
+      }
+      return true;
+    }
+    return false;
+  }
+
+  private tryExtract(): string | null {
+    // Strip XML tags for boundary detection.
+    const clean = this.buf.replace(/<[^>]+>/g, "");
+    if (clean.length < SentenceBuffer.MIN_CHUNK) return null;
+
+    // Find sentence-ending punctuation (.!?) followed by a space, quote+space,
+    // or end-of-string with trailing content still in the buffer.
+    // The key: we need SOMETHING after the punctuation to confirm the sentence
+    // is complete (a space, a new word starting, etc.).
+    const match = clean.match(/^([\s\S]*?[.!?]["\')]*)\s([\s\S]*)$/);
+    if (!match) return null;
+
+    const candidate = match[1].trim();
+
+    // Reject false positives: decimal numbers like "3.14"
+    if (/\d\.\d/.test(candidate.slice(-4))) return null;
+    // Reject ellipsis: "..."
+    if (candidate.endsWith("...")) return null;
+
+    if (candidate.length < SentenceBuffer.MIN_CHUNK) return null;
+
+    // Advance the raw buffer past the extracted portion + the space.
+    // Map back from clean-text offset to raw-buffer offset by skipping tags.
+    let rawIdx = 0;
+    let cleanConsumed = 0;
+    const targetClean = candidate.length + 1; // +1 for the space delimiter
+    let inTag = false;
+    while (rawIdx < this.buf.length && cleanConsumed < targetClean) {
+      if (this.buf[rawIdx] === "<") inTag = true;
+      if (!inTag) cleanConsumed++;
+      if (this.buf[rawIdx] === ">") inTag = false;
+      rawIdx++;
+    }
+
+    this.buf = this.buf.slice(rawIdx);
+    return candidate;
+  }
+}
+
 // ── Hook ──────────────────────────────────────────────────────────────────────
 
 export function useVoiceConversation(): UseVoiceConversationHandle {
@@ -249,49 +369,213 @@ export function useVoiceConversation(): UseVoiceConversationHandle {
     const convId = store.activeConversation.id;
     log(`Sending to LLM (conv ${convId.slice(0, 8)}…)`);
 
-    let accum = "";
     unlistenRef.current?.();
     unlistenRef.current = null;
 
+    // ── Streaming sentence-boundary TTS ──────────────────────────────────
+    // Instead of waiting for the full LLM response, we detect sentence
+    // boundaries in real-time and enqueue each sentence for TTS immediately.
+    // A concurrent playback loop starts as soon as the first sentence is
+    // ready, so the user hears audio while the LLM is still generating.
+
+    const sentenceBuf = new SentenceBuffer();
+    const ttsQueue: string[] = [];
+    let queueDone = false;          // true after done:true + final flush
+    let queueResolve: (() => void) | null = null;
+    let ttsLoopStarted = false;
+    let fullAccum = "";              // raw accumulator for setResponse
+
+    /** Signal the playback loop that a new sentence is available. */
+    const notifyQueue = () => {
+      if (queueResolve) { queueResolve(); queueResolve = null; }
+    };
+
+    /** Wait until the queue has an item or is done. */
+    const waitForQueue = (): Promise<void> =>
+      new Promise((resolve) => {
+        if (ttsQueue.length > 0 || queueDone) { resolve(); return; }
+        queueResolve = resolve;
+      });
+
     const unlisten = await listen<{ conversation_id: string; token: string; done: boolean }>(
       "chat_token",
-      async (ev) => {
+      (ev) => {
         if (!activeRef.current) return;
         if (ev.payload.conversation_id !== convId) return;
 
         if (!ev.payload.done) {
-          accum += ev.payload.token;
+          fullAccum += ev.payload.token;
+          const sentence = sentenceBuf.push(ev.payload.token);
+          if (sentence) {
+            ttsQueue.push(sentence);
+            // Start the TTS playback loop on the first sentence.
+            if (!ttsLoopStarted) {
+              ttsLoopStarted = true;
+              goPhase("speaking");
+              runTTSQueue(); // eslint-disable-line @typescript-eslint/no-use-before-define
+            }
+            notifyQueue();
+          }
         } else {
           unlisten();
           unlistenRef.current = null;
-          if (!activeRef.current) return;
+          if (!activeRef.current) { queueDone = true; notifyQueue(); return; }
 
-          const cleaned = accum
+          // Flush remaining text from the sentence buffer.
+          const tail = sentenceBuf.flush();
+          if (tail) ttsQueue.push(tail);
+
+          // If nothing was ever enqueued (very short or empty response),
+          // update the UI and go back to listening.
+          const cleaned = fullAccum
             .replace(/<think>[\s\S]*?<\/think>/g, "")
             .replace(/<[^>]+>/g, "")
             .trim();
 
           log(`LLM done (${cleaned.length} chars)`);
-
-          if (!cleaned) {
-            if (activeRef.current) { goPhase("listening"); startMic(); } // eslint-disable-line @typescript-eslint/no-use-before-define
-            return;
-          }
-
           setResponse(cleaned);
-          goPhase("speaking");
-          await playTTS(cleaned); // eslint-disable-line @typescript-eslint/no-use-before-define
+
+          if (!ttsLoopStarted) {
+            if (ttsQueue.length > 0) {
+              // Sentence(s) were flushed on done but the loop never started.
+              queueDone = true;
+              ttsLoopStarted = true;
+              goPhase("speaking");
+              runTTSQueue(); // eslint-disable-line @typescript-eslint/no-use-before-define
+            } else if (cleaned) {
+              // The full response didn't produce any sentence boundaries at all
+              // (e.g. very short answer). Play the whole cleaned text as one shot.
+              ttsQueue.push(cleaned);
+              queueDone = true;
+              ttsLoopStarted = true;
+              goPhase("speaking");
+              runTTSQueue(); // eslint-disable-line @typescript-eslint/no-use-before-define
+            } else {
+              // Empty response — go back to listening.
+              queueDone = true;
+              if (activeRef.current) { goPhase("listening"); startMic(); } // eslint-disable-line @typescript-eslint/no-use-before-define
+            }
+          } else {
+            queueDone = true;
+            notifyQueue();
+          }
         }
       }
     );
 
     unlistenRef.current = unlisten;
 
+    /**
+     * Synthesize one sentence via the streaming PCM endpoint.
+     * Collects all PCM chunks, wraps them into a WAV, and plays.
+     * Returns a promise that resolves when playback finishes.
+     */
+    const synthesizeAndPlayStream = async (
+      sentence: string, voice: string, speed: number,
+    ): Promise<void> => {
+      const requestId = `tts-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const pcmChunks: Uint8Array[] = [];
+      let totalBytes = 0;
+      let streamDone = false;
+      let streamResolve: (() => void) | null = null;
+
+      const waitStreamDone = (): Promise<void> =>
+        new Promise((resolve) => {
+          if (streamDone) { resolve(); return; }
+          streamResolve = resolve;
+        });
+
+      const unlistenChunk = await listen<{ request_id: string; data: number[]; done: boolean }>(
+        "tts_audio_chunk",
+        (ev) => {
+          if (ev.payload.request_id !== requestId) return;
+          if (!ev.payload.done) {
+            const chunk = new Uint8Array(ev.payload.data);
+            pcmChunks.push(chunk);
+            totalBytes += chunk.length;
+          } else {
+            streamDone = true;
+            if (streamResolve) { streamResolve(); streamResolve = null; }
+          }
+        },
+      );
+
+      try {
+        await invoke("synthesize_speech_stream", {
+          text: sentence, voice, speed, requestId,
+        });
+      } catch (e) {
+        unlistenChunk();
+        throw e;
+      }
+
+      await waitStreamDone();
+      unlistenChunk();
+
+      if (totalBytes === 0) return;
+
+      // Merge PCM chunks and wrap in WAV header.
+      const merged = new Uint8Array(totalBytes);
+      let off = 0;
+      for (const c of pcmChunks) { merged.set(c, off); off += c.length; }
+      const wavData = rawPcmToWav(merged);
+      await playWavBuffer(Array.from(wavData));
+    };
+
+    /** Consume the TTS queue, playing sentences as they arrive. */
+    const runTTSQueue = async () => {
+      const s = settingsRef.current;
+      const voice = s?.tts_voice ?? "af_heart";
+      const speed = s?.tts_speed ?? 1.0;
+
+      ttsCancelledRef.current = false;
+      let chunkIdx = 0;
+
+      while (true) {
+        if (ttsCancelledRef.current || !activeRef.current) break;
+
+        await waitForQueue();
+        if (ttsQueue.length === 0 && queueDone) break;
+        if (ttsQueue.length === 0) continue;
+
+        const sentence = ttsQueue.shift()!;
+        chunkIdx++;
+        log(`TTS queue #${chunkIdx}: "${sentence.slice(0, 50)}${sentence.length > 50 ? "…" : ""}"`);
+
+        try {
+          await synthesizeAndPlayStream(sentence, voice, speed);
+        } catch (e) {
+          if (ttsCancelledRef.current) break;
+          // Fallback: try the non-streaming endpoint.
+          log(`Stream TTS failed, falling back to batch: ${e}`);
+          try {
+            const wavBytes = await invoke<number[]>("synthesize_speech", { text: sentence, voice, speed });
+            if (ttsCancelledRef.current || !activeRef.current) break;
+            await playWavBuffer(wavBytes);
+          } catch (e2) {
+            if (ttsCancelledRef.current) break;
+            const msg = e2 instanceof Error ? e2.message : String(e2);
+            log(`TTS fallback error on chunk ${chunkIdx}: ${msg}`);
+            setError(msg);
+            break;
+          }
+        }
+      }
+
+      if (activeRef.current && phaseRef.current === "speaking") {
+        log("TTS queue drained — back to listening");
+        goPhase("listening");
+        startMic(); // eslint-disable-line @typescript-eslint/no-use-before-define
+      }
+    };
+
     try {
       await store.sendMessage(text.trim());
     } catch (e) {
       unlisten();
       unlistenRef.current = null;
+      queueDone = true;
+      notifyQueue();
       const msg = e instanceof Error ? e.message : String(e);
       log(`LLM send error: ${msg}`);
       setError(msg);
@@ -301,30 +585,6 @@ export function useVoiceConversation(): UseVoiceConversationHandle {
   }, [goPhase, log]);
 
   // ── TTS playback ─────────────────────────────────────────────────────────
-
-  /**
-   * Split text into sentence-level chunks for pipelined TTS.
-   * Splits on sentence-ending punctuation followed by a space, keeping each
-   * chunk a reasonable length for low-latency synthesis.
-   */
-  const splitTTSChunks = useCallback((text: string): string[] => {
-    // Split on sentence boundaries (. ! ? followed by space or end of string).
-    // Also split on semicolons and colons for long compound sentences.
-    const raw = text.match(/[^.!?;:]+[.!?;:]*/g) ?? [text];
-    const chunks: string[] = [];
-    let buf = "";
-
-    for (const seg of raw) {
-      buf += seg;
-      // Flush when we have a reasonable chunk (>40 chars) or it's the last segment.
-      if (buf.trim().length >= 40) {
-        chunks.push(buf.trim());
-        buf = "";
-      }
-    }
-    if (buf.trim()) chunks.push(buf.trim());
-    return chunks.filter(Boolean);
-  }, []);
 
   /**
    * Play a single WAV buffer and return a promise that resolves when it ends.
@@ -360,71 +620,6 @@ export function useVoiceConversation(): UseVoiceConversationHandle {
       }
     });
   }, []);
-
-  /**
-   * Pipelined TTS: split text into sentence chunks, synthesize chunk N+1
-   * while playing chunk N, so the user hears audio almost immediately.
-   */
-  const playTTS = useCallback(async (text: string) => {
-    const s = settingsRef.current;
-    const voice = s?.tts_voice ?? "af_heart";
-    const speed = s?.tts_speed ?? 1.0;
-
-    const chunks = splitTTSChunks(text);
-    log(`TTS voice=${voice} speed=${speed} chunks=${chunks.length}`);
-
-    ttsCancelledRef.current = false;
-
-    // Pre-fetch the first chunk immediately.
-    let nextSynthesis: Promise<number[]> | null = null;
-
-    for (let i = 0; i < chunks.length; i++) {
-      if (ttsCancelledRef.current || !activeRef.current) break;
-
-      const chunk = chunks[i];
-      log(`TTS chunk ${i + 1}/${chunks.length}: "${chunk.slice(0, 50)}${chunk.length > 50 ? "…" : ""}"`);
-
-      // Either use the pre-fetched synthesis or start a new one.
-      let wavBytes: number[];
-      try {
-        if (nextSynthesis) {
-          wavBytes = await nextSynthesis;
-          nextSynthesis = null;
-        } else {
-          wavBytes = await invoke<number[]>("synthesize_speech", { text: chunk, voice, speed });
-        }
-      } catch (e) {
-        if (ttsCancelledRef.current) break;
-        const msg = e instanceof Error ? e.message : String(e);
-        log(`TTS error on chunk ${i + 1}: ${msg}`);
-        setError(msg);
-        break;
-      }
-
-      if (ttsCancelledRef.current || !activeRef.current) break;
-
-      // Start synthesizing the NEXT chunk in the background while we play this one.
-      if (i + 1 < chunks.length) {
-        const nextChunk = chunks[i + 1];
-        nextSynthesis = invoke<number[]>("synthesize_speech", { text: nextChunk, voice, speed });
-      }
-
-      // Play the current chunk and wait for it to finish.
-      try {
-        await playWavBuffer(wavBytes);
-      } catch {
-        break; // cancelled or decode error
-      }
-    }
-
-    // All chunks done (or cancelled) — transition back to listening.
-    if (activeRef.current && phaseRef.current === "speaking") {
-      log("TTS ended — back to listening");
-      goPhase("listening");
-      startMic(); // eslint-disable-line @typescript-eslint/no-use-before-define
-    }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [goPhase, log, stopTTS, splitTTSChunks, playWavBuffer]);
 
   // ── Start microphone + VAD ────────────────────────────────────────────────
 

@@ -93,6 +93,10 @@ export interface Conversation {
   created_at: string;
   updated_at: string;
   messages: Message[];
+  /** LLM-generated rolling summary of evicted conversation turns. */
+  context_summary?: string | null;
+  /** Rowid watermark: last message already absorbed into context_summary. */
+  summary_up_to_rowid?: number | null;
 }
 
 export interface ConversationSummary {

@@ -269,6 +269,16 @@
       ]
     },
     {
+      "id": "currency_rates",
+      "name": "Currency Exchange Rates",
+      "description": "Fetch live and historical exchange rates between any two currencies. Get USD vs EUR/GBP/JPY/BRL (and more), convert amounts, compare a base currency against many targets at once, and look up rates on any past date back to 1999. Powered by the free Frankfurter API (ECB data) — no API key required.",
+      "category": "Finance",
+      "icon": "DollarSign",
+      "script": "${TOOLS_DIR}/packages/official/currency_rates.py",
+      "requires": ["requests"],
+      "args_schema": []
+    },
+    {
       "id": "rich_responses",
       "name": "Rich Responses",
       "description": "Generate charts, tables, and visual cards inline in chat. Provides line/bar/pie charts (SVG, offline), metric cards, comparison grids, and styled data tables — no configuration needed.",

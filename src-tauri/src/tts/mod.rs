@@ -307,6 +307,66 @@ impl KokoroManager {
         self.port
     }
 
+    /// Stream TTS audio as PCM chunks via Tauri events.
+    ///
+    /// POSTs to `/tts/stream` and reads the chunked response body
+    /// progressively.  Each chunk is emitted as a `tts_audio_chunk` event
+    /// with `{ request_id, data: Vec<u8>, done: false }`.  A final event
+    /// with `done: true` signals completion.
+    pub async fn synthesize_stream(
+        &self,
+        text: &str,
+        voice: &str,
+        speed: f32,
+        app: &tauri::AppHandle,
+        request_id: &str,
+    ) -> Result<()> {
+        use futures_util::StreamExt;
+        use tauri::Emitter;
+
+        let url = format!("http://127.0.0.1:{}/tts/stream", self.port);
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .build()?;
+
+        let body = serde_json::json!({
+            "text": text,
+            "voice": voice,
+            "speed": speed,
+        });
+
+        let resp = client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .context("Failed to reach kokoro-server /tts/stream")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let msg = resp.text().await.unwrap_or_default();
+            anyhow::bail!("kokoro-server /tts/stream returned {}: {}", status, msg);
+        }
+
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk_result) = stream.next().await {
+            let chunk = chunk_result.context("Error reading TTS stream chunk")?;
+            let _ = app.emit("tts_audio_chunk", serde_json::json!({
+                "request_id": request_id,
+                "data": chunk.to_vec(),
+                "done": false,
+            }));
+        }
+
+        let _ = app.emit("tts_audio_chunk", serde_json::json!({
+            "request_id": request_id,
+            "data": [],
+            "done": true,
+        }));
+
+        Ok(())
+    }
+
     /// Send text to the running server and return WAV bytes.
     pub async fn synthesize(&self, text: &str, voice: &str, speed: f32) -> Result<Vec<u8>> {
         let url = format!("http://127.0.0.1:{}/tts", self.port);

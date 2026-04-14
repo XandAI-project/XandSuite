@@ -21,6 +21,44 @@ export function SettingsView() {
   const [saved, setSaved] = useState(false);
   const [dataDir, setDataDir] = useState("");
   const [modelsDir, setModelsDir] = useState("");
+  const [previewingVoice, setPreviewingVoice] = useState<string | null>(null);
+  const [previewLoadingVoice, setPreviewLoadingVoice] = useState<string | null>(null);
+  const previewSourceRef = useRef<AudioBufferSourceNode | null>(null);
+  const previewCtxRef = useRef<AudioContext | null>(null);
+
+  const stopVoicePreview = () => {
+    try { previewSourceRef.current?.stop(); } catch { /* already stopped */ }
+    previewSourceRef.current = null;
+    setPreviewingVoice(null);
+  };
+
+  const handleVoicePreview = async (voiceId: string) => {
+    if (previewingVoice === voiceId) { stopVoicePreview(); return; }
+    stopVoicePreview();
+    setPreviewLoadingVoice(voiceId);
+    try {
+      const res = await fetch(`/voice-previews/${voiceId}.wav`);
+      if (!res.ok) throw new Error("Preview not found — run: npm run gen:previews");
+      const arrayBuf = await res.arrayBuffer();
+      if (!previewCtxRef.current || previewCtxRef.current.state === "closed") {
+        previewCtxRef.current = new AudioContext();
+      }
+      const ctx = previewCtxRef.current;
+      const audioBuf = await ctx.decodeAudioData(arrayBuf);
+      const source = ctx.createBufferSource();
+      source.buffer = audioBuf;
+      source.connect(ctx.destination);
+      source.onended = () => setPreviewingVoice(null);
+      previewSourceRef.current = source;
+      setPreviewLoadingVoice(null);
+      setPreviewingVoice(voiceId);
+      source.start();
+    } catch (err) {
+      setPreviewLoadingVoice(null);
+      setPreviewingVoice(null);
+      console.warn("Voice preview failed:", err);
+    }
+  };
 
   const {
     status: serverStatus, gpuInfo, isDownloading, downloadProgress, error: serverError,
@@ -633,28 +671,24 @@ export function SettingsView() {
                   label="Default voice"
                   description="Voice used when speaking responses. Each language has dedicated voices."
                 >
-                  <div className="flex items-center gap-3 flex-wrap">
+                  <div className="flex items-center gap-2 flex-wrap">
                     <select
                       value={settings.tts_voice ?? "af_heart"}
                       onChange={(e) => {
                         const voiceId = e.target.value;
-                        // Auto-update language to match voice prefix
                         const langMap: Record<string, string> = {
                           af: "en-us", am: "en-us",
                           bf: "en-gb", bm: "en-gb",
                           pf: "pt-br", pm: "pt-br",
                           ef: "es",    em: "es",
-                          ff: "fr",
-                          if: "it",
+                          ff: "fr",    if: "it",
                           hf: "hi",    hm: "hi",
-                          jf: "ja",    jm: "ja",
-                          kf: "ko",    km: "ko",
-                          zf: "zh",    zm: "zh",
                         };
                         const prefix = voiceId.slice(0, 2);
                         const lang = langMap[prefix] ?? settings.tts_language ?? "en-us";
                         update("tts_voice", voiceId);
                         update("tts_language", lang);
+                        stopVoicePreview();
                       }}
                       className="text-sm bg-background border border-border rounded px-2 py-1 h-8"
                     >
@@ -679,36 +713,36 @@ export function SettingsView() {
                         ))}
                       </optgroup>
                       <optgroup label="French">
-                        {["ff_siwis"].map(v => (
-                          <option key={v} value={v}>{v}</option>
-                        ))}
+                        <option value="ff_siwis">ff_siwis</option>
                       </optgroup>
                       <optgroup label="Italian">
-                        {["if_sara"].map(v => (
-                          <option key={v} value={v}>{v}</option>
-                        ))}
+                        <option value="if_sara">if_sara</option>
                       </optgroup>
                       <optgroup label="Hindi">
                         {["hf_alpha","hm_omega"].map(v => (
                           <option key={v} value={v}>{v}</option>
                         ))}
                       </optgroup>
-                      <optgroup label="Japanese">
-                        {["jf_alpha","jf_gongitsune","jm_kumo"].map(v => (
-                          <option key={v} value={v}>{v}</option>
-                        ))}
-                      </optgroup>
-                      <optgroup label="Korean">
-                        {["kf_alpha","km_omega"].map(v => (
-                          <option key={v} value={v}>{v}</option>
-                        ))}
-                      </optgroup>
-                      <optgroup label="Mandarin">
-                        {["zf_xiaobei","zm_yunxi"].map(v => (
-                          <option key={v} value={v}>{v}</option>
-                        ))}
-                      </optgroup>
                     </select>
+
+                    {/* Preview button for selected voice */}
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className={cn("h-8 gap-1.5", previewingVoice === settings.tts_voice && "text-blue-400 border-blue-400/40 bg-blue-400/10")}
+                      title={previewingVoice === settings.tts_voice ? "Stop preview" : "Preview this voice"}
+                      onClick={() => handleVoicePreview(settings.tts_voice ?? "af_heart")}
+                    >
+                      {previewLoadingVoice === settings.tts_voice ? (
+                        <Loader2 className="w-3 h-3 animate-spin" />
+                      ) : previewingVoice === settings.tts_voice ? (
+                        <Square className="w-3 h-3 fill-current" />
+                      ) : (
+                        <Play className="w-3 h-3 fill-current" />
+                      )}
+                      {previewingVoice === settings.tts_voice ? "Stop" : "Preview"}
+                    </Button>
+
                     <span className="text-xs text-muted-foreground">
                       Language: <span className="font-mono">{settings.tts_language ?? "en-us"}</span>
                     </span>

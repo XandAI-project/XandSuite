@@ -369,6 +369,12 @@ impl AppDb {
         let _ = self.conn.execute_batch(
             "ALTER TABLE conversations ADD COLUMN persona_id TEXT REFERENCES personas(id);"
         );
+        let _ = self.conn.execute_batch(
+            "ALTER TABLE conversations ADD COLUMN context_summary TEXT;"
+        );
+        let _ = self.conn.execute_batch(
+            "ALTER TABLE conversations ADD COLUMN summary_up_to_rowid INTEGER NOT NULL DEFAULT 0;"
+        );
 
         // Personas table (idempotent)
         self.conn.execute_batch(r#"

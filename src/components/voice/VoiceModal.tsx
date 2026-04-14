@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { X, ChevronDown, Terminal } from "lucide-react";
+import { X, ChevronDown, Terminal, Play, Square, Loader2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useVoiceConversation, VoiceConvPhase } from "@/hooks/useVoiceConversation";
 import { useSettingsStore } from "@/stores/settingsStore";
@@ -33,10 +33,6 @@ export const KOKORO_VOICES: {
   { id: "if_sara",     label: "Sara (F)",     lang: "Italian",     langCode: "it" },
   { id: "hf_alpha",    label: "Alpha (F)",    lang: "Hindi",       langCode: "hi" },
   { id: "hm_omega",    label: "Omega (M)",    lang: "Hindi",       langCode: "hi" },
-  { id: "jf_alpha",    label: "Alpha (F)",    lang: "Japanese",    langCode: "ja" },
-  { id: "kf_alpha",    label: "Alpha (F)",    lang: "Korean",      langCode: "ko" },
-  { id: "zf_xiaobei",  label: "Xiaobei (F)",  lang: "Mandarin",    langCode: "cmn" },
-  { id: "zm_yunxi",    label: "Yunxi (M)",    lang: "Mandarin",    langCode: "cmn" },
 ];
 
 // ── Phase labels ──────────────────────────────────────────────────────────────
@@ -71,8 +67,18 @@ export function VoiceModal({ onClose }: Props) {
   const { settings, saveSettings } = useSettingsStore();
   const [voiceDropdownOpen, setVoiceDropdownOpen] = useState(false);
   const [showLogs, setShowLogs] = useState(false);
+  const [previewingId, setPreviewingId] = useState<string | null>(null);
+  const [previewLoadingId, setPreviewLoadingId] = useState<string | null>(null);
   const dropdownRef = useRef<HTMLDivElement>(null);
   const logBoxRef = useRef<HTMLDivElement>(null);
+  const previewSourceRef = useRef<AudioBufferSourceNode | null>(null);
+  const previewCtxRef = useRef<AudioContext | null>(null);
+
+  const stopPreview = () => {
+    try { previewSourceRef.current?.stop(); } catch { /* already stopped */ }
+    previewSourceRef.current = null;
+    setPreviewingId(null);
+  };
 
   const selectedVoice = settings?.tts_voice ?? "af_heart";
   const selectedSpeed = settings?.tts_speed ?? 1.0;
@@ -100,7 +106,7 @@ export function VoiceModal({ onClose }: Props) {
 
   // ── Cleanup on unmount ────────────────────────────────────────────────────
   useEffect(() => {
-    return () => stop();
+    return () => { stop(); stopPreview(); };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -112,14 +118,17 @@ export function VoiceModal({ onClose }: Props) {
   // ── Dropdown outside click ────────────────────────────────────────────────
   useEffect(() => {
     const h = (e: MouseEvent) => {
-      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node))
+      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
         setVoiceDropdownOpen(false);
+        stopPreview();
+      }
     };
     document.addEventListener("mousedown", h);
     return () => document.removeEventListener("mousedown", h);
   }, []);
 
   const handleVoiceSelect = async (voiceId: string, langCode: string) => {
+    stopPreview();
     setVoiceDropdownOpen(false);
     // Derive the Whisper language from the TTS langCode so STT matches voice language
     const whisperLangMap: Record<string, string> = {
@@ -130,6 +139,42 @@ export function VoiceModal({ onClose }: Props) {
     };
     const whisperLang = whisperLangMap[langCode] ?? "auto";
     await saveSettings({ tts_voice: voiceId, tts_language: langCode, whisper_language: whisperLang });
+  };
+
+  const handlePreview = async (e: React.MouseEvent, voiceId: string) => {
+    e.stopPropagation();
+
+    if (previewingId === voiceId) { stopPreview(); return; }
+
+    stopPreview();
+    setPreviewLoadingId(voiceId);
+
+    try {
+      const res = await fetch(`/voice-previews/${voiceId}.wav`);
+      if (!res.ok) throw new Error(`Preview file not found — run: npm run gen:previews`);
+
+      const arrayBuf = await res.arrayBuffer();
+
+      if (!previewCtxRef.current || previewCtxRef.current.state === "closed") {
+        previewCtxRef.current = new AudioContext();
+      }
+      const ctx = previewCtxRef.current;
+      const audioBuf = await ctx.decodeAudioData(arrayBuf);
+
+      const source = ctx.createBufferSource();
+      source.buffer = audioBuf;
+      source.connect(ctx.destination);
+      source.onended = () => setPreviewingId(null);
+
+      previewSourceRef.current = source;
+      setPreviewLoadingId(null);
+      setPreviewingId(voiceId);
+      source.start();
+    } catch (err) {
+      setPreviewLoadingId(null);
+      setPreviewingId(null);
+      console.warn("Voice preview failed:", err);
+    }
   };
 
   const handleClose = () => { stop(); onClose(); };
@@ -196,18 +241,44 @@ export function VoiceModal({ onClose }: Props) {
                       {lang}
                     </div>
                     {voices.map((v) => (
-                      <button
+                      <div
                         key={v.id}
-                        onClick={() => handleVoiceSelect(v.id, v.langCode)}
                         className={cn(
-                          "w-full text-left px-3 py-1.5 text-sm transition-colors",
+                          "flex items-center gap-1 pr-1 transition-colors group",
                           v.id === selectedVoice
-                            ? "text-white bg-white/10"
-                            : "text-white/65 hover:text-white hover:bg-white/8"
+                            ? "bg-white/10"
+                            : "hover:bg-white/8"
                         )}
                       >
-                        {v.label}
-                      </button>
+                        <button
+                          onClick={() => handleVoiceSelect(v.id, v.langCode)}
+                          className={cn(
+                            "flex-1 text-left px-3 py-1.5 text-sm",
+                            v.id === selectedVoice ? "text-white" : "text-white/65 group-hover:text-white"
+                          )}
+                        >
+                          {v.label}
+                        </button>
+                        {/* Preview button */}
+                        <button
+                          onClick={(e) => handlePreview(e, v.id)}
+                          title={previewingId === v.id ? "Stop preview" : "Preview voice"}
+                          className={cn(
+                            "flex items-center justify-center w-6 h-6 rounded-lg shrink-0 transition-all",
+                            previewingId === v.id
+                              ? "text-blue-300 bg-blue-500/20 opacity-100"
+                              : "text-white/30 hover:text-white/70 hover:bg-white/10 opacity-0 group-hover:opacity-100"
+                          )}
+                        >
+                          {previewLoadingId === v.id ? (
+                            <Loader2 className="w-3 h-3 animate-spin" />
+                          ) : previewingId === v.id ? (
+                            <Square className="w-2.5 h-2.5 fill-current" />
+                          ) : (
+                            <Play className="w-3 h-3 fill-current" />
+                          )}
+                        </button>
+                      </div>
                     ))}
                   </div>
                 ))}

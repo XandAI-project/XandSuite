@@ -12,7 +12,8 @@
     "test:watch": "vitest",
     "build:dist": "npm run tauri -- build",
     "collect": "node scripts/collect-artifacts.js",
-    "release": "npm run build:dist && npm run collect"
+    "release": "npm run build:dist && npm run collect",
+    "gen:previews": "python tools/tts/generate_voice_previews.py"
   },
   "dependencies": {
     "@radix-ui/react-alert-dialog": "^1.1.15",

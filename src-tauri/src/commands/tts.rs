@@ -148,6 +148,55 @@ pub async fn synthesize_speech(
         .map_err(|e| e.to_string())
 }
 
+/// Stream TTS audio as PCM chunks via `tts_audio_chunk` events.
+/// Returns the `request_id` immediately — audio arrives asynchronously.
+/// Auto-starts the server if not running.
+#[tauri::command]
+pub async fn synthesize_speech_stream(
+    app: tauri::AppHandle,
+    text: String,
+    voice: String,
+    speed: f32,
+    request_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let settings = state.settings.lock().unwrap().clone();
+
+    {
+        let mut tts = state.tts.lock().await;
+        if !tts.is_running() {
+            tts.spawn(settings.tts_port, &state.data_dir, &settings.tts_device)
+                .map_err(|e| format!("Failed to start TTS server: {}", e))?;
+        }
+    }
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+    loop {
+        {
+            let mut tts = state.tts.lock().await;
+            if tts.is_healthy().await {
+                break;
+            }
+            if !tts.is_running() {
+                let log = tts.read_log().unwrap_or_default();
+                return Err(format!(
+                    "kokoro-server exited before becoming ready.\nLog:\n{}",
+                    log.lines().rev().take(20).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n")
+                ));
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("kokoro-server did not become ready within 10 minutes.".into());
+        }
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+    }
+
+    let tts = state.tts.lock().await;
+    tts.synthesize_stream(&text, &voice, speed, &app, &request_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 // ── Download ──────────────────────────────────────────────────────────────────
 
 /// Download hexgrad/Kokoro-82M into the app-local HF cache for offline use.

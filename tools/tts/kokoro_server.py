@@ -23,9 +23,12 @@ entirely, making startup near-instant.  Changing the --device flag
 invalidates the stamp and triggers a one-time reinstall.
 
 Endpoints (server mode):
-  GET  /health  → {"status": "ok"}
-  POST /tts     → Body: {"text": str, "voice": str, "speed": float}
-                  Response: audio/wav (24 kHz, 16-bit PCM mono)
+  GET  /health      → {"status": "ok"}
+  POST /tts         → Body: {"text": str, "voice": str, "speed": float}
+                      Response: audio/wav (24 kHz, 16-bit PCM mono)
+  POST /tts/stream  → Body: same as /tts
+                      Response: chunked raw PCM (16-bit signed LE, 24 kHz, mono)
+                      Streams audio segments as they are generated.
 
 Voice naming — first character is the KPipeline lang_code:
   a = American English    b = British English    p = Portuguese
@@ -688,6 +691,23 @@ def _synthesize(text: str, voice: str, speed: float) -> bytes:
     return buf.getvalue()
 
 
+def _synthesize_stream(text: str, voice: str, speed: float):
+    """Generator that yields raw 16-bit PCM bytes (24 kHz mono) per
+    internal Kokoro segment.  Each yield is a `bytes` object ready to
+    be written to the HTTP response body."""
+    import numpy as np
+
+    pipeline = _get_pipeline(_lang_code_from_voice(voice))
+    any_audio = False
+    for _, _, audio in pipeline(text, voice=voice, speed=speed):
+        any_audio = True
+        pcm16 = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16)
+        yield pcm16.tobytes()
+
+    if not any_audio:
+        raise RuntimeError("KPipeline produced no audio")
+
+
 # ---------------------------------------------------------------------------
 # HTTP server
 # ---------------------------------------------------------------------------
@@ -721,25 +741,53 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._json(404, {"error": "not found"})
 
-    def do_POST(self):
-        if self.path != "/tts":
-            self._json(404, {"error": "not found"})
-            return
-
+    def _parse_tts_body(self):
+        """Parse and validate the JSON body common to /tts and /tts/stream."""
         length = int(self.headers.get("Content-Length", 0))
         try:
             body = json.loads(self.rfile.read(length))
         except json.JSONDecodeError as exc:
             self._json(400, {"error": f"Invalid JSON: {exc}"})
-            return
-
+            return None
         text = body.get("text", "").strip()
         if not text:
             self._json(400, {"error": "text is required"})
-            return
-
+            return None
         voice = body.get("voice", "af_heart")
         speed = float(body.get("speed", 1.0))
+        return text, voice, speed
+
+    def do_POST(self):
+        if self.path == "/tts/stream":
+            parsed = self._parse_tts_body()
+            if parsed is None:
+                return
+            text, voice, speed = parsed
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "audio/pcm; rate=24000; encoding=signed-integer; bits=16")
+                self.send_header("Transfer-Encoding", "chunked")
+                self.send_header("X-TTS-Format", "pcm16_24000_mono")
+                self.end_headers()
+                for pcm_chunk in _synthesize_stream(text, voice, speed):
+                    hex_len = f"{len(pcm_chunk):X}\r\n".encode()
+                    self.wfile.write(hex_len)
+                    self.wfile.write(pcm_chunk)
+                    self.wfile.write(b"\r\n")
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            except Exception as exc:
+                _log(f"Stream synthesis error: {exc}")
+            return
+
+        if self.path != "/tts":
+            self._json(404, {"error": "not found"})
+            return
+
+        parsed = self._parse_tts_body()
+        if parsed is None:
+            return
+        text, voice, speed = parsed
 
         try:
             self._audio(_synthesize(text, voice, speed))

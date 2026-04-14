@@ -1,11 +1,12 @@
 use chrono::Utc;
 use rusqlite::params;
 use serde::Serialize;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+use crate::db::AppDb;
 use crate::models::{Conversation, InferenceConfig, Message, MessageRole, Persona, MEMORY_COLLECTION_ID};
 use crate::skills::SkillsExecutor;
 use crate::state::AppState;
@@ -92,6 +93,213 @@ fn extract_artifacts(text: &str) -> Vec<RawArtifact> {
 
     results
 }
+
+// ── Context-window compression ────────────────────────────────────────────────
+
+/// Rough token estimate: 1 token ≈ 4 characters.
+#[inline]
+fn estimate_tokens(text: &str) -> usize {
+    (text.len() + 3) / 4
+}
+
+/// Token budget; compression fires when the full history exceeds this.
+const SUMMARY_TOKEN_THRESHOLD: usize = 8_000;
+/// Number of most-recent non-system turns always kept verbatim.
+const SUMMARY_KEEP_LAST_N: usize = 10;
+/// Minimum new evictable turns required before extending the summary.
+const SUMMARY_MIN_NEW_TURNS: usize = 5;
+
+/// Build the context window that will be sent to the LLM.
+///
+/// If total estimated tokens are within `SUMMARY_TOKEN_THRESHOLD` the full
+/// history is returned unchanged.  When the budget is exceeded *and* a running
+/// `context_summary` is available the history is replaced with:
+///   1. All original system messages (never compressed).
+///   2. An injected system message containing the running summary.
+///   3. The last `SUMMARY_KEEP_LAST_N` non-system turns verbatim.
+///
+/// If the budget is exceeded but no summary exists yet the full history is
+/// still returned (the summary will be generated after this turn).
+fn build_context_window(
+    messages: Vec<(i64, String, String)>, // (rowid, role, content)
+    context_summary: Option<&str>,
+) -> Vec<(String, String)> {
+    let total_tokens: usize = messages.iter().map(|(_, _, c)| estimate_tokens(c)).sum();
+
+    if total_tokens <= SUMMARY_TOKEN_THRESHOLD || context_summary.is_none() {
+        return messages.into_iter().map(|(_, role, content)| (role, content)).collect();
+    }
+
+    let summary = context_summary.unwrap();
+
+    let mut system_msgs: Vec<(String, String)> = Vec::new();
+    let mut conv_msgs: Vec<(String, String)> = Vec::new();
+    for (_, role, content) in messages {
+        if role == "system" {
+            system_msgs.push((role, content));
+        } else {
+            conv_msgs.push((role, content));
+        }
+    }
+
+    let keep_start = conv_msgs.len().saturating_sub(SUMMARY_KEEP_LAST_N);
+
+    let mut result: Vec<(String, String)> = Vec::new();
+    result.extend(system_msgs);
+    result.push((
+        "system".to_string(),
+        format!("[Earlier conversation summary]\n{}", summary),
+    ));
+    result.extend_from_slice(&conv_msgs[keep_start..]);
+    result
+}
+
+/// Incrementally extend the conversation's running summary with turns that
+/// have been pushed outside the active context window.  Runs as a background
+/// task — the caller should `spawn` it so it does not block the response.
+async fn maybe_update_summary(
+    conversation_id: String,
+    db: Arc<Mutex<AppDb>>,
+    engine: Arc<crate::engine::EngineManager>,
+) {
+    // Load current summary state and all messages.
+    let (current_summary, watermark, all_rows): (Option<String>, i64, Vec<(i64, String, String)>) = {
+        let db_g = db.lock().unwrap();
+        let (summary, wm) = db_g.conn.query_row(
+            "SELECT context_summary, COALESCE(summary_up_to_rowid, 0)
+             FROM conversations WHERE id = ?1",
+            params![conversation_id],
+            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?)),
+        ).unwrap_or((None, 0));
+
+        let mut stmt = match db_g.conn.prepare(
+            "SELECT rowid, role, content FROM messages
+             WHERE conversation_id = ?1 ORDER BY rowid ASC",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!("[summary] Failed to prepare message query: {}", e);
+                return;
+            }
+        };
+        let rows: Vec<(i64, String, String)> = stmt
+            .query_map(params![conversation_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map(|mapped| mapped.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default();
+
+        (summary, wm, rows)
+    };
+
+    // Collect non-system rows to reason about eviction boundaries.
+    let conv_rows: Vec<(i64, &str, &str)> = all_rows
+        .iter()
+        .filter(|(_, role, _)| role != "system")
+        .map(|(rid, role, content)| (*rid, role.as_str(), content.as_str()))
+        .collect();
+
+    if conv_rows.len() <= SUMMARY_KEEP_LAST_N {
+        return; // Not enough history to evict anything.
+    }
+
+    // Evictable window = all turns except the last SUMMARY_KEEP_LAST_N.
+    let evict_end = conv_rows.len() - SUMMARY_KEEP_LAST_N;
+    let new_to_absorb: Vec<(i64, &str, &str)> = conv_rows[..evict_end]
+        .iter()
+        .filter(|(rowid, _, _)| *rowid > watermark)
+        .copied()
+        .collect();
+
+    if new_to_absorb.len() < SUMMARY_MIN_NEW_TURNS {
+        return; // Not enough new turns to justify a summarization call.
+    }
+
+    let new_turns_text: String = new_to_absorb
+        .iter()
+        .map(|(_, role, content)| format!("{}: {}", role, content))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    let new_watermark = new_to_absorb
+        .last()
+        .map(|(rid, _, _)| *rid)
+        .unwrap_or(watermark);
+
+    let existing = current_summary.as_deref().unwrap_or("(none yet)");
+
+    let prompt = format!(
+        "You are a conversation summarizer. Produce a concise updated summary \
+         using these sections:\n\
+         - Topics discussed\n\
+         - Key decisions and conclusions\n\
+         - Important facts or context\n\
+         - Current task / what was last being worked on\n\n\
+         Existing summary:\n{}\n\n\
+         New conversation turns to incorporate:\n{}\n\n\
+         Return only the updated summary with no preamble.",
+        existing, new_turns_text
+    );
+
+    let summary_messages = vec![
+        (
+            "system".to_string(),
+            "You are a helpful conversation summarizer. Be concise and structured.".to_string(),
+        ),
+        ("user".to_string(), prompt),
+    ];
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(512);
+    let mut cfg = InferenceConfig::default();
+    cfg.enable_thinking = false;
+    cfg.max_tokens = 512;
+
+    tauri::async_runtime::spawn(async move {
+        let _ = engine.chat_stream(summary_messages, cfg, tx).await;
+    });
+
+    let mut new_summary = String::new();
+    while let Some(token) = rx.recv().await {
+        if token == "[DONE]" {
+            break;
+        }
+        new_summary.push_str(&token);
+    }
+
+    let new_summary = new_summary.trim().to_string();
+    if new_summary.is_empty() {
+        log::warn!(
+            "[summary] Summarization returned empty for conv {}",
+            conversation_id
+        );
+        return;
+    }
+
+    let db_g = db.lock().unwrap();
+    match db_g.conn.execute(
+        "UPDATE conversations
+         SET context_summary = ?1, summary_up_to_rowid = ?2
+         WHERE id = ?3",
+        params![new_summary, new_watermark, conversation_id],
+    ) {
+        Ok(_) => log::info!(
+            "[summary] Updated summary for conv {} (watermark={})",
+            conversation_id,
+            new_watermark
+        ),
+        Err(e) => log::warn!(
+            "[summary] Failed to save summary for conv {}: {}",
+            conversation_id,
+            e
+        ),
+    }
+}
+
+// ── Conversation commands ─────────────────────────────────────────────────────
 
 #[derive(Serialize)]
 pub struct ConversationSummary {
@@ -196,6 +404,8 @@ pub fn create_conversation(
         created_at: Utc::now(),
         updated_at: Utc::now(),
         messages,
+        context_summary: None,
+        summary_up_to_rowid: None,
     })
 }
 
@@ -249,8 +459,9 @@ pub fn get_conversation(
 ) -> Result<Conversation, String> {
     let db = state.db.lock().unwrap();
 
-    let (id, title, model_id, system_prompt, persona_id) = db.conn.query_row(
-        "SELECT id, title, model_id, system_prompt, persona_id FROM conversations WHERE id = ?1",
+    let (id, title, model_id, system_prompt, persona_id, context_summary, summary_up_to_rowid) = db.conn.query_row(
+        "SELECT id, title, model_id, system_prompt, persona_id, context_summary, summary_up_to_rowid
+         FROM conversations WHERE id = ?1",
         params![conversation_id],
         |row| Ok((
             row.get::<_, String>(0)?,
@@ -258,6 +469,8 @@ pub fn get_conversation(
             row.get::<_, Option<String>>(2)?,
             row.get::<_, Option<String>>(3)?,
             row.get::<_, Option<String>>(4)?,
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, Option<i64>>(6)?,
         )),
     ).map_err(|e| format!("Conversation not found: {}", e))?;
 
@@ -302,6 +515,8 @@ pub fn get_conversation(
         created_at: Utc::now(),
         updated_at: Utc::now(),
         messages,
+        context_summary,
+        summary_up_to_rowid,
     })
 }
 
@@ -506,24 +721,28 @@ pub async fn send_message_inner(
         ).map_err(|e| e.to_string())?;
     }
 
-    // Build message history (sync, short lock); also read persona_id for this conversation.
+    // Build message history (sync, short lock); also read persona_id and
+    // the running context summary for this conversation.
     let (mut messages, conversation_persona_id): (Vec<(String, String)>, Option<String>) = {
         let db = state.db.lock().unwrap();
+        // Load messages with rowids so build_context_window can apply compression.
         let mut stmt = db.conn.prepare(
-            "SELECT role, content FROM messages WHERE conversation_id = ?1 ORDER BY rowid ASC"
+            "SELECT rowid, role, content FROM messages
+             WHERE conversation_id = ?1 ORDER BY rowid ASC"
         ).map_err(|e| e.to_string())?;
-        let rows: Vec<(String, String)> = stmt.query_map(params![conversation_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        let rows_with_rowid: Vec<(i64, String, String)> = stmt.query_map(params![conversation_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
         })
         .map_err(|e| e.to_string())?
         .filter_map(|r| r.ok())
         .collect();
-        let pid: Option<String> = db.conn.query_row(
-            "SELECT persona_id FROM conversations WHERE id = ?1",
+        let (pid, summary): (Option<String>, Option<String>) = db.conn.query_row(
+            "SELECT persona_id, context_summary FROM conversations WHERE id = ?1",
             params![conversation_id],
-            |row| row.get(0),
-        ).ok().flatten();
-        (rows, pid)
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap_or((None, None));
+        let compressed = build_context_window(rows_with_rowid, summary.as_deref());
+        (compressed, pid)
     };
 
     // Resolve persona (if any) for this conversation. The persona's model and
@@ -1248,6 +1467,20 @@ pub async fn send_message_inner(
                 }
             }
         }
+    }
+
+    // ── Background context-window compression ────────────────────────────────
+    // Spawn a background task to extend the running conversation summary with
+    // any turns that have been evicted from the active context window.  This
+    // fires only when there are enough new turns to absorb (SUMMARY_MIN_NEW_TURNS)
+    // and does NOT block the response.
+    if conversation_alive {
+        let db_arc = state.db.clone();
+        let engine_arc = state.engine.clone();
+        let conv_id_sum = conversation_id.clone();
+        tauri::async_runtime::spawn(async move {
+            maybe_update_summary(conv_id_sum, db_arc, engine_arc).await;
+        });
     }
 
     // ── Background memory extraction ─────────────────────────────────────────
