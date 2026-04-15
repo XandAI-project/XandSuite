@@ -1,4 +1,4 @@
-import { useRef, useEffect, useState, useCallback } from "react";
+import { useRef, useEffect, useState, useCallback, useMemo, memo } from "react";
 import {
   X,
   Trash2,
@@ -55,6 +55,7 @@ function Lightbox({
 }) {
   const [idx, setIdx] = useState(startIndex);
   const img = images[idx];
+  const currentSrc = useMemo(() => mediaSrc(img), [img?.id, img?.file_path, img?.image_data]);
 
   const prev = useCallback(
     (e: React.MouseEvent) => {
@@ -83,12 +84,11 @@ function Lightbox({
   }, [onClose, images.length]);
 
   const handleDownload = () => {
-    const src = mediaSrc(img);
     if (isVideo(img)) {
-      window.open(src, "_blank");
+      window.open(currentSrc, "_blank");
     } else {
       const a = document.createElement("a");
-      a.href = src;
+      a.href = currentSrc;
       a.download = img.filename;
       a.click();
     }
@@ -132,7 +132,7 @@ function Lightbox({
         {/* Media */}
         {isVideo(img) ? (
           <video
-            src={mediaSrc(img)}
+            src={currentSrc}
             controls
             loop
             autoPlay
@@ -140,7 +140,7 @@ function Lightbox({
           />
         ) : (
           <img
-            src={mediaSrc(img)}
+            src={currentSrc}
             alt={img.prompt ?? img.filename}
             className="max-w-[90vw] max-h-[75vh] object-contain rounded-md border border-white/10"
           />
@@ -177,7 +177,7 @@ function Lightbox({
 
 // ── Image tile ────────────────────────────────────────────────────────────────
 
-function ImageTile({
+const ImageTile = memo(function ImageTile({
   image,
   onClick,
   onDelete,
@@ -188,6 +188,10 @@ function ImageTile({
 }) {
   const [deleting, setDeleting] = useState(false);
 
+  // Memoized by the stable identity fields so the browser never sees a
+  // spurious src change when the parent re-renders with a new array reference.
+  const src = useMemo(() => mediaSrc(image), [image.id, image.file_path, image.image_data]);
+
   const handleDelete = async (e: React.MouseEvent) => {
     e.stopPropagation();
     setDeleting(true);
@@ -196,7 +200,6 @@ function ImageTile({
 
   const handleDownload = (e: React.MouseEvent) => {
     e.stopPropagation();
-    const src = mediaSrc(image);
     if (isVideo(image)) {
       window.open(src, "_blank");
     } else {
@@ -220,7 +223,7 @@ function ImageTile({
       <div className="aspect-square">
         {isVideo(image) ? (
           <video
-            src={mediaSrc(image)}
+            src={src}
             muted
             loop
             className="w-full h-full object-cover"
@@ -229,7 +232,7 @@ function ImageTile({
           />
         ) : (
           <img
-            src={mediaSrc(image)}
+            src={src}
             alt={image.prompt ?? image.filename}
             className="w-full h-full object-cover"
             loading="lazy"
@@ -261,7 +264,7 @@ function ImageTile({
       </div>
     </div>
   );
-}
+});
 
 // ── Upload area ───────────────────────────────────────────────────────────────
 
@@ -347,6 +350,7 @@ export function GalleryPanel() {
     images,
     scope,
     activeConversationId,
+    isInitialized,
     closeGallery,
     deleteImage,
     fetchImages,
@@ -447,7 +451,11 @@ export function GalleryPanel() {
             <UploadArea conversationId={activeConversationId} />
           )}
 
-          {filtered.length === 0 ? (
+          {!isInitialized ? (
+            <div className="flex items-center justify-center h-32">
+              <Loader2 className="w-5 h-5 animate-spin text-muted-foreground" />
+            </div>
+          ) : filtered.length === 0 ? (
             <EmptyState
               label={
                 tab === "generated"

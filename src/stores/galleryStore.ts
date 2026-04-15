@@ -7,6 +7,8 @@ interface GalleryStore {
   scope: "conversation" | "all";
   galleryOpen: boolean;
   activeConversationId: string | null;
+  /** True once at least one successful fetch has completed — used to suppress false EmptyState flash */
+  isInitialized: boolean;
 
   fetchImages: (conversationId: string) => Promise<void>;
   fetchAllImages: () => Promise<void>;
@@ -25,29 +27,44 @@ interface GalleryStore {
   setActiveConversation: (id: string | null) => void;
 }
 
+// Tracks in-flight fetch keys so we don't fire the same query twice concurrently.
+// "all" is the key for fetchAllImages; a conversationId string is the key for fetchImages.
+const _inFlight = new Set<string>();
+
 export const useGalleryStore = create<GalleryStore>((set, get) => ({
   images: [],
   scope: "conversation",
   galleryOpen: false,
   activeConversationId: null,
+  isInitialized: false,
 
   fetchImages: async (conversationId: string) => {
+    const key = conversationId;
+    if (_inFlight.has(key)) return;
+    _inFlight.add(key);
     try {
       const images = await invoke<GalleryImage[]>("list_gallery_images", {
         conversationId,
       });
-      set({ images, activeConversationId: conversationId });
+      set({ images, activeConversationId: conversationId, isInitialized: true });
     } catch (e) {
       console.error("Failed to fetch gallery images:", e);
+    } finally {
+      _inFlight.delete(key);
     }
   },
 
   fetchAllImages: async () => {
+    const key = "all";
+    if (_inFlight.has(key)) return;
+    _inFlight.add(key);
     try {
       const images = await invoke<GalleryImage[]>("list_all_gallery_images");
-      set({ images });
+      set({ images, isInitialized: true });
     } catch (e) {
       console.error("Failed to fetch all gallery images:", e);
+    } finally {
+      _inFlight.delete(key);
     }
   },
 
@@ -90,7 +107,7 @@ export const useGalleryStore = create<GalleryStore>((set, get) => ({
   toggleGallery: () => set((s) => ({ galleryOpen: !s.galleryOpen })),
 
   setScope: (scope) => {
-    set({ scope });
+    set({ scope, isInitialized: false });
     const { activeConversationId, fetchImages, fetchAllImages } = get();
     if (scope === "all") {
       fetchAllImages();

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, useCallback, memo } from "react";
 import { Plus, Trash2, MessageSquare, Settings2, Check, X, Images, Zap, Sparkles, Pencil } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
 import { useChatStore } from "@/stores/chatStore";
@@ -26,44 +26,115 @@ import { InputBar } from "./InputBar";
 import { ArtifactPanel } from "./ArtifactPanel";
 import { GalleryPanel } from "./GalleryPanel";
 import { cn, formatDate } from "@/lib/utils";
+import type { Message } from "@/lib/tauri";
+import type { ToolStep } from "@/stores/skillsStore";
+
+// ── Streaming bubble wrapper ───────────────────────────────────────────────────
+//
+// Isolated component that subscribes to streamingContent/streamingThinking/
+// isThinking. This means only this one component re-renders on every token —
+// the rest of the message list (and ChatView itself) remains stable.
+
+interface StreamingBubbleWrapperProps {
+  message: Message;
+  activeToolSteps: ToolStep[];
+  isStreaming: boolean;
+  personaAvatar?: string;
+  personaName?: string;
+  messagesEndRef: React.RefObject<HTMLDivElement | null>;
+}
+
+const StreamingBubbleWrapper = memo(function StreamingBubbleWrapper({
+  message,
+  activeToolSteps,
+  isStreaming,
+  personaAvatar,
+  personaName,
+  messagesEndRef,
+}: StreamingBubbleWrapperProps) {
+  const streamingContent = useChatStore((s) => s.streamingContent);
+  const streamingThinking = useChatStore((s) => s.streamingThinking);
+  const isThinking = useChatStore((s) => s.isThinking);
+
+  // Debounced auto-scroll during streaming so the view follows new tokens.
+  const scrollTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    if (!isStreaming) return;
+    if (scrollTimer.current) clearTimeout(scrollTimer.current);
+    scrollTimer.current = setTimeout(() => {
+      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    }, 80);
+    return () => {
+      if (scrollTimer.current) clearTimeout(scrollTimer.current);
+    };
+  }, [streamingContent, isStreaming, messagesEndRef]);
+
+  return (
+    <div className="space-y-2">
+      {activeToolSteps.length > 0 && (
+        <ToolCallMessage steps={activeToolSteps} isStreaming={isStreaming} />
+      )}
+      <MessageBubble
+        message={message}
+        liveContent={streamingContent}
+        liveThinking={streamingThinking}
+        isThinking={isThinking}
+        personaAvatar={personaAvatar}
+        personaName={personaName}
+      />
+    </div>
+  );
+});
 
 export function ChatView() {
-  const {
-    conversations,
-    activeConversation,
-    isStreaming,
-    isThinking,
-    streamingThinking,
-    fetchConversations,
-    openConversation,
-    createConversation,
-    updateConversation,
-    deleteConversation,
-    renameConversation,
-    retryLastMessage,
-    editAndResend,
-  } = useChatStore();
+  // Narrow per-field selectors so each subscription only re-renders ChatView
+  // when that specific field changes. Actions are stable Zustand references
+  // that never change — selecting them individually avoids whole-store churn.
 
-  const { collections, fetchCollections } = useRagStore();
-  const {
-    activeToolSteps,
-    completedToolSteps,
-    snapshotCompletedSteps,
-    clearToolSteps,
-    fetchTools,
-  } = useSkillsStore();
-  const { artifacts, panelOpen, fetchArtifacts, clearArtifacts } = useArtifactStore();
-  const {
-    galleryOpen,
-    toggleGallery,
-    fetchImages,
-    fetchAllImages,
-    scope: galleryScope,
-    setActiveConversation: setGalleryConversation,
-  } = useGalleryStore();
+  // chatStore — reactive fields
+  const conversations    = useChatStore((s) => s.conversations);
+  const activeConversation = useChatStore((s) => s.activeConversation);
+  const isStreaming      = useChatStore((s) => s.isStreaming);
+  // chatStore — stable actions (never cause re-renders)
+  const fetchConversations = useChatStore((s) => s.fetchConversations);
+  const openConversation   = useChatStore((s) => s.openConversation);
+  const createConversation = useChatStore((s) => s.createConversation);
+  const updateConversation = useChatStore((s) => s.updateConversation);
+  const deleteConversation = useChatStore((s) => s.deleteConversation);
+  const renameConversation = useChatStore((s) => s.renameConversation);
+  const retryLastMessage   = useChatStore((s) => s.retryLastMessage);
+  const editAndResend      = useChatStore((s) => s.editAndResend);
 
-  const { personas, fetchPersonas } = usePersonaStore();
-  const { templates, fetchTemplates } = useTemplateStore();
+  // ragStore
+  const collections    = useRagStore((s) => s.collections);
+  const fetchCollections = useRagStore((s) => s.fetchCollections);
+
+  // skillsStore
+  const activeToolSteps      = useSkillsStore((s) => s.activeToolSteps);
+  const completedToolSteps   = useSkillsStore((s) => s.completedToolSteps);
+  const snapshotCompletedSteps = useSkillsStore((s) => s.snapshotCompletedSteps);
+  const clearToolSteps       = useSkillsStore((s) => s.clearToolSteps);
+  const fetchTools           = useSkillsStore((s) => s.fetchTools);
+
+  // artifactStore
+  const artifacts      = useArtifactStore((s) => s.artifacts);
+  const panelOpen      = useArtifactStore((s) => s.panelOpen);
+  const fetchArtifacts = useArtifactStore((s) => s.fetchArtifacts);
+  const clearArtifacts = useArtifactStore((s) => s.clearArtifacts);
+
+  // galleryStore
+  const galleryOpen          = useGalleryStore((s) => s.galleryOpen);
+  const toggleGallery        = useGalleryStore((s) => s.toggleGallery);
+  const fetchImages          = useGalleryStore((s) => s.fetchImages);
+  const fetchAllImages       = useGalleryStore((s) => s.fetchAllImages);
+  const galleryScope         = useGalleryStore((s) => s.scope);
+  const setGalleryConversation = useGalleryStore((s) => s.setActiveConversation);
+
+  // personaStore / templateStore
+  const personas      = usePersonaStore((s) => s.personas);
+  const fetchPersonas = usePersonaStore((s) => s.fetchPersonas);
+  const templates     = useTemplateStore((s) => s.templates);
+  const fetchTemplates = useTemplateStore((s) => s.fetchTemplates);
 
   // Resolve the active persona for the current conversation (for avatar display)
   const activePersona = useMemo(() => {
@@ -114,9 +185,13 @@ export function ChatView() {
     return ordered.slice(0, 4);
   }, [templates]);
 
+  // Scroll when the number of finalized messages changes (conversation open,
+  // message sent, stream done). Per-token scroll is handled inside
+  // StreamingBubbleWrapper so this never fires during the token stream.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [activeConversation?.messages]);
+  }, [activeConversation?.messages.length]);
 
   // Reload artifacts and gallery whenever the active conversation changes.
   // Also clear any stale tool-step state from the previous conversation.
@@ -172,18 +247,37 @@ export function ChatView() {
     return () => { unlisten?.(); };
   }, [activeConversation?.id]);
 
-  // Re-fetch gallery whenever a new image is saved (e.g. from ComfyUI generation)
-  useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    listen<{ conversation_id: string }>("gallery_updated", () => {
+  // Re-fetch gallery whenever a new image is saved (e.g. from ComfyUI generation).
+  // Debounced so rapid back-to-back events only trigger one fetch.
+  const galleryRefreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const handleGalleryUpdated = useCallback(() => {
+    if (galleryRefreshTimer.current) clearTimeout(galleryRefreshTimer.current);
+    galleryRefreshTimer.current = setTimeout(() => {
       if (galleryScope === "all") {
         fetchAllImages();
       } else if (activeConversation?.id) {
         fetchImages(activeConversation.id);
       }
-    }).then((fn) => { unlisten = fn; });
-    return () => { unlisten?.(); };
-  }, [activeConversation?.id, galleryScope]);
+    }, 250);
+  }, [activeConversation?.id, galleryScope, fetchImages, fetchAllImages]);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    listen<{ conversation_id: string }>("gallery_updated", handleGalleryUpdated)
+      .then((fn) => { unlisten = fn; });
+    return () => {
+      unlisten?.();
+      if (galleryRefreshTimer.current) clearTimeout(galleryRefreshTimer.current);
+    };
+  }, [handleGalleryUpdated]);
+
+  // Stable handlers passed as props to MessageBubble — must not be recreated
+  // on every render or React.memo on MessageBubble would be defeated.
+  const handleEdit = useCallback(
+    (id: string, content: string) => editAndResend(id, content),
+    [editAndResend]
+  );
+  const handleRetry = useCallback(() => retryLastMessage(), [retryLastMessage]);
 
   // Instantly create and open a new conversation — no dialog
   const handleNewChat = async () => {
@@ -400,20 +494,35 @@ export function ChatView() {
               )}
 
               {/* Messages */}
-              <ScrollArea className="flex-1 px-4 py-4">
-                <div className="max-w-5xl mx-auto space-y-4">
+              <ScrollArea className="flex-1 overflow-x-hidden">
+                <div className="w-full max-w-4xl mx-auto px-4 py-4 space-y-4">
                   {activeConversation.messages
                     .filter((m) => m.role !== "system")
                     .map((message, idx, arr) => {
                       const isLast = idx === arr.length - 1;
                       const isLastAssistant = isLast && message.role === "assistant";
 
+                      // The streaming placeholder is rendered by its own isolated
+                      // component that subscribes to streamingContent directly.
+                      // This prevents all other bubbles from re-rendering on tokens.
+                      if (message.id === "streaming") {
+                        return (
+                          <StreamingBubbleWrapper
+                            key="streaming"
+                            message={message}
+                            activeToolSteps={activeToolSteps}
+                            isStreaming={isStreaming}
+                            personaAvatar={activePersona?.avatar}
+                            personaName={activePersona?.name}
+                            messagesEndRef={messagesEndRef}
+                          />
+                        );
+                      }
+
                       // Priority order for tool steps to display:
                       // 1. Active steps while the stream is live (current turn)
                       // 2. Completed snapshot from the just-finished stream
                       // 3. Persisted steps loaded from DB (historical messages)
-                      const showActiveSteps =
-                        isStreaming && isLast && message.id === "streaming" && activeToolSteps.length > 0;
                       const showCompletedSteps =
                         !isStreaming && isLastAssistant && completedToolSteps.length > 0;
                       const hasPersistedSteps =
@@ -423,32 +532,24 @@ export function ChatView() {
                         Array.isArray(message.tool_steps) &&
                         (message.tool_steps?.length ?? 0) > 0;
 
-                      const showToolSteps = showActiveSteps || showCompletedSteps || hasPersistedSteps;
-                      const stepsToShow = showActiveSteps
-                        ? activeToolSteps
-                        : showCompletedSteps
+                      const showToolSteps = showCompletedSteps || hasPersistedSteps;
+                      const stepsToShow = showCompletedSteps
                         ? completedToolSteps
                         : (message.tool_steps ?? []);
 
                       return (
                         <div key={message.id} className="space-y-2">
                           {showToolSteps && (
-                            <ToolCallMessage steps={stepsToShow} isStreaming={isStreaming && showActiveSteps} />
+                            <ToolCallMessage steps={stepsToShow} isStreaming={false} />
                           )}
                           <MessageBubble
                             message={message}
-                            liveThinking={message.id === "streaming" ? streamingThinking : undefined}
-                            isThinking={message.id === "streaming" ? isThinking : undefined}
                             personaAvatar={activePersona?.avatar}
                             personaName={activePersona?.name}
-                            onEdit={
-                              message.role === "user" && !isStreaming
-                                ? (id, content) => editAndResend(id, content)
-                                : undefined
-                            }
+                            onEdit={message.role === "user" && !isStreaming ? handleEdit : undefined}
                             onRegenerate={
-                              message.role === "assistant" && isLast && !isStreaming && message.id !== "streaming"
-                                ? retryLastMessage
+                              isLastAssistant && !isStreaming
+                                ? handleRetry
                                 : undefined
                             }
                           />

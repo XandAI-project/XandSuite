@@ -37,10 +37,13 @@ fn row_to_image(row: &rusqlite::Row<'_>) -> rusqlite::Result<GalleryImage> {
     })
 }
 
-/// Listing queries intentionally return '' for image_data to avoid sending
-/// megabytes of base64 to the frontend. The frontend uses file_path instead.
+/// For rows that have a file_path, image_data is omitted (empty string) to avoid
+/// sending megabytes of base64. For legacy rows without file_path, the actual
+/// image_data is returned so the frontend can still render them.
 const SELECT_COLS: &str =
-    "id, conversation_id, source, filename, '' AS image_data, mime_type, prompt, width, height, created_at, file_path";
+    "id, conversation_id, source, filename, \
+     CASE WHEN file_path IS NOT NULL THEN '' ELSE image_data END AS image_data, \
+     mime_type, prompt, width, height, created_at, COALESCE(file_path, '') AS file_path";
 
 #[tauri::command]
 pub fn list_gallery_images(

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect, memo } from "react";
 import {
   ChevronDown,
   ChevronRight,
@@ -258,7 +258,7 @@ function AlwaysVisibleVideoPreview({ raw }: { raw: string }) {
 
 // ── Generic tool step card ────────────────────────────────────────────────────
 
-function ToolStepCard({
+const ToolStepCard = memo(function ToolStepCard({
   step,
   isLast,
   isStreaming,
@@ -283,12 +283,15 @@ function ToolStepCard({
     ?.toLowerCase()
     .includes("generate_video");
 
-  // Auto-open code execution, image, and video generation steps so output is visible immediately
+  // Auto-open code execution, image, and video generation steps so output is visible immediately.
+  // Done in useEffect (not during render) to comply with React rules and avoid extra render cycles.
   const [autoOpened, setAutoOpened] = useState(false);
-  if ((isCodeExec || isImageGen || isVideoGen) && !pending && step.result !== undefined && !autoOpened) {
-    setAutoOpened(true);
-    setTimeout(() => setOpen(true), 0);
-  }
+  useEffect(() => {
+    if ((isCodeExec || isImageGen || isVideoGen) && !pending && step.result !== undefined && !autoOpened) {
+      setAutoOpened(true);
+      setOpen(true);
+    }
+  }, [step.result, pending, isCodeExec, isImageGen, isVideoGen, autoOpened]);
 
   return (
     <div
@@ -414,9 +417,9 @@ function ToolStepCard({
       )}
     </div>
   );
-}
+});
 
-export function ToolCallMessage({ steps, isStreaming }: Props) {
+export const ToolCallMessage = memo(function ToolCallMessage({ steps, isStreaming }: Props) {
   if (steps.length === 0) return null;
 
   return (
@@ -431,4 +434,4 @@ export function ToolCallMessage({ steps, isStreaming }: Props) {
       ))}
     </div>
   );
-}
+});

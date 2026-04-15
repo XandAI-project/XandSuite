@@ -7,9 +7,9 @@ import {
   User, Bot, Copy, Check, ChevronDown, ChevronRight, Brain,
   Gauge, Pencil, RefreshCw, X,
   FileText, FileCode, FileJson, File,
-  Code, Globe, AlignLeft, Terminal, BookOpen,
+  Code, Globe, AlignLeft, Terminal, BookOpen, ImageIcon,
 } from "lucide-react";
-import { useState, useRef, useEffect, useMemo } from "react";
+import { useState, useRef, useEffect, useMemo, memo } from "react";
 import { cn, resolveGallerySrc } from "@/lib/utils";
 import type { Message, ArtifactType, AttachmentMeta, ImageMeta } from "@/lib/tauri";
 import { ArtifactCard } from "./ArtifactCard";
@@ -243,6 +243,12 @@ function PreparingResponseBadge() {
 
 interface Props {
   message: Message;
+  /**
+   * Live content override for the streaming placeholder message. The streaming
+   * bubble reads this from a dedicated subscription so the rest of the message
+   * list (whose `message.content` is stable) can skip reconciliation entirely.
+   */
+  liveContent?: string;
   liveThinking?: string;
   isThinking?: boolean;
   onEdit?: (messageId: string, newContent: string) => void;
@@ -430,13 +436,39 @@ const LOCAL_GALLERY_RE = /^http:\/\/localhost:\d+\/images\/([^/?#]+)/;
 
 function GalleryAwareImage({ src, alt }: { src?: string; alt?: string }) {
   const galleryImages = useGalleryStore((s) => s.images);
+  const [broken, setBroken] = useState(false);
+
+  // Stable-src cache: once we successfully resolve a real URL for this src,
+  // we hold it here so gallery refetches (which temporarily clear `images`)
+  // never cause the image to flicker back to a placeholder.
+  const prevSrcRef   = useRef<string | undefined>(undefined);
+  const stableSrcRef = useRef<string | undefined>(undefined);
 
   const galleryId = src ? (src.match(LOCAL_GALLERY_RE)?.[1] ?? null) : null;
   const entry = galleryId ? galleryImages.find((img) => img.id === galleryId) : null;
 
-  // When a gallery URL can't be resolved from the current store snapshot, actively
-  // re-fetch. Uses getState() inside the callbacks so we always read fresh values
-  // regardless of React's render cycle or closure staleness.
+  // When src prop itself changes (a different image), drop the cached URL.
+  if (prevSrcRef.current !== src) {
+    prevSrcRef.current  = src;
+    stableSrcRef.current = undefined;
+  }
+
+  // Compute the best URL for this render, and cache it if it's a real one.
+  let displaySrc: string | undefined;
+  if (entry) {
+    const resolved = resolveGallerySrc(entry);
+    if (resolved) {
+      stableSrcRef.current = resolved; // update cache
+      displaySrc = resolved;
+    }
+  }
+  if (!displaySrc) {
+    // Fall back to whatever we successfully showed before (survives gallery refetches).
+    // For non-gallery URLs (plain http/data) use src directly.
+    displaySrc = stableSrcRef.current ?? (!galleryId ? src : undefined);
+  }
+
+  // Trigger a gallery fetch when the entry is still missing.
   useEffect(() => {
     if (!galleryId || entry) return;
 
@@ -450,30 +482,46 @@ function GalleryAwareImage({ src, alt }: { src?: string; alt?: string }) {
     };
 
     tryFetch();
-    // Retry after 1 s in case the first fetch races with the DB write
     const timer = setTimeout(tryFetch, 1000);
     return () => clearTimeout(timer);
-  }, [galleryId]); // intentionally excludes `entry` to avoid re-triggering once found
+  }, [galleryId]); // `entry` intentionally excluded — only re-trigger when galleryId changes
 
-  const resolvedSrc = useMemo(() => {
-    if (!src) return src;
-    if (entry) {
-      const resolved = resolveGallerySrc(entry);
-      if (resolved) return resolved;
-    }
-    return src;
-  }, [src, entry]);
+  // Clear broken flag whenever we obtain a fresh valid displaySrc.
+  useEffect(() => {
+    if (displaySrc && broken) setBroken(false);
+  }, [displaySrc]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  if (isVideoUrl(resolvedSrc)) return <InlineVideo src={resolvedSrc!} />;
+  if (isVideoUrl(displaySrc)) return <InlineVideo src={displaySrc!} />;
+
+  if (broken) {
+    return (
+      <span className="inline-flex items-center gap-1.5 px-2 py-1 rounded-md bg-muted/50 border border-border text-xs text-muted-foreground my-1">
+        <ImageIcon className="w-3 h-3 shrink-0" />
+        <span className="truncate max-w-[180px]">{alt || "Image"}</span>
+      </span>
+    );
+  }
+
+  if (!displaySrc) {
+    // Gallery entry not yet loaded — show a skeleton instead of a broken img tag.
+    return (
+      <div className="rounded-md border border-border bg-muted/30 animate-pulse w-48 h-32 my-2" />
+    );
+  }
 
   return (
     <img
-      src={resolvedSrc}
+      src={displaySrc}
       alt={alt ?? ""}
       className="rounded-md border border-border max-w-full max-h-96 object-contain my-2"
+      onError={() => setBroken(true)}
     />
   );
 }
+
+// Module-level stable arrays — defined once so React never sees a new reference.
+const MD_REMARK_PLUGINS = [remarkGfm] as const;
+const MD_REHYPE_PLUGINS = [rehypeRaw] as const;
 
 // ── Markdown components shared between message + panel ────────────────────────
 
@@ -524,7 +572,7 @@ export const markdownComponents: React.ComponentProps<typeof ReactMarkdown>["com
 
 // ── Main component ────────────────────────────────────────────────────────────
 
-export function MessageBubble({ message, liveThinking, isThinking, onEdit, onRegenerate, personaAvatar, personaName }: Props) {
+export const MessageBubble = memo(function MessageBubble({ message, liveContent, liveThinking, isThinking, onEdit, onRegenerate, personaAvatar, personaName }: Props) {
   const [copied, setCopied] = useState(false);
   const [thinkOpen, setThinkOpen] = useState(false);
   const [editing, setEditing] = useState(false);
@@ -532,7 +580,13 @@ export function MessageBubble({ message, liveThinking, isThinking, onEdit, onReg
   const editRef = useRef<HTMLTextAreaElement>(null);
   const isUser = message.role === "user";
 
-  const { artifacts } = useArtifactStore();
+  // Narrow selector: only re-render when the artifacts array itself changes,
+  // not when panelOpen / activeArtifactId change.
+  const artifacts = useArtifactStore((s) => s.artifacts);
+
+  // For the streaming placeholder, liveContent carries the live token stream.
+  // All other messages pass undefined, so displayContent === message.content (stable).
+  const displayContent = liveContent ?? message.content;
 
   useEffect(() => {
     if (editing && editRef.current) {
@@ -570,14 +624,14 @@ export function MessageBubble({ message, liveThinking, isThinking, onEdit, onReg
 
   // During streaming, detect an in-progress artifact and show a badge instead of raw content
   const streamingArtifact = !isUser && isStreamingMsg
-    ? detectStreamingArtifact(message.content)
+    ? detectStreamingArtifact(displayContent)
     : null;
 
   // Parse artifacts from completed assistant messages
   const { strippedContent, parsedArtifacts } = !isUser && !streamingArtifact
-    ? parseArtifacts(message.content)
+    ? parseArtifacts(displayContent)
     : {
-        strippedContent: stripToolCallXml(streamingArtifact?.textBefore ?? message.content),
+        strippedContent: stripToolCallXml(streamingArtifact?.textBefore ?? displayContent),
         parsedArtifacts: [],
       };
 
@@ -602,7 +656,7 @@ export function MessageBubble({ message, liveThinking, isThinking, onEdit, onReg
   // (Removed auto-open to prevent jarring layout jumps during streaming.)
 
   return (
-    <div className={cn("flex gap-3 group", isUser && "flex-row-reverse")} tabIndex={0}>
+    <div className={cn("flex gap-3 group min-w-0", isUser && "flex-row-reverse")} tabIndex={0}>
       {/* Avatar */}
       {isUser ? (
         <div className="flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center bg-primary">
@@ -638,7 +692,7 @@ export function MessageBubble({ message, liveThinking, isThinking, onEdit, onReg
         </div>
       )}
 
-      <div className={cn("flex flex-col max-w-[80%] gap-1.5", isUser && "items-end")}>
+      <div className={cn("flex flex-col max-w-[80%] min-w-0 gap-1.5", isUser && "items-end")}>
 
         {/* Thinking section */}
         {!isUser && (isThinking || thinkingText) && (
@@ -697,7 +751,7 @@ export function MessageBubble({ message, liveThinking, isThinking, onEdit, onReg
           </div>
         ) : (
           <div className={cn(
-            "relative rounded-xl px-4 py-3 text-sm",
+            "relative rounded-xl px-4 py-3 text-sm min-w-0 w-full",
             isUser
               ? "glass-primary text-white"
               : "bg-card border border-border text-foreground"
@@ -727,13 +781,13 @@ export function MessageBubble({ message, liveThinking, isThinking, onEdit, onReg
                     ))}
                   </div>
                 )}
-                <p className="whitespace-pre-wrap break-words">{message.content}</p>
+                <p className="whitespace-pre-wrap break-words overflow-wrap-anywhere">{message.content}</p>
               </>
             ) : (
               <>
-                <div className="prose prose-invert prose-sm max-w-none">
+                <div className="prose prose-invert prose-sm max-w-none break-words overflow-hidden">
                   {strippedContent ? (
-                    <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeRaw]} components={markdownComponents}>
+                    <ReactMarkdown remarkPlugins={MD_REMARK_PLUGINS} rehypePlugins={MD_REHYPE_PLUGINS} components={markdownComponents}>
                       {strippedContent}
                     </ReactMarkdown>
                   ) : isStreamingMsg && !streamingArtifact && !pendingCodeStep && isThinking ? (
@@ -846,4 +900,4 @@ export function MessageBubble({ message, liveThinking, isThinking, onEdit, onReg
       </div>
     </div>
   );
-}
+});

@@ -128,10 +128,14 @@ export function FlowCanvas() {
   const [nodeExecStatus, setNodeExecStatus] = useState<Record<string, "running" | "done" | "error">>({});
   const [execStep, setExecStep] = useState<{ step: number; total: number; label: string } | null>(null);
   const unlistenRef = useRef<(() => void) | null>(null);
+  const execStatusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Clean up listener if the component unmounts mid-execution
+  // Clean up listener and any pending timers if the component unmounts mid-execution
   useEffect(() => {
-    return () => { unlistenRef.current?.(); };
+    return () => {
+      unlistenRef.current?.();
+      if (execStatusTimerRef.current) clearTimeout(execStatusTimerRef.current);
+    };
   }, []);
 
   const selectedNode = useMemo(
@@ -351,7 +355,8 @@ export function FlowCanvas() {
     } finally {
       setIsExecuting(false);
       setExecStep(null);
-      setTimeout(() => setNodeExecStatus({}), 2500);
+      if (execStatusTimerRef.current) clearTimeout(execStatusTimerRef.current);
+      execStatusTimerRef.current = setTimeout(() => setNodeExecStatus({}), 2500);
       unlisten();
       unlistenRef.current = null;
     }

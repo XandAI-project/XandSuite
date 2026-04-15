@@ -339,19 +339,13 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         // Count tokens roughly by whitespace-split (fast, good-enough approximation)
         tokenCount += p.token.split(/\s+/).filter(Boolean).length || 1;
 
-        set((state) => ({
-          streamingContent: state.streamingContent + p.token,
+        // Only update streamingContent — do NOT rebuild the messages array here.
+        // The streaming MessageBubble reads streamingContent directly from the
+        // store via its own subscription so the full message list stays stable
+        // and all other bubbles skip reconciliation.
+        set((s) => ({
+          streamingContent: s.streamingContent + p.token,
           isThinking: false,
-          activeConversation: state.activeConversation
-            ? {
-                ...state.activeConversation,
-                messages: state.activeConversation.messages.map((m) =>
-                  m.id === "streaming"
-                    ? { ...m, content: state.streamingContent + p.token }
-                    : m
-                ),
-              }
-            : null,
         }));
       }
     });

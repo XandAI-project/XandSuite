@@ -400,7 +400,10 @@ export function ModelBrowser() {
     fetchDownloadedModels();
     fetchStatus();
     const unlistenPromise = listenToDownloads();
-    return () => { unlistenPromise.then((fn) => fn()); };
+    return () => {
+      unlistenPromise.then((fn) => fn());
+      if (searchTimer.current) clearTimeout(searchTimer.current);
+    };
   }, []);
 
   const handleSearch = (q: string) => {

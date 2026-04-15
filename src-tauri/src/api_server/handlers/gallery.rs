@@ -21,7 +21,8 @@ pub struct GalleryQuery {
 
 fn query_gallery(db: &crate::db::AppDb, conv_id: Option<&str>) -> rusqlite::Result<Vec<Value>> {
     let sql_base = "SELECT id, conversation_id, source, filename, mime_type, \
-                    '' AS image_data, created_at, COALESCE(file_path, '') AS file_path \
+                    CASE WHEN file_path IS NOT NULL THEN '' ELSE image_data END AS image_data, \
+                    created_at, COALESCE(file_path, '') AS file_path \
                     FROM gallery_images";
     if let Some(cid) = conv_id {
         let mut stmt = db.conn.prepare(
