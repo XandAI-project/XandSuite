@@ -163,6 +163,50 @@ fn recommend_variant(gpu_name: &str) -> (String, String) {
         || lower.contains("navi");
 
     if is_amd {
+        // AMD APU / integrated graphics (Ryzen built-in Radeon) use the same
+        // driver stack as discrete Radeon but Vulkan compute is unreliable on
+        // Linux for these parts.  The CPU build is stable and fast enough.
+        // Discrete cards (RX 6xxx / RX 7xxx / RX 9xxx, Vega, Navi) do work
+        // well with Vulkan on Linux.
+        //
+        // APU detection heuristics (lspci codename or model-number patterns):
+        //   Raphael   — Ryzen 7000 desktop   (Radeon 610M / 700M)
+        //   Rembrandt — Ryzen 6000 mobile     (Radeon 680M)
+        //   Phoenix   — Ryzen 7040 mobile     (Radeon 780M)
+        //   Hawk Point — Ryzen 8040 mobile
+        //   Strix Point — Ryzen AI 300
+        //   Mendocino — budget Ryzen 7020
+        //   Model numbers ending in 'M' (mobile/integrated suffix)
+        #[cfg(target_os = "linux")]
+        {
+            let is_apu = lower.contains("raphael")
+                || lower.contains("rembrandt")
+                || lower.contains("phoenix")
+                || lower.contains("hawk point")
+                || lower.contains("strix")
+                || lower.contains("mendocino")
+                || lower.contains("integrated")
+                // Integrated Radeon model numbers: 610M, 680M, 700M, 740M,
+                // 760M, 780M, 890M, etc.  Match "radeon NNNm" patterns.
+                || {
+                    let apu_models = ["610m","660m","680m","700m","740m",
+                                      "760m","780m","890m","radeon m"];
+                    apu_models.iter().any(|m| lower.contains(m))
+                };
+
+            if is_apu {
+                return (
+                    "cpu".into(),
+                    format!(
+                        "Detected AMD integrated/APU graphics ({}).\n\
+                         Vulkan compute is unreliable on these GPUs under Linux — \
+                         CPU build recommended.",
+                        gpu_name
+                    ),
+                );
+            }
+        }
+
         return (
             "vulkan".into(),
             format!(
