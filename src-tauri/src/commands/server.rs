@@ -335,61 +335,139 @@ async fn probe_running_server(port: u16, last_known_model: Option<&str>) -> Opti
     last_known_model.map(String::from)
 }
 
-/// On Linux, scan `bin_dir` for shared-library files (`*.so` / `*.so.*`) that
-/// are 0 bytes — a symptom of the old extractor writing empty files instead of
-/// real symlinks.  When any are found the entire bin directory is removed so a
-/// clean re-download produces correct symlinks.
+/// On Linux, scan `bin_dir` for shared-library files that are 0-byte regular
+/// files — a symptom of the old extractor writing empty placeholder files
+/// instead of real OS symlinks.
 ///
-/// Returns `Err` with a user-facing message when corruption is detected.
+/// **Repair strategy (preferred):**
+/// Each corrupt file `libXXX.so.N` should be a symlink pointing to the next
+/// link in the versioned chain (e.g. `libXXX.so.0` → `libXXX.so.0.0.8795`).
+/// We find the real non-zero target already on disk and replace the empty file
+/// with a proper symlink — no re-download required.
+///
+/// **Fallback:** if a corrupt file has no resolvable target (the versioned
+/// binary is also missing), the entire bin directory is purged so the next
+/// download starts clean, and an `Err` is returned asking the user to
+/// re-download.
 #[cfg(target_os = "linux")]
-fn check_and_purge_corrupt_libs(bin_dir: &std::path::Path) -> Result<(), String> {
-    let entries = match std::fs::read_dir(bin_dir) {
-        Ok(e) => e,
-        Err(_) => return Ok(()), // bin_dir does not exist yet — nothing to check
+fn check_and_repair_libs(bin_dir: &std::path::Path) -> Result<(), String> {
+    use std::os::unix::fs as unix_fs;
+
+    let read_dir = |p: &std::path::Path| -> Vec<(String, std::path::PathBuf, std::fs::Metadata)> {
+        std::fs::read_dir(p)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| {
+                let meta = e.path().symlink_metadata().ok()?;
+                Some((e.file_name().to_string_lossy().into_owned(), e.path(), meta))
+            })
+            .collect()
     };
 
-    let mut corrupt: Vec<String> = Vec::new();
+    let all = read_dir(bin_dir);
 
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        // Match libXxx.so and libXxx.so.0 / libXxx.so.0.0.8795 etc.
-        if !name.contains(".so") {
-            continue;
-        }
-        // Use symlink_metadata so we see the symlink itself, not what it points to.
-        if let Ok(meta) = entry.path().symlink_metadata() {
-            if meta.file_type().is_symlink() {
-                continue; // Proper symlink — fine.
-            }
-            if meta.is_file() && meta.len() == 0 {
-                corrupt.push(name);
+    // Partition into: real non-zero .so binaries, 0-byte corrupt .so files,
+    // and already-correct symlinks (which we leave untouched).
+    let mut real_targets: Vec<String> = Vec::new();
+    let mut corrupt:      Vec<String> = Vec::new();
+
+    for (name, _, meta) in &all {
+        if !name.contains(".so") { continue; }
+        if meta.file_type().is_symlink() { continue; } // already correct
+        if meta.is_file() {
+            if meta.len() > 0 {
+                real_targets.push(name.clone());
+            } else {
+                corrupt.push(name.clone());
             }
         }
     }
 
-    if corrupt.is_empty() {
-        return Ok(());
-    }
+    if corrupt.is_empty() { return Ok(()); }
 
     log::warn!(
-        "Detected {} corrupted shared-library file(s) in {:?}: {:?}. \
-         Purging bin directory so a fresh download creates correct symlinks.",
+        "Detected {} corrupted (0-byte) shared-library file(s) in {:?}: {:?}",
         corrupt.len(), bin_dir, corrupt
     );
 
-    // Remove everything in bin_dir so the re-download starts clean.
-    if let Ok(entries) = std::fs::read_dir(bin_dir) {
-        for entry in entries.flatten() {
-            let _ = std::fs::remove_file(entry.path());
+    // --- Pass 1: link each corrupt name to a real (non-zero) versioned file ---
+    // e.g. "libmtmd.so.0" (0-byte) → "libmtmd.so.0.0.8795" (real binary).
+    // A valid target must START WITH `corrupt_name + "."` (more version digits).
+    let mut still_corrupt: Vec<String> = Vec::new();
+
+    for name in &corrupt {
+        let prefix = format!("{}.", name); // e.g. "libmtmd.so.0."
+        let target = real_targets.iter().find(|t| t.starts_with(&prefix));
+
+        if let Some(t) = target {
+            let link_path = bin_dir.join(name);
+            let _ = std::fs::remove_file(&link_path);
+            match unix_fs::symlink(t, &link_path) {
+                Ok(_) => log::info!("Repaired symlink: {} -> {}", name, t),
+                Err(e) => {
+                    log::warn!("Could not create symlink {} -> {}: {}", name, t, e);
+                    still_corrupt.push(name.clone());
+                }
+            }
+        } else {
+            still_corrupt.push(name.clone());
         }
     }
 
+    // --- Pass 2: link names whose target is itself a (now-repaired) symlink ---
+    // e.g. "libmtmd.so" (0-byte) → "libmtmd.so.0" (just repaired to a symlink).
+    let mut unresolved: Vec<String> = Vec::new();
+
+    for name in still_corrupt {
+        let prefix = format!("{}.", name);
+        // Re-read the directory so we see the symlinks created in pass 1.
+        let refreshed = read_dir(bin_dir);
+        let target = refreshed.iter().find(|(n, _, m)| {
+            n.starts_with(&prefix) && (m.file_type().is_symlink() || (m.is_file() && m.len() > 0))
+        });
+
+        if let Some((t, _, _)) = target {
+            let link_path = bin_dir.join(&name);
+            let _ = std::fs::remove_file(&link_path);
+            match unix_fs::symlink(t, &link_path) {
+                Ok(_) => log::info!("Repaired symlink (pass 2): {} -> {}", name, t),
+                Err(e) => {
+                    log::warn!("Could not create symlink {} -> {}: {}", name, t, e);
+                    unresolved.push(name);
+                }
+            }
+        } else {
+            unresolved.push(name);
+        }
+    }
+
+    if unresolved.is_empty() {
+        log::info!(
+            "All shared-library symlinks in {:?} have been repaired in-place.",
+            bin_dir
+        );
+        return Ok(());
+    }
+
+    // Some files have no resolvable target — the versioned binary is missing.
+    // Purge so the next download starts completely clean.
+    log::warn!(
+        "Could not repair {} file(s) (no versioned target on disk): {:?}. \
+         Purging bin directory.",
+        unresolved.len(), unresolved
+    );
+    for (_, path, _) in read_dir(bin_dir) {
+        let _ = std::fs::remove_file(path);
+    }
+
     Err(format!(
-        "Shared libraries are corrupted ({} zero-byte .so file(s) detected: {}).\n\
+        "Shared libraries are corrupted and could not be repaired automatically \
+         ({} file(s) with no versioned target: {}).\n\
          The bin directory has been cleared — please re-download llama-server \
          in the Models tab.",
-        corrupt.len(),
-        corrupt.join(", ")
+        unresolved.len(),
+        unresolved.join(", ")
     ))
 }
 
@@ -408,10 +486,10 @@ pub async fn start_local_server(
     let data_dir = state.data_dir.clone();
     let port = settings.llama_server_port;
 
-    // Linux only: detect the 0-byte .so files left by the old extractor and
-    // force a re-download before trying to spawn a server that will crash.
+    // Linux only: detect 0-byte .so files left by the old extractor.
+    // Attempts in-place symlink repair first; only purges if repair fails.
     #[cfg(target_os = "linux")]
-    check_and_purge_corrupt_libs(&data_dir.join("bin"))?;
+    check_and_repair_libs(&data_dir.join("bin"))?;
 
     // Always update mmproj from the caller's value so stale paths never
     // bleed across models.  Explicitly clearing (None or empty string) removes
