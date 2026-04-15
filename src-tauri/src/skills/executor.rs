@@ -830,16 +830,16 @@ fn maybe_save_video_to_gallery(
 }
 
 /// If `result_text` looks like a successful image generation or editing result
-/// (has `image_url` and `status: "generated"`), downloads the image, stores the
-/// bytes as base64 in the gallery, and rewrites `image_url` to a stable local
-/// URL (`http://localhost:{port}/images/{id}`) that works fully offline.
+/// (has `image_url` and `status: "generated"`), downloads the image, writes it
+/// to `{data_dir}/gallery/{id}.ext` on disk, and stores the file path in the DB.
+/// This avoids base64 bloat in SQLite and makes images loadable via Tauri's
+/// `asset://` protocol — no HTTP round-trip through the WebView.
 async fn maybe_save_image_to_gallery(
     result_text: &str,
     fn_name: &str,
     app: &tauri::AppHandle,
     conv_id: &str,
 ) -> String {
-    // Process tool calls that produce an image_url result (generation or editing).
     let fn_lower = fn_name.to_lowercase();
     if !fn_lower.contains("generate_image") && !fn_lower.contains("edit_image") {
         return result_text.to_string();
@@ -856,7 +856,6 @@ async fn maybe_save_image_to_gallery(
         return result_text.to_string();
     }
 
-    // Skip if gallery_id is already present (e.g. set by a previous pass).
     if result_val.get("gallery_id").is_some() {
         return result_text.to_string();
     }
@@ -870,85 +869,125 @@ async fn maybe_save_image_to_gallery(
     let width = result_val.get("width").and_then(|v| v.as_i64());
     let height = result_val.get("height").and_then(|v| v.as_i64());
 
-    let mime = if filename.to_lowercase().ends_with(".webp") {
-        "image/webp"
+    let ext = if filename.to_lowercase().ends_with(".webp") {
+        "webp"
     } else if filename.to_lowercase().ends_with(".jpg") || filename.to_lowercase().ends_with(".jpeg") {
-        "image/jpeg"
+        "jpg"
     } else {
-        "image/png"
+        "png"
     };
-
-    // Download the image and store its bytes as base64.
-    // This makes the gallery entry self-contained and fully offline.
-    let image_b64 = if image_url.starts_with("http://") || image_url.starts_with("https://") {
-        match reqwest::get(&image_url).await {
-            Ok(resp) => match resp.bytes().await {
-                Ok(b) => {
-                    use base64::Engine as _;
-                    base64::engine::general_purpose::STANDARD.encode(&b)
-                }
-                Err(e) => {
-                    log::warn!("[image-gallery] Could not read downloaded image bytes: {}", e);
-                    // Fall back to storing the URL so the proxy endpoint can serve it.
-                    image_url.clone()
-                }
-            },
-            Err(e) => {
-                log::warn!("[image-gallery] Could not download image '{}': {}", image_url, e);
-                image_url.clone()
-            }
-        }
-    } else {
-        // Already base64 or a file path — store as-is.
-        image_url.clone()
+    let mime = match ext {
+        "webp" => "image/webp",
+        "jpg" => "image/jpeg",
+        _ => "image/png",
     };
 
     let gid = uuid::Uuid::new_v4().to_string();
-    let now = chrono::Utc::now().to_rfc3339();
 
     use tauri::Manager;
     let state = app.state::<crate::state::AppState>();
+    let gallery_dir = state.data_dir.join("gallery");
+    let _ = std::fs::create_dir_all(&gallery_dir);
+    let dest_path = gallery_dir.join(format!("{}.{}", gid, ext));
+
+    // Download with timeout + retry, write directly to disk (no base64).
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
+    let mut file_path_str = String::new();
+    let mut fallback_image_data = String::new();
+
+    if image_url.starts_with("http://") || image_url.starts_with("https://") {
+        let mut downloaded = false;
+        for attempt in 1..=3u32 {
+            match client.get(&image_url).send().await {
+                Ok(resp) => match resp.bytes().await {
+                    Ok(bytes) => {
+                        match std::fs::write(&dest_path, &bytes) {
+                            Ok(_) => {
+                                file_path_str = dest_path.to_string_lossy().to_string();
+                                downloaded = true;
+                                log::info!(
+                                    "[image-gallery] Saved {} bytes to {} (attempt {})",
+                                    bytes.len(), file_path_str, attempt
+                                );
+                            }
+                            Err(e) => {
+                                log::warn!("[image-gallery] fs::write failed: {} (attempt {})", e, attempt);
+                            }
+                        }
+                        break;
+                    }
+                    Err(e) => {
+                        log::warn!("[image-gallery] read bytes failed: {} (attempt {})", e, attempt);
+                    }
+                },
+                Err(e) => {
+                    log::warn!("[image-gallery] download failed: {} (attempt {})", e, attempt);
+                }
+            }
+            if attempt < 3 {
+                tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
+            }
+        }
+        if !downloaded {
+            log::warn!("[image-gallery] All 3 download attempts failed, storing URL as fallback");
+            fallback_image_data = image_url.clone();
+        }
+    } else {
+        fallback_image_data = image_url.clone();
+    }
+
+    let now = chrono::Utc::now().to_rfc3339();
     let mobile_port = state.settings.lock().unwrap().mobile_api_port;
+
+    // image_data is empty when file_path is set; holds URL/base64 only as legacy fallback.
+    let db_image_data = if file_path_str.is_empty() { &fallback_image_data } else { "" };
+    let db_file_path: Option<&str> = if file_path_str.is_empty() { None } else { Some(&file_path_str) };
 
     {
         let db = state.db.lock().unwrap();
         match db.conn.execute(
             "INSERT INTO gallery_images \
              (id, conversation_id, source, filename, image_data, mime_type, \
-              prompt, width, height, created_at) \
-             VALUES (?1, ?2, 'generated', ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+              prompt, width, height, created_at, file_path) \
+             VALUES (?1, ?2, 'generated', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             sql_params![
                 gid,
                 conv_id,
                 filename,
-                image_b64,
+                db_image_data,
                 mime,
                 prompt,
                 width,
                 height,
-                now
+                now,
+                db_file_path
             ],
         ) {
             Ok(_) => {
                 log::info!(
-                    "[image-gallery] Saved image to gallery: id={} conv={} file={}",
-                    gid, conv_id, filename
+                    "[image-gallery] Saved to gallery: id={} conv={} file_path={:?}",
+                    gid, conv_id, db_file_path
                 );
-                // Rewrite image_url to the stable local serving endpoint.
                 let local_url = format!("http://localhost:{}/images/{}", mobile_port, gid);
                 result_val["gallery_id"] = json!(gid);
                 result_val["image_url"] = json!(local_url);
+                if let Some(fp) = db_file_path {
+                    result_val["file_path"] = json!(fp);
+                }
             }
             Err(e) => {
                 log::error!(
-                    "[image-gallery] Failed to save image to gallery: {} (conv_id={}, filename={})",
+                    "[image-gallery] Failed to insert gallery row: {} (conv_id={}, filename={})",
                     e, conv_id, filename
                 );
             }
         }
     }
 
-    // Emit gallery_updated so the frontend refreshes.
     if result_val.get("gallery_id").is_some() {
         let _ = app.emit(
             "gallery_updated",

@@ -375,6 +375,9 @@ impl AppDb {
         let _ = self.conn.execute_batch(
             "ALTER TABLE conversations ADD COLUMN summary_up_to_rowid INTEGER NOT NULL DEFAULT 0;"
         );
+        let _ = self.conn.execute_batch(
+            "ALTER TABLE gallery_images ADD COLUMN file_path TEXT;"
+        );
 
         // Personas table (idempotent)
         self.conn.execute_batch(r#"

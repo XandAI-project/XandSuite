@@ -10,7 +10,7 @@ import {
   Code, Globe, AlignLeft, Terminal, BookOpen,
 } from "lucide-react";
 import { useState, useRef, useEffect, useMemo } from "react";
-import { cn } from "@/lib/utils";
+import { cn, resolveGallerySrc } from "@/lib/utils";
 import type { Message, ArtifactType, AttachmentMeta, ImageMeta } from "@/lib/tauri";
 import { ArtifactCard } from "./ArtifactCard";
 import { useArtifactStore } from "@/stores/artifactStore";
@@ -458,11 +458,9 @@ function GalleryAwareImage({ src, alt }: { src?: string; alt?: string }) {
   const resolvedSrc = useMemo(() => {
     if (!src) return src;
     if (entry) {
-      const d = entry.image_data;
-      if (d.startsWith("http://") || d.startsWith("https://")) return d;
-      return `data:${entry.mime_type};base64,${d}`;
+      const resolved = resolveGallerySrc(entry);
+      if (resolved) return resolved;
     }
-    // Fallback: the API server serves the image at this URL without auth
     return src;
   }, [src, entry]);
 

@@ -12,7 +12,7 @@ import {
 } from "lucide-react";
 import { useGalleryStore } from "@/stores/galleryStore";
 import type { GalleryImage } from "@/lib/tauri";
-import { cn } from "@/lib/utils";
+import { cn, resolveGallerySrc } from "@/lib/utils";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -22,13 +22,9 @@ function isVideo(img: GalleryImage): boolean {
 
 function mediaSrc(img: GalleryImage): string {
   if (isVideo(img)) {
-    return img.image_data; // videos store the URL directly, not base64
-  }
-  // Package-generated images also store a URL (ComfyUI /view endpoint) rather than base64
-  if (img.image_data.startsWith("http://") || img.image_data.startsWith("https://")) {
     return img.image_data;
   }
-  return `data:${img.mime_type};base64,${img.image_data}`;
+  return resolveGallerySrc(img) || img.image_data;
 }
 
 // imgSrc alias removed — use mediaSrc directly

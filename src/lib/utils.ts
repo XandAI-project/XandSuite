@@ -1,5 +1,7 @@
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
+import { convertFileSrc } from "@tauri-apps/api/core";
+import type { GalleryImage } from "./tauri";
 
 /**
  * Converts a byte array to a base64 string safely for any file size.
@@ -65,4 +67,22 @@ export function debounce<T extends (...args: unknown[]) => unknown>(
     clearTimeout(timer);
     timer = setTimeout(() => fn(...args), delay);
   };
+}
+
+/**
+ * Resolve the display URL for a gallery image.
+ * Priority: on-disk file (via asset:// protocol) > base64 data URL > raw http URL.
+ */
+export function resolveGallerySrc(img: GalleryImage): string {
+  if (img.file_path) {
+    try {
+      return convertFileSrc(img.file_path);
+    } catch {
+      // convertFileSrc unavailable outside Tauri — fall through
+    }
+  }
+  const d = img.image_data;
+  if (d && (d.startsWith("http://") || d.startsWith("https://"))) return d;
+  if (d && d.length > 0) return `data:${img.mime_type};base64,${d}`;
+  return "";
 }

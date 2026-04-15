@@ -11,7 +11,7 @@ import {
   ImageIcon,
   Video,
 } from "lucide-react";
-import { cn } from "@/lib/utils";
+import { cn, resolveGallerySrc } from "@/lib/utils";
 import type { ToolStep } from "@/stores/skillsStore";
 import { useGalleryStore } from "@/stores/galleryStore";
 
@@ -125,19 +125,15 @@ interface ImageGenResultData {
 }
 
 /** Resolve the best image src for a generated image.
- *  Prefers the persisted gallery base64 data URL (works after ComfyUI restarts)
+ *  Prefers the on-disk file via asset:// protocol, then persisted base64,
  *  and falls back to the live ComfyUI URL. */
 function useImageSrc(result: ImageGenResultData): string | undefined {
   const galleryImages = useGalleryStore((s) => s.images);
   if (result.gallery_id) {
     const galleryEntry = galleryImages.find((img) => img.id === result.gallery_id);
     if (galleryEntry) {
-      // image_data may be a raw URL (package-generated) or a base64 blob (legacy upload)
-      const data = galleryEntry.image_data;
-      if (data.startsWith("http://") || data.startsWith("https://")) {
-        return data;
-      }
-      return `data:${galleryEntry.mime_type};base64,${data}`;
+      const resolved = resolveGallerySrc(galleryEntry);
+      if (resolved) return resolved;
     }
   }
   return result.image_url;

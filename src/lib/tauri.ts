@@ -510,4 +510,6 @@ export interface GalleryImage {
   width: number | null;
   height: number | null;
   created_at: string;
+  /** Absolute path to the image file on disk (new images). */
+  file_path?: string | null;
 }

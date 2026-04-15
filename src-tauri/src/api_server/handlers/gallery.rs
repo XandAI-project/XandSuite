@@ -20,17 +20,18 @@ pub struct GalleryQuery {
 }
 
 fn query_gallery(db: &crate::db::AppDb, conv_id: Option<&str>) -> rusqlite::Result<Vec<Value>> {
+    let sql_base = "SELECT id, conversation_id, source, filename, mime_type, \
+                    '' AS image_data, created_at, COALESCE(file_path, '') AS file_path \
+                    FROM gallery_images";
     if let Some(cid) = conv_id {
         let mut stmt = db.conn.prepare(
-            "SELECT id, conversation_id, source, filename, mime_type, image_data, created_at
-             FROM gallery_images WHERE conversation_id = ?1 ORDER BY created_at DESC",
+            &format!("{sql_base} WHERE conversation_id = ?1 ORDER BY created_at DESC"),
         )?;
         let x: Vec<Value> = stmt.query_map(params![cid], gallery_row)?.filter_map(|r| r.ok()).collect();
         Ok(x)
     } else {
         let mut stmt = db.conn.prepare(
-            "SELECT id, conversation_id, source, filename, mime_type, image_data, created_at
-             FROM gallery_images ORDER BY created_at DESC",
+            &format!("{sql_base} ORDER BY created_at DESC"),
         )?;
         let x: Vec<Value> = stmt.query_map([], gallery_row)?.filter_map(|r| r.ok()).collect();
         Ok(x)
@@ -61,6 +62,15 @@ pub async fn delete_gallery_image(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let db = state.db.lock().unwrap();
+    if let Ok(fp) = db.conn.query_row(
+        "SELECT file_path FROM gallery_images WHERE id = ?1",
+        params![id],
+        |row| row.get::<_, Option<String>>(0),
+    ) {
+        if let Some(path) = fp {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
     db.conn
         .execute("DELETE FROM gallery_images WHERE id = ?1", params![id])
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -136,6 +146,7 @@ fn gallery_row(row: &rusqlite::Row) -> rusqlite::Result<Value> {
         "mime_type": row.get::<_, String>(4)?,
         "image_data": row.get::<_, String>(5)?,
         "created_at": row.get::<_, String>(6)?,
+        "file_path": row.get::<_, String>(7)?,
     }))
 }
 
@@ -153,16 +164,17 @@ pub async fn serve_gallery_image(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Response {
-    // Fetch the row
-    let (image_data, mime_type, filename) = {
+    let (file_path, image_data, mime_type, filename) = {
         let db = state.db.lock().unwrap();
         match db.conn.query_row(
-            "SELECT image_data, mime_type, filename FROM gallery_images WHERE id = ?1",
+            "SELECT COALESCE(file_path, ''), image_data, mime_type, filename \
+             FROM gallery_images WHERE id = ?1",
             params![id],
             |row| Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
             )),
         ) {
             Ok(v) => v,
@@ -175,9 +187,13 @@ pub async fn serve_gallery_image(
         }
     };
 
-    // Decode or proxy depending on the stored value.
-    let bytes: Vec<u8> = if image_data.starts_with("http://") || image_data.starts_with("https://") {
-        // Legacy/fallback: proxy the remote URL.
+    // Priority: on-disk file > legacy base64 > legacy URL proxy
+    let bytes: Vec<u8> = if !file_path.is_empty() {
+        match tokio::fs::read(&file_path).await {
+            Ok(b) => b,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("file read error: {e}")).into_response(),
+        }
+    } else if image_data.starts_with("http://") || image_data.starts_with("https://") {
         match reqwest::get(&image_data).await {
             Ok(resp) => match resp.bytes().await {
                 Ok(b) => b.to_vec(),
@@ -185,12 +201,13 @@ pub async fn serve_gallery_image(
             },
             Err(e) => return (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
         }
-    } else {
-        // Base64-encoded bytes.
+    } else if !image_data.is_empty() {
         match base64::engine::general_purpose::STANDARD.decode(&image_data) {
             Ok(b) => b,
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("base64 decode error: {e}")).into_response(),
         }
+    } else {
+        return (StatusCode::NOT_FOUND, "No image data available").into_response();
     };
 
     Response::builder()
