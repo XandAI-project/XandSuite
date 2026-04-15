@@ -1,6 +1,6 @@
 [package]
 name = "xandsuite"
-version = "0.2.19"
+version = "0.3.0"
 description = "XandSuite - Local LLM Desktop Application"
 authors = ["XandNet"]
 edition = "2021"
