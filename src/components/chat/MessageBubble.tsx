@@ -9,7 +9,7 @@ import {
   FileText, FileCode, FileJson, File,
   Code, Globe, AlignLeft, Terminal, BookOpen, ImageIcon,
 } from "lucide-react";
-import { useState, useRef, useEffect, useMemo, memo } from "react";
+import { useState, useRef, useEffect, memo } from "react";
 import { cn, resolveGallerySrc } from "@/lib/utils";
 import type { Message, ArtifactType, AttachmentMeta, ImageMeta } from "@/lib/tauri";
 import { ArtifactCard } from "./ArtifactCard";
@@ -520,8 +520,8 @@ function GalleryAwareImage({ src, alt }: { src?: string; alt?: string }) {
 }
 
 // Module-level stable arrays — defined once so React never sees a new reference.
-const MD_REMARK_PLUGINS = [remarkGfm] as const;
-const MD_REHYPE_PLUGINS = [rehypeRaw] as const;
+const MD_REMARK_PLUGINS = [remarkGfm];
+const MD_REHYPE_PLUGINS = [rehypeRaw];
 
 // ── Markdown components shared between message + panel ────────────────────────
 
