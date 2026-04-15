@@ -229,13 +229,16 @@ function DownloadedRow({
   model,
   isActive,
   isLoading,
+  mmprojPath,
   onLoad,
   onDelete,
 }: {
   model: { model_id: string; filename: string; path: string; size_bytes: number };
   isActive: boolean;
   isLoading: boolean;
-  onLoad: (path: string) => void;
+  /** Path to the companion mmproj file, if one exists in the same folder */
+  mmprojPath?: string;
+  onLoad: (modelPath: string, mmprojPath?: string) => void;
   onDelete: (modelId: string, filename: string) => void;
 }) {
   const [confirmDelete, setConfirmDelete] = useState(false);
@@ -250,7 +253,14 @@ function DownloadedRow({
       <HardDrive className={cn("w-4 h-4 shrink-0", isActive ? "text-emerald-400" : "text-muted-foreground")} />
 
       <div className="flex-1 min-w-0">
-        <p className="text-sm font-mono truncate text-foreground/90">{model.filename}</p>
+        <div className="flex items-center gap-2">
+          <p className="text-sm font-mono truncate text-foreground/90">{model.filename}</p>
+          {mmprojPath && (
+            <span className="shrink-0 text-[9px] font-semibold px-1.5 py-0.5 rounded bg-violet-500/15 text-violet-400 border border-violet-500/20 uppercase tracking-wide">
+              Vision
+            </span>
+          )}
+        </div>
         <p className="text-[10px] text-muted-foreground">{model.model_id} · {fmtBytes(model.size_bytes)}</p>
       </div>
 
@@ -263,9 +273,9 @@ function DownloadedRow({
           size="sm"
           variant="ghost"
           className="h-7 gap-1 text-xs"
-          onClick={() => onLoad(model.path)}
+          onClick={() => onLoad(model.path, mmprojPath)}
           disabled={isLoading}
-          title="Start llama-server with this model"
+          title={mmprojPath ? "Start llama-server with vision support" : "Start llama-server with this model"}
         >
           {isLoading ? (
             <Loader2 className="w-3 h-3 animate-spin" />
@@ -344,7 +354,22 @@ export function ModelBrowser() {
     }
   }
 
-  // Build per-model downloaded filenames map
+  // Separate mmproj files from actual model files.
+  // mmproj files are vision projection weights, not standalone models.
+  const isMmproj = (filename: string) =>
+    filename.toLowerCase().includes("mmproj");
+
+  const mmprojFiles = downloadedModels.filter((d) => isMmproj(d.filename));
+  const actualModels = downloadedModels.filter((d) => !isMmproj(d.filename));
+
+  // Build a map from model_id → mmproj path so the companion model row can
+  // receive the right path and pass it to start_local_server.
+  const mmprojByModelId: Record<string, string> = {};
+  for (const mp of mmprojFiles) {
+    mmprojByModelId[mp.model_id] = mp.path;
+  }
+
+  // Build per-model downloaded filenames map (for Browse tab)
   const downloadedByModel: Record<string, string[]> = {};
   for (const d of downloadedModels) {
     if (!downloadedByModel[d.model_id]) downloadedByModel[d.model_id] = [];
@@ -373,8 +398,8 @@ export function ModelBrowser() {
     await downloadModel(modelId, file.filename, file.url);
   };
 
-  const handleLoad = async (path: string) => {
-    await startServer(path);
+  const handleLoad = async (modelPath: string, mmprojPath?: string) => {
+    await startServer(modelPath, mmprojPath);
     await fetchStatus();
   };
 
@@ -406,7 +431,7 @@ export function ModelBrowser() {
         {/* Tab bar */}
         <div className="flex gap-1 mt-4">
           {([
-            { id: "local",  label: `Downloaded (${downloadedModels.length})` },
+            { id: "local",  label: `Downloaded (${actualModels.length})` },
             { id: "browse", label: "Browse HuggingFace" },
           ] as const).map(({ id, label }) => (
             <button
@@ -439,7 +464,7 @@ export function ModelBrowser() {
               <p className="text-xs text-destructive whitespace-pre-wrap">{serverError}</p>
             </div>
           )}
-          {downloadedModels.length === 0 ? (
+          {actualModels.length === 0 ? (
             <div className="flex flex-col items-center justify-center h-64 text-center gap-3">
               <HardDrive className="w-10 h-10 text-muted-foreground/30" />
               <p className="text-muted-foreground text-sm">No models downloaded yet.</p>
@@ -449,16 +474,36 @@ export function ModelBrowser() {
             </div>
           ) : (
             <div className="space-y-2 max-w-2xl">
-              {downloadedModels.map((m) => (
+              {actualModels.map((m) => (
                 <DownloadedRow
                   key={`${m.model_id}::${m.filename}`}
                   model={m}
                   isActive={serverStatus.running && serverStatus.model === m.path}
                   isLoading={isStarting}
+                  mmprojPath={mmprojByModelId[m.model_id]}
                   onLoad={handleLoad}
                   onDelete={handleDelete}
                 />
               ))}
+              {mmprojFiles.length > 0 && (
+                <div className="mt-4 rounded-xl border border-violet-500/20 bg-violet-500/5 px-4 py-3">
+                  <p className="text-xs font-semibold text-violet-400 mb-1.5">
+                    Vision projection files
+                  </p>
+                  <div className="space-y-1">
+                    {mmprojFiles.map((mp) => (
+                      <div key={`${mp.model_id}::${mp.filename}`} className="flex items-center gap-2">
+                        <span className="text-xs font-mono text-muted-foreground truncate flex-1">
+                          {mp.filename}
+                        </span>
+                        <span className="text-[10px] text-muted-foreground shrink-0">
+                          {fmtBytes(mp.size_bytes)} · auto-attached to {mp.model_id}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
           )}
         </ScrollArea>

@@ -293,14 +293,26 @@ async fn probe_running_server(port: u16, last_known_model: Option<&str>) -> Opti
 
 /// Start the internal llama-server with the given model file.
 /// Automatically connects the engine to the local server on success.
+///
+/// `mmproj_path` — when provided, overrides `settings.mmproj_path` for this
+/// launch only (used when a vision projection file is bundled with the model).
 #[tauri::command]
 pub async fn start_local_server(
     model_path: String,
+    mmproj_path: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let settings = state.settings.lock().unwrap().clone();
+    let mut settings = state.settings.lock().unwrap().clone();
     let data_dir = state.data_dir.clone();
     let port = settings.llama_server_port;
+
+    // Override mmproj if the caller supplied one explicitly.
+    if let Some(ref mp) = mmproj_path {
+        if !mp.is_empty() {
+            settings.mmproj_path = Some(mp.clone());
+            log::info!("start_local_server: using mmproj override: {}", mp);
+        }
+    }
 
     // If an adopted (orphaned) server is running on the port, we must not try
     // to spawn a second process. Clear the adopted state first; the new start()
@@ -327,10 +339,15 @@ pub async fn start_local_server(
             .map_err(|e| e.to_string())?;
     }
 
-    // Persist the last-used model path
+    // Persist the last-used model path and the mmproj override (if any)
     {
         let mut s = state.settings.lock().unwrap();
         s.last_server_model = Some(model_path.clone());
+        if let Some(mp) = mmproj_path {
+            if !mp.is_empty() {
+                s.mmproj_path = Some(mp);
+            }
+        }
         let json = serde_json::to_string(&*s).map_err(|e| e.to_string())?;
         let db = state.db.lock().unwrap();
         db.set_setting("app_settings", &json).map_err(|e| e.to_string())?;

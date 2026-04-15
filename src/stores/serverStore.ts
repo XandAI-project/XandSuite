@@ -31,7 +31,7 @@ interface ServerStore {
 
   fetchStatus: () => Promise<void>;
   detectGpu: () => Promise<void>;
-  startServer: (modelPath: string) => Promise<void>;
+  startServer: (modelPath: string, mmprojPath?: string) => Promise<void>;
   stopServer: () => Promise<void>;
   downloadBinary: (variant: "cpu" | "cuda12" | "cuda13" | "vulkan") => Promise<void>;
   listenToProgress: () => Promise<() => void>;
@@ -80,10 +80,13 @@ export const useServerStore = create<ServerStore>((set, get) => ({
     }
   },
 
-  startServer: async (modelPath: string) => {
+  startServer: async (modelPath: string, mmprojPath?: string) => {
     set({ isStarting: true, error: null });
     try {
-      await invoke("start_local_server", { modelPath });
+      await invoke("start_local_server", {
+        modelPath,
+        mmprojPath: mmprojPath ?? null,
+      });
       set({ error: null });
       await get().fetchStatus();
     } catch (e) {
