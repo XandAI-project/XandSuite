@@ -156,6 +156,46 @@ pub async fn download_llama_server(
     }
 
     let dest = bin_dir.join(bin_name);
+
+    // Fallback: if the binary landed in a subdirectory (prefix strip failed),
+    // find it one level deep and hoist all sibling files up to bin_dir.
+    if !dest.exists() {
+        let subdir = std::fs::read_dir(bin_dir)
+            .ok()
+            .and_then(|mut rd| {
+                rd.find_map(|e| {
+                    let e = e.ok()?;
+                    if e.metadata().ok()?.is_dir() {
+                        let candidate = e.path().join(bin_name);
+                        if candidate.exists() { Some(e.path()) } else { None }
+                    } else {
+                        None
+                    }
+                })
+            });
+
+        if let Some(sub) = subdir {
+            log::info!(
+                "llama-server found in subdirectory {:?} — hoisting files to {:?}",
+                sub, bin_dir
+            );
+            for entry in std::fs::read_dir(&sub)?.flatten() {
+                let src = entry.path();
+                let dst = bin_dir.join(entry.file_name());
+                if let Err(e) = std::fs::rename(&src, &dst) {
+                    // rename across devices fails — fall back to copy+delete
+                    if let Ok(data) = std::fs::read(&src) {
+                        create_file_replacing(&dst, &data)?;
+                        let _ = std::fs::remove_file(&src);
+                    } else {
+                        log::warn!("Could not move {:?}: {}", src, e);
+                    }
+                }
+            }
+            let _ = std::fs::remove_dir(&sub);
+        }
+    }
+
     if !dest.exists() {
         anyhow::bail!(
             "'{}' was not found in the archive after extraction. \
@@ -350,7 +390,11 @@ fn extract_all_from_targz(gz_bytes: &[u8], dest_dir: &Path) -> Result<()> {
     let gz = GzDecoder::new(cursor);
     let mut archive = Archive::new(gz);
 
-    // First pass: detect the top-level prefix
+    // First pass: detect the top-level prefix from the first component of any
+    // entry.  Linux tar.gz releases from llama.cpp often skip the standalone
+    // directory entry (components.len() == 1) and go straight to files like
+    // "llama-b8795/llama-server", so we must take the first component of the
+    // very first entry regardless of depth.
     let strip_prefix: Option<String> = {
         let cursor2 = std::io::Cursor::new(gz_bytes);
         let gz2 = GzDecoder::new(cursor2);
@@ -360,13 +404,20 @@ fn extract_all_from_targz(gz_bytes: &[u8], dest_dir: &Path) -> Result<()> {
             let entry = entry?;
             let path = entry.path()?;
             let components: Vec<_> = path.components().collect();
-            if components.len() == 1 {
-                prefix = Some(format!("{}/", components[0].as_os_str().to_string_lossy()));
-                break;
+            if let Some(first) = components.first() {
+                let name = first.as_os_str().to_string_lossy();
+                // Only strip if there are multiple components (i.e. a real
+                // subdirectory prefix, not a top-level file).
+                if components.len() > 1 && !name.is_empty() {
+                    prefix = Some(format!("{}/", name));
+                }
             }
+            break; // Only need the first entry to detect the prefix
         }
         prefix
     };
+
+    log::debug!("tar.gz strip_prefix = {:?}", strip_prefix);
 
     for entry in archive.entries().context("Failed to read tar archive")? {
         let mut entry = entry?;
