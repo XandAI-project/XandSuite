@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import {
-  Search, Download, Trash2, Play, RefreshCw,
+  Search, Download, Trash2, Play, Square, RefreshCw,
   HardDrive, ChevronDown, ChevronUp, Loader2,
   CheckCircle2, ExternalLink, Cpu,
 } from "lucide-react";
@@ -229,16 +229,20 @@ function DownloadedRow({
   model,
   isActive,
   isLoading,
+  isStopping,
   mmprojPath,
   onLoad,
+  onStop,
   onDelete,
 }: {
   model: { model_id: string; filename: string; path: string; size_bytes: number };
   isActive: boolean;
   isLoading: boolean;
+  isStopping: boolean;
   /** Path to the companion mmproj file, if one exists in the same folder */
   mmprojPath?: string;
   onLoad: (modelPath: string, mmprojPath?: string) => void;
+  onStop: () => void;
   onDelete: (modelId: string, filename: string) => void;
 }) {
   const [confirmDelete, setConfirmDelete] = useState(false);
@@ -264,26 +268,40 @@ function DownloadedRow({
         <p className="text-[10px] text-muted-foreground">{model.model_id} · {fmtBytes(model.size_bytes)}</p>
       </div>
 
-      {isActive && (
-        <span className="text-[10px] text-emerald-400 font-medium shrink-0">Active</span>
-      )}
-
       <div className="flex items-center gap-1 shrink-0">
-        <Button
-          size="sm"
-          variant="ghost"
-          className="h-7 gap-1 text-xs"
-          onClick={() => onLoad(model.path, mmprojPath)}
-          disabled={isLoading}
-          title={mmprojPath ? "Start llama-server with vision support" : "Start llama-server with this model"}
-        >
-          {isLoading ? (
-            <Loader2 className="w-3 h-3 animate-spin" />
-          ) : (
-            <Play className="w-3 h-3 fill-current" />
-          )}
-          {isLoading ? "Starting…" : "Load"}
-        </Button>
+        {isActive ? (
+          <Button
+            size="sm"
+            variant="ghost"
+            className="h-7 gap-1 text-xs text-red-400 hover:text-red-300 hover:bg-red-500/10"
+            onClick={onStop}
+            disabled={isStopping}
+            title="Stop llama-server"
+          >
+            {isStopping ? (
+              <Loader2 className="w-3 h-3 animate-spin" />
+            ) : (
+              <Square className="w-3 h-3 fill-current" />
+            )}
+            {isStopping ? "Stopping…" : "Stop"}
+          </Button>
+        ) : (
+          <Button
+            size="sm"
+            variant="ghost"
+            className="h-7 gap-1 text-xs"
+            onClick={() => onLoad(model.path, mmprojPath)}
+            disabled={isLoading}
+            title={mmprojPath ? "Start llama-server with vision support" : "Start llama-server with this model"}
+          >
+            {isLoading ? (
+              <Loader2 className="w-3 h-3 animate-spin" />
+            ) : (
+              <Play className="w-3 h-3 fill-current" />
+            )}
+            {isLoading ? "Starting…" : "Load"}
+          </Button>
+        )}
 
         {confirmDelete ? (
           <>
@@ -334,8 +352,10 @@ export function ModelBrowser() {
   const {
     status: serverStatus,
     isStarting,
+    isStopping,
     error: serverError,
     startServer,
+    stopServer,
     fetchStatus,
   } = useServerStore();
 
@@ -401,6 +421,10 @@ export function ModelBrowser() {
   const handleLoad = async (modelPath: string, mmprojPath?: string) => {
     await startServer(modelPath, mmprojPath);
     await fetchStatus();
+  };
+
+  const handleStop = async () => {
+    await stopServer();
   };
 
   const handleDelete = async (modelId: string, filename: string) => {
@@ -480,8 +504,10 @@ export function ModelBrowser() {
                   model={m}
                   isActive={serverStatus.running && serverStatus.model === m.path}
                   isLoading={isStarting}
+                  isStopping={isStopping}
                   mmprojPath={mmprojByModelId[m.model_id]}
                   onLoad={handleLoad}
+                  onStop={handleStop}
                   onDelete={handleDelete}
                 />
               ))}
