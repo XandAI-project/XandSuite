@@ -240,14 +240,27 @@ fn find_asset<'a>(assets: &'a [GithubAsset], variant: &BinaryVariant) -> Option<
             }
 
             // Variant check — actual asset patterns in ggml-org/llama.cpp releases:
-            //   CPU:    llama-bXXXX-bin-win-cpu-x64.zip
-            //   CUDA12: llama-bXXXX-bin-win-cuda-12.X-x64.zip
-            //   Vulkan: llama-bXXXX-bin-win-vulkan-x64.zip
+            //   Windows CPU:    llama-bXXXX-bin-win-cpu-x64.zip
+            //   Linux CPU:      llama-bXXXX-bin-ubuntu-x64.tar.gz (no -cpu- suffix)
+            //   CUDA12:         llama-bXXXX-bin-win-cuda-12.X-x64.zip
+            //   Vulkan:         llama-bXXXX-bin-win-vulkan-x64.zip / llama-bXXXX-bin-ubuntu-vulkan-x64.tar.gz
             match variant {
                 BinaryVariant::CpuOnly => {
-                    name.contains("-cpu-")
-                        && !name.contains("cuda")
-                        && !name.contains("vulkan")
+                    // Windows: explicit -cpu- suffix
+                    // Linux: no accelerator suffix (plain -ubuntu- or -linux-)
+                    if is_windows {
+                        name.contains("-cpu-")
+                            && !name.contains("cuda")
+                            && !name.contains("vulkan")
+                    } else {
+                        // Linux CPU builds don't have -cpu- suffix; exclude all accelerator types
+                        !name.contains("cuda")
+                            && !name.contains("vulkan")
+                            && !name.contains("rocm")
+                            && !name.contains("openvino")
+                            && !name.contains("sycl")
+                            && !name.contains("hip")
+                    }
                 }
                 BinaryVariant::Cuda12 => {
                     (name.contains("cuda-12") || (name.contains("cuda") && name.contains("-12.")))
