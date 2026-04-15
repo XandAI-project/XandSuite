@@ -291,6 +291,64 @@ async fn probe_running_server(port: u16, last_known_model: Option<&str>) -> Opti
     last_known_model.map(String::from)
 }
 
+/// On Linux, scan `bin_dir` for shared-library files (`*.so` / `*.so.*`) that
+/// are 0 bytes — a symptom of the old extractor writing empty files instead of
+/// real symlinks.  When any are found the entire bin directory is removed so a
+/// clean re-download produces correct symlinks.
+///
+/// Returns `Err` with a user-facing message when corruption is detected.
+#[cfg(target_os = "linux")]
+fn check_and_purge_corrupt_libs(bin_dir: &std::path::Path) -> Result<(), String> {
+    let entries = match std::fs::read_dir(bin_dir) {
+        Ok(e) => e,
+        Err(_) => return Ok(()), // bin_dir does not exist yet — nothing to check
+    };
+
+    let mut corrupt: Vec<String> = Vec::new();
+
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // Match libXxx.so and libXxx.so.0 / libXxx.so.0.0.8795 etc.
+        if !name.contains(".so") {
+            continue;
+        }
+        // Use symlink_metadata so we see the symlink itself, not what it points to.
+        if let Ok(meta) = entry.path().symlink_metadata() {
+            if meta.file_type().is_symlink() {
+                continue; // Proper symlink — fine.
+            }
+            if meta.is_file() && meta.len() == 0 {
+                corrupt.push(name);
+            }
+        }
+    }
+
+    if corrupt.is_empty() {
+        return Ok(());
+    }
+
+    log::warn!(
+        "Detected {} corrupted shared-library file(s) in {:?}: {:?}. \
+         Purging bin directory so a fresh download creates correct symlinks.",
+        corrupt.len(), bin_dir, corrupt
+    );
+
+    // Remove everything in bin_dir so the re-download starts clean.
+    if let Ok(entries) = std::fs::read_dir(bin_dir) {
+        for entry in entries.flatten() {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+
+    Err(format!(
+        "Shared libraries are corrupted ({} zero-byte .so file(s) detected: {}).\n\
+         The bin directory has been cleared — please re-download llama-server \
+         in the Models tab.",
+        corrupt.len(),
+        corrupt.join(", ")
+    ))
+}
+
 /// Start the internal llama-server with the given model file.
 /// Automatically connects the engine to the local server on success.
 ///
@@ -305,6 +363,11 @@ pub async fn start_local_server(
     let mut settings = state.settings.lock().unwrap().clone();
     let data_dir = state.data_dir.clone();
     let port = settings.llama_server_port;
+
+    // Linux only: detect the 0-byte .so files left by the old extractor and
+    // force a re-download before trying to spawn a server that will crash.
+    #[cfg(target_os = "linux")]
+    check_and_purge_corrupt_libs(&data_dir.join("bin"))?;
 
     // Always update mmproj from the caller's value so stale paths never
     // bleed across models.  Explicitly clearing (None or empty string) removes
