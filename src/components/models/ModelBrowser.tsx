@@ -122,12 +122,14 @@ function GgufRow({
 function ModelCard({
   model,
   downloadedFiles,
+  allDownloaded,
   downloads,
   onDownload,
   onLoad,
 }: {
   model: HfModel;
   downloadedFiles: string[];
+  allDownloaded: { model_id: string; filename: string; path: string; size_bytes: number }[];
   downloads: Record<string, number | null>;
   onDownload: (modelId: string, file: GgufFile) => void;
   onLoad: (path: string) => void;
@@ -205,10 +207,12 @@ function ModelCard({
                 progress={prog}
                 onDownload={(file) => onDownload(model.id, file)}
                 onLoad={(filename) => {
-                  const path = model.local_path
-                    ? `${model.local_path}/${filename}`
-                    : filename;
-                  onLoad(path);
+                  // Resolve the full absolute path from allDownloaded list;
+                  // model.local_path is null from the HF scraper, so we can't use it.
+                  const entry = allDownloaded.find(
+                    (d: { filename: string; path: string }) => d.filename === filename
+                  );
+                  onLoad(entry?.path ?? filename);
                 }}
               />
             );
@@ -224,11 +228,13 @@ function ModelCard({
 function DownloadedRow({
   model,
   isActive,
+  isLoading,
   onLoad,
   onDelete,
 }: {
   model: { model_id: string; filename: string; path: string; size_bytes: number };
   isActive: boolean;
+  isLoading: boolean;
   onLoad: (path: string) => void;
   onDelete: (modelId: string, filename: string) => void;
 }) {
@@ -258,10 +264,15 @@ function DownloadedRow({
           variant="ghost"
           className="h-7 gap-1 text-xs"
           onClick={() => onLoad(model.path)}
-          title="Load into engine"
+          disabled={isLoading}
+          title="Start llama-server with this model"
         >
-          <Play className="w-3 h-3 fill-current" />
-          Load
+          {isLoading ? (
+            <Loader2 className="w-3 h-3 animate-spin" />
+          ) : (
+            <Play className="w-3 h-3 fill-current" />
+          )}
+          {isLoading ? "Starting…" : "Load"}
         </Button>
 
         {confirmDelete ? (
@@ -306,11 +317,17 @@ export function ModelBrowser() {
     models, downloadedModels, downloads,
     isLoading, error,
     fetchModels, fetchDownloadedModels,
-    downloadModel, deleteModel, loadModel,
+    downloadModel, deleteModel,
     listenToDownloads,
     refreshModels,
   } = useModelStore();
-  const { status: serverStatus } = useServerStore();
+  const {
+    status: serverStatus,
+    isStarting,
+    error: serverError,
+    startServer,
+    fetchStatus,
+  } = useServerStore();
 
   const [search, setSearch] = useState("");
   const [tab, setTab] = useState<"browse" | "local">("local");
@@ -336,6 +353,7 @@ export function ModelBrowser() {
 
   useEffect(() => {
     fetchDownloadedModels();
+    fetchStatus();
     const unlistenPromise = listenToDownloads();
     return () => { unlistenPromise.then((fn) => fn()); };
   }, []);
@@ -356,7 +374,8 @@ export function ModelBrowser() {
   };
 
   const handleLoad = async (path: string) => {
-    await loadModel(path);
+    await startServer(path);
+    await fetchStatus();
   };
 
   const handleDelete = async (modelId: string, filename: string) => {
@@ -409,6 +428,17 @@ export function ModelBrowser() {
       {/* ── Local tab ── */}
       {tab === "local" && (
         <ScrollArea className="flex-1 px-6 py-4">
+          {isStarting && (
+            <div className="mb-4 flex items-center gap-2 rounded-lg border border-primary/20 bg-primary/5 px-4 py-2 text-sm text-primary max-w-2xl">
+              <Loader2 className="w-4 h-4 animate-spin shrink-0" />
+              Starting llama-server… this may take up to a minute while the model loads.
+            </div>
+          )}
+          {serverError && !isStarting && (
+            <div className="mb-4 rounded-lg border border-destructive/30 bg-destructive/5 px-4 py-2 max-w-2xl">
+              <p className="text-xs text-destructive whitespace-pre-wrap">{serverError}</p>
+            </div>
+          )}
           {downloadedModels.length === 0 ? (
             <div className="flex flex-col items-center justify-center h-64 text-center gap-3">
               <HardDrive className="w-10 h-10 text-muted-foreground/30" />
@@ -423,7 +453,8 @@ export function ModelBrowser() {
                 <DownloadedRow
                   key={`${m.model_id}::${m.filename}`}
                   model={m}
-                  isActive={false}
+                  isActive={serverStatus.running && serverStatus.model === m.path}
+                  isLoading={isStarting}
                   onLoad={handleLoad}
                   onDelete={handleDelete}
                 />
@@ -496,6 +527,7 @@ export function ModelBrowser() {
                     key={m.id}
                     model={m}
                     downloadedFiles={downloadedByModel[m.id] ?? []}
+                    allDownloaded={downloadedModels}
                     downloads={fileProgress}
                     onDownload={handleDownload}
                     onLoad={handleLoad}
