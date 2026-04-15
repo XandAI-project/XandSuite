@@ -306,11 +306,19 @@ pub async fn start_local_server(
     let data_dir = state.data_dir.clone();
     let port = settings.llama_server_port;
 
-    // Override mmproj if the caller supplied one explicitly.
-    if let Some(ref mp) = mmproj_path {
-        if !mp.is_empty() {
-            settings.mmproj_path = Some(mp.clone());
-            log::info!("start_local_server: using mmproj override: {}", mp);
+    // Always update mmproj from the caller's value so stale paths never
+    // bleed across models.  Explicitly clearing (None or empty string) removes
+    // a previously-persisted projection path, preventing a mismatch crash.
+    match mmproj_path.as_deref() {
+        Some(mp) if !mp.is_empty() => {
+            log::info!("start_local_server: using mmproj: {}", mp);
+            settings.mmproj_path = Some(mp.to_string());
+        }
+        _ => {
+            if settings.mmproj_path.is_some() {
+                log::info!("start_local_server: clearing stale mmproj (not needed for this model)");
+            }
+            settings.mmproj_path = None;
         }
     }
 
@@ -339,14 +347,15 @@ pub async fn start_local_server(
             .map_err(|e| e.to_string())?;
     }
 
-    // Persist the last-used model path and the mmproj override (if any)
+    // Persist the last-used model path and the resolved mmproj (or clear it).
     {
         let mut s = state.settings.lock().unwrap();
         s.last_server_model = Some(model_path.clone());
-        if let Some(mp) = mmproj_path {
-            if !mp.is_empty() {
-                s.mmproj_path = Some(mp);
-            }
+        // Mirror the same clear-or-set logic so the persisted settings always
+        // reflect what was actually launched.
+        match mmproj_path.as_deref() {
+            Some(mp) if !mp.is_empty() => s.mmproj_path = Some(mp.to_string()),
+            _ => s.mmproj_path = None,
         }
         let json = serde_json::to_string(&*s).map_err(|e| e.to_string())?;
         let db = state.db.lock().unwrap();
