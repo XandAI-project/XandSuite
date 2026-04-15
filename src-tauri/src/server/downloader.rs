@@ -437,9 +437,32 @@ fn extract_all_from_targz(gz_bytes: &[u8], dest_dir: &Path) -> Result<()> {
             std::fs::create_dir_all(parent)?;
         }
 
+        // Symlink entries (e.g. libmtmd.so.0 -> libmtmd.so.0.0.8795) carry zero
+        // data bytes — writing them as regular files produces a "file too short"
+        // error from the dynamic linker at runtime.  Create a real symlink instead.
+        #[cfg(unix)]
+        if entry.header().entry_type() == tar::EntryType::Symlink {
+            if let Ok(Some(link_target)) = entry.link_name() {
+                // Remove any stale file or symlink at the destination first.
+                if dest_path.symlink_metadata().is_ok() {
+                    let _ = std::fs::remove_file(&dest_path);
+                }
+                std::os::unix::fs::symlink(&link_target, &dest_path)
+                    .with_context(|| {
+                        format!(
+                            "Failed to create symlink {:?} -> {:?}",
+                            dest_path, link_target
+                        )
+                    })?;
+                log::debug!("symlink: {} -> {}", relative, link_target.display());
+            }
+            continue;
+        }
+
         let mut buf = Vec::new();
         entry.read_to_end(&mut buf)?;
         create_file_replacing(&dest_path, &buf)?;
+        log::debug!("extracted: {}", relative);
     }
 
     Ok(())
