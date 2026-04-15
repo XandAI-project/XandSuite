@@ -659,6 +659,57 @@ impl SkillsExecutor {
                     })).unwrap_or_default());
                 }
 
+                // ── Pre-flight guards ──────────────────────────────────────────
+                // Guard 1: HTML/CSS content stored inside a Python variable.
+                // Pattern: html_content = """<!DOCTYPE html>..."""
+                // This never produces useful output and always either fails JSON
+                // parsing (if large enough) or runs silently and returns nothing.
+                let code_lower = code.to_lowercase();
+                let has_html_signature = code_lower.contains("<!doctype")
+                    || (code_lower.contains("<html") && code_lower.contains("</html>"));
+                if has_html_signature && code.len() > 512 {
+                    log::warn!(
+                        "[executor] execute_code called with HTML embedded in Python ({} chars) — redirecting to artifact",
+                        code.len()
+                    );
+                    return Ok(serde_json::to_string(&json!({
+                        "error": "HTML_IN_PYTHON",
+                        "instruction":
+                            "STOP — You are embedding HTML inside a Python variable and passing it \
+                             to execute_code. This is WRONG and will always fail or produce no output.\n\
+                             Output the HTML DIRECTLY as an artifact in your NEXT response — \
+                             do NOT call any tool:\n\
+                             <artifact type=\"html\" title=\"Page Title\">\n\
+                             <!DOCTYPE html>\n...(full HTML here)...\n\
+                             </artifact>\n\
+                             Write the complete artifact tag immediately. No tool call."
+                    })).unwrap_or_default());
+                }
+
+                // Guard 2: oversized code (> 12 KB).
+                // Large code blocks can cause llama-server JSON parse failures
+                // when the argument string is truncated mid-generation.
+                const MAX_CODE_BYTES: usize = 12_288;
+                if code.len() > MAX_CODE_BYTES {
+                    log::warn!(
+                        "[executor] execute_code code too large ({} chars > {} limit) — redirecting",
+                        code.len(), MAX_CODE_BYTES
+                    );
+                    return Ok(serde_json::to_string(&json!({
+                        "error": "CODE_TOO_LARGE",
+                        "instruction": format!(
+                            "Your Python code is {} characters, which exceeds the safe limit of {} bytes.\n\
+                             If you are generating file content (HTML, data, documents), output it DIRECTLY \
+                             as an artifact instead — no tool call needed:\n\
+                             <artifact type=\"html\" title=\"Title\">...content...</artifact>\n\
+                             If this is genuine computational code, split it into smaller functions and \
+                             call execute_code for each part separately.",
+                            code.len(), MAX_CODE_BYTES
+                        )
+                    })).unwrap_or_default());
+                }
+                // ── End pre-flight guards ──────────────────────────────────────
+
                 log::info!("[executor] Executing {} code ({} chars)", language, code.len());
                 let run = crate::code_runner::execute_code(language, code).await?;
                 log::info!(

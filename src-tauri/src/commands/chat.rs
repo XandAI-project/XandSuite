@@ -1147,7 +1147,10 @@ pub async fn send_message_inner(
                 - To create a document or text artifact, write the content DIRECTLY inside an \
                   <artifact type=\"markdown\"> or <artifact type=\"text\"> tag. No tool call needed.\n\
                 - To create an HTML page, component, or landing page, write it DIRECTLY inside an \
-                  <artifact type=\"html\" title=\"...\"> tag. NEVER pass HTML to execute_code.\n\n\
+                  <artifact type=\"html\" title=\"...\"> tag. NEVER pass HTML to execute_code.\n\
+                - **NEVER store HTML/CSS inside a Python variable** (e.g. `html = \"\"\"...\"\"\"`). \
+                  This is always wrong — Python cannot render HTML, and the call will fail. \
+                  Write the `<artifact type=\"html\">` tag directly instead.\n\n\
                 MANDATORY behaviour:\n\
                 1. Whenever you write a Python, JavaScript (Node.js), or Shell code snippet that the user \
                    wants to run, or whenever you produce computed results, ALWAYS call \
