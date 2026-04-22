@@ -33,6 +33,13 @@ struct ChatRequest {
     /// "auto" | "none" | {"type":"function","function":{"name":"..."}}
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<JsonValue>,
+    /// llama.cpp --jinja: JSON-schema-constrained sampling. When populated the
+    /// server will mask logits at decode time so the output is guaranteed to
+    /// match the schema. For tool calls we build a `oneOf` union of every
+    /// allowed (tool_name, arguments_schema) pair — see
+    /// `build_tool_call_response_format`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<JsonValue>,
 }
 
 /// A chat message that may carry a raw JSON blob for tool_calls turns.
@@ -295,6 +302,7 @@ impl RemoteEngine {
             chat_template_kwargs: Some(chat_template_kwargs),
             tools: None,
             tool_choice: None,
+            response_format: None,
         };
 
         let url = format!("{}/v1/chat/completions", self.server_url.trim_end_matches('/'));
@@ -432,10 +440,32 @@ impl RemoteEngine {
         messages: &[(String, String)],
         config: &InferenceConfig,
         tools: &[ToolDefinition],
+        tool_choice_override: Option<JsonValue>,
         token_tx: &mpsc::Sender<String>,
+        // Optional side-channel that gets notified `(tool_call_id, function_name)`
+        // the moment the engine has enough delta data to identify a tool call.
+        // Used by the executor to publish an early "pending" event to the UI
+        // so the user sees a tool-call card while the model is still streaming
+        // arguments, instead of waiting for dispatch.
+        tool_call_started_tx: Option<&mpsc::Sender<(String, String)>>,
     ) -> Result<StreamWithToolsResult> {
         let chat_messages = Self::build_messages(messages.to_vec());
         let chat_template_kwargs = Self::build_template_kwargs(config);
+
+        // NOTE: we deliberately DO NOT set `response_format` here.
+        //
+        // With `--jinja --tools all`, llama.cpp builds its own grammar from the
+        // chat template's tool-call wrapping (e.g. Qwen wraps calls in
+        // `<tool_call>…</tool_call>`, Hermes uses a different pattern). Passing
+        // our own `response_format: json_schema` overrides that grammar with a
+        // plain-JSON schema, so the model's output is valid JSON but bypasses
+        // the template's tool-call parser — it then leaks out as assistant
+        // `content` (or into `reasoning_content` when wrapped in `<think>`)
+        // and the executor sees zero `tool_calls`. See the retry / validate
+        // flow in skills/executor.rs: a `tool_choice` pin + corrective user
+        // message is enough to force the exact tool + valid args on retry,
+        // without clobbering the native tool-call grammar.
+        let tool_choice = tool_choice_override.unwrap_or_else(|| JsonValue::String("auto".into()));
 
         let request = ChatRequest {
             model: self.model_name.clone(),
@@ -447,7 +477,8 @@ impl RemoteEngine {
             cache_prompt: Some(true),
             chat_template_kwargs: Some(chat_template_kwargs),
             tools: Some(tools.to_vec()),
-            tool_choice: Some(JsonValue::String("auto".to_string())),
+            tool_choice: Some(tool_choice),
+            response_format: None,
         };
 
         let url = format!("{}/v1/chat/completions", self.server_url.trim_end_matches('/'));
@@ -467,6 +498,10 @@ impl RemoteEngine {
 
         // Accumulators
         let mut tool_call_slots: Vec<StreamingToolCall> = Vec::new();
+        // Parallel to `tool_call_slots`: whether we've already emitted the
+        // "started" notice for that index. Prevents firing the event on every
+        // arguments-delta chunk.
+        let mut tool_call_announced: Vec<bool> = Vec::new();
         let mut visible_content = String::new();
         let mut finish_reason = "stop".to_string();
 
@@ -562,6 +597,7 @@ impl RemoteEngine {
                         for tc in tc_deltas {
                             while tool_call_slots.len() <= tc.index {
                                 tool_call_slots.push(StreamingToolCall::default());
+                                tool_call_announced.push(false);
                             }
                             let slot = &mut tool_call_slots[tc.index];
                             if let Some(id) = &tc.id {
@@ -577,6 +613,31 @@ impl RemoteEngine {
                                 if let Some(args) = &func.arguments {
                                     slot.arguments.push_str(args);
                                 }
+                            }
+
+                            // ── Early UI notification ─────────────────────
+                            //
+                            // As soon as we have the pair (id, name) for this
+                            // slot, tell the executor so it can publish a
+                            // "pending" tool-call card to the frontend. This
+                            // happens during streaming, well before args are
+                            // finished, so the user gets instant feedback
+                            // that a tool is being prepared. The notice only
+                            // fires once per slot — subsequent argument
+                            // chunks don't trigger it again.
+                            if !tool_call_announced[tc.index]
+                                && !slot.id.is_empty()
+                                && !slot.name.is_empty()
+                            {
+                                if let Some(tx) = tool_call_started_tx {
+                                    // Best-effort send; if the receiver is
+                                    // gone, we don't want to tear down the
+                                    // stream for a UI nicety.
+                                    let _ = tx
+                                        .send((slot.id.clone(), slot.name.clone()))
+                                        .await;
+                                }
+                                tool_call_announced[tc.index] = true;
                             }
                         }
                     }
@@ -716,6 +777,8 @@ impl RemoteEngine {
         let chat_messages = Self::build_messages(messages.to_vec());
         let chat_template_kwargs = Self::build_template_kwargs(config);
 
+        // See the long comment in `chat_stream_with_tools_detection` about why
+        // `response_format` is left as `None` when tools are enabled.
         let request = ChatRequest {
             model: self.model_name.clone(),
             messages: chat_messages,
@@ -727,6 +790,7 @@ impl RemoteEngine {
             chat_template_kwargs: Some(chat_template_kwargs),
             tools: Some(tools.to_vec()),
             tool_choice: Some(JsonValue::String("auto".to_string())),
+            response_format: None,
         };
 
         let url = format!("{}/v1/chat/completions", self.server_url.trim_end_matches('/'));
@@ -804,4 +868,194 @@ fn partial_tag_suffix(s: &str, tag: &str) -> usize {
         }
     }
     0
+}
+
+// ── Tool-call schema builder ──────────────────────────────────────────────────
+//
+// llama.cpp's JSON-schema-constrained sampler silently falls back to
+// unconstrained output when the schema contains `$ref`/`$defs` (issue #21228).
+// Pydantic-v2-generated schemas ALWAYS carry refs, so every MCP tool's
+// input_schema must be flattened inline before being sent to the server.
+
+/// Recursively expand every `$ref` in `schema` against the root's `$defs`
+/// (or legacy `definitions`). Removes `$defs`/`definitions` keys from the
+/// result so the final document is self-contained.
+///
+/// Cycles are guarded by a visited set; on a cycle the offending `$ref` is
+/// replaced with an empty schema `{}` (accept-anything) rather than recursing
+/// forever.
+#[allow(dead_code)]
+pub fn inline_refs(schema: &JsonValue) -> JsonValue {
+    let defs = extract_defs(schema);
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    strip_defs_keys(&mut inline_refs_inner(schema, &defs, &mut visited))
+}
+
+#[allow(dead_code)]
+fn extract_defs(schema: &JsonValue) -> serde_json::Map<String, JsonValue> {
+    let mut defs = serde_json::Map::new();
+    if let Some(obj) = schema.as_object() {
+        if let Some(d) = obj.get("$defs").and_then(|v| v.as_object()) {
+            for (k, v) in d {
+                defs.insert(k.clone(), v.clone());
+            }
+        }
+        if let Some(d) = obj.get("definitions").and_then(|v| v.as_object()) {
+            for (k, v) in d {
+                defs.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    defs
+}
+
+#[allow(dead_code)]
+fn inline_refs_inner(
+    node: &JsonValue,
+    defs: &serde_json::Map<String, JsonValue>,
+    visited: &mut std::collections::HashSet<String>,
+) -> JsonValue {
+    match node {
+        JsonValue::Object(obj) => {
+            if let Some(JsonValue::String(r)) = obj.get("$ref") {
+                // Only support local refs like "#/$defs/Foo" or "#/definitions/Foo".
+                let key = r
+                    .trim_start_matches("#/$defs/")
+                    .trim_start_matches("#/definitions/");
+                if visited.contains(key) {
+                    return JsonValue::Object(serde_json::Map::new());
+                }
+                if let Some(target) = defs.get(key) {
+                    visited.insert(key.to_string());
+                    let resolved = inline_refs_inner(target, defs, visited);
+                    visited.remove(key);
+                    return resolved;
+                }
+                // Unresolvable ref → fall through to empty schema.
+                return JsonValue::Object(serde_json::Map::new());
+            }
+            let mut out = serde_json::Map::with_capacity(obj.len());
+            for (k, v) in obj {
+                if k == "$defs" || k == "definitions" {
+                    continue;
+                }
+                out.insert(k.clone(), inline_refs_inner(v, defs, visited));
+            }
+            JsonValue::Object(out)
+        }
+        JsonValue::Array(arr) => {
+            JsonValue::Array(arr.iter().map(|v| inline_refs_inner(v, defs, visited)).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+#[allow(dead_code)]
+fn strip_defs_keys(node: &mut JsonValue) -> JsonValue {
+    if let Some(obj) = node.as_object_mut() {
+        obj.remove("$defs");
+        obj.remove("definitions");
+    }
+    node.clone()
+}
+
+/// Build the OpenAI-flavoured `response_format: {"type":"json_schema", ...}`
+/// payload that constrains the model's next output to a single valid tool call.
+///
+/// **Not currently wired into requests.** Setting this alongside `tools` +
+/// `--jinja` overrides llama.cpp's template-driven tool-call grammar (which
+/// wraps calls in template-specific markers such as `<tool_call>…</tool_call>`
+/// for Qwen, or Hermes' bespoke format). The server then returns the raw JSON
+/// we ask for, but the parser never recognises it as a `tool_calls` payload —
+/// it falls out as assistant `content` instead. Kept here for the case where
+/// we can one day generate a schema that *matches* the template's exact
+/// wrapping, at which point we can wire it back into `ChatRequest`.
+///
+/// The schema is a two-level wrapper:
+/// * Top-level: `{"tool_calls": [ <one-of union> ]}` — matches the OpenAI
+///   streaming assistant message shape that llama-server emits with `--jinja`.
+/// * Inner `oneOf`: one branch per allowed tool, each branch pinning
+///   `function.name` to a constant and embedding the tool's input_schema as
+///   `function.arguments`.
+///
+/// When `pinned_name` is `Some`, only that tool's branch is included — used
+/// by the retry path to force the model to re-emit a specific call with
+/// valid args.
+///
+/// Returns `None` when `tools` is empty (nothing to constrain).
+#[allow(dead_code)]
+pub fn build_tool_call_response_format(
+    tools: &[ToolDefinition],
+    pinned_name: Option<&str>,
+) -> Option<JsonValue> {
+    if tools.is_empty() {
+        return None;
+    }
+
+    let branches: Vec<JsonValue> = tools
+        .iter()
+        .filter(|t| pinned_name.map_or(true, |name| t.function.name == name))
+        .map(|t| {
+            let args_schema = inline_refs(&t.function.parameters);
+            // Fall back to `{"type":"object"}` when the tool declares no schema
+            // so llama-server still accepts the oneOf branch.
+            let args_schema = if args_schema.is_object() {
+                args_schema
+            } else {
+                serde_json::json!({"type": "object"})
+            };
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "type": {"type": "string", "const": "function"},
+                    "function": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string", "const": t.function.name},
+                            "arguments": args_schema,
+                        },
+                        "required": ["name", "arguments"],
+                    }
+                },
+                "required": ["id", "type", "function"],
+            })
+        })
+        .collect();
+
+    if branches.is_empty() {
+        return None;
+    }
+
+    let one_of = JsonValue::Array(branches);
+
+    Some(serde_json::json!({
+        "type": "json_schema",
+        "json_schema": {
+            "name": "tool_call",
+            "strict": true,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "tool_calls": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": { "oneOf": one_of }
+                    }
+                },
+                "required": ["tool_calls"],
+            }
+        }
+    }))
+}
+
+/// Extract the `function.name` field from an OpenAI-style `tool_choice`
+/// object, returning `None` for `"auto"`, `"none"`, or malformed input.
+#[allow(dead_code)]
+fn extract_pinned_tool_name(choice: &JsonValue) -> Option<String> {
+    choice
+        .get("function")
+        .and_then(|f| f.get("name"))
+        .and_then(|n| n.as_str())
+        .map(|s| s.to_string())
 }

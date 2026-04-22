@@ -98,22 +98,7 @@ def _safe_output_path(filename: str) -> str:
 
 @mcp.tool()
 def read_pdf(file_path: str, pages: str = "") -> str:
-    """
-    Extract text from a PDF file.
-
-    Works offline. Best results on machine-generated (non-scanned) PDFs.
-
-    Parameters
-    ----------
-    file_path : str
-        Absolute path to the PDF file.
-    pages : str, optional
-        Page range to read. Examples: "1", "1,3", "2-5", "1,3-5,7".
-        Leave empty to read ALL pages.
-
-    Returns JSON with keys:
-        file, total_pages, pages_read, text (per-page list), full_text
-    """
+    """Extract text from a PDF (offline; best on machine-generated PDFs). Required: file_path (absolute). Optional: pages (e.g. '1,3-5'), empty=all. Returns JSON {file,total_pages,pages_read,text[],full_text}."""
     try:
         import pdfplumber
     except ImportError:
@@ -150,17 +135,7 @@ def read_pdf(file_path: str, pages: str = "") -> str:
 
 @mcp.tool()
 def get_pdf_info(file_path: str) -> str:
-    """
-    Get metadata and structure information about a PDF file.
-
-    Returns page count, page dimensions, and document metadata
-    (title, author, creator, creation date) when available.
-
-    Parameters
-    ----------
-    file_path : str
-        Absolute path to the PDF file.
-    """
+    """Get PDF metadata and structure (page count, dimensions, title/author/creator/creation). Required: file_path (absolute). Returns JSON {file,file_size_kb,total_pages,metadata,pages[]}."""
     try:
         import pdfplumber
     except ImportError:
@@ -206,19 +181,7 @@ def get_pdf_info(file_path: str) -> str:
 
 @mcp.tool()
 def extract_pdf_tables(file_path: str, page_number: int = 1) -> str:
-    """
-    Extract all tables from a specific page of a PDF file.
-
-    Works best on machine-generated PDFs with clearly bordered tables.
-    Returns each table as a list of rows (each row is a list of cell strings).
-
-    Parameters
-    ----------
-    file_path   : str
-        Absolute path to the PDF file.
-    page_number : int, optional
-        1-based page number to extract tables from. Defaults to 1.
-    """
+    """Extract tables from a PDF page (best on machine-generated bordered tables). Required: file_path (absolute). Optional: page_number (1-based, default 1). Returns list-of-tables, each a list of rows."""
     try:
         import pdfplumber
     except ImportError:
@@ -428,25 +391,7 @@ def create_pdf_document(
     content: str,
     author: str = "",
 ) -> str:
-    """
-    Create a simple styled PDF document and save it to the output directory.
-
-    Use for memos, notes, letters, summaries, or any plain text document.
-
-    Parameters
-    ----------
-    filename : str
-        Output filename (with or without .pdf extension).
-    title    : str
-        Document title displayed as a large heading on the first page.
-    content  : str
-        Body text in Markdown. Supports # headings, - bullets, **bold**,
-        *italic*, --- horizontal rules, and blank lines for spacing.
-    author   : str, optional
-        Author name shown below the title.
-
-    Returns JSON with the saved file path and page count.
-    """
+    """Create a simple styled PDF from a Markdown body (no math; use latex_pdf for equations). Required: filename, title, content. Optional: author. Returns JSON {status,filename,path,pages}."""
     try:
         from fpdf import FPDF  # noqa: F401 — trigger import error early
     except ImportError:
@@ -497,41 +442,7 @@ def create_pdf_report(
     sections: list,
     author: str = "",
 ) -> str:
-    """
-    Create a structured multi-section PDF report and save it to the output directory.
-
-    Use for business reports, research summaries, analyses, or any document
-    with distinct sections, headings, and optional data tables.
-
-    Parameters
-    ----------
-    filename : str
-        Output filename (with or without .pdf extension).
-    title    : str
-        Report title on the cover / first page.
-    author   : str, optional
-        Author name.
-    sections : list of dicts
-        Each section dict may have:
-          - "heading" (str)          Section heading.
-          - "body"    (str)          Body text in Markdown (headings, bullets,
-                                     **bold**, *italic*, ---, blank lines).
-          - "table"   (list, opt)    Table data as list of rows.
-                                     First row is treated as the header row.
-                                     Each row is a list of strings.
-
-    Example sections value:
-        [
-          {"heading": "Executive Summary", "body": "Revenue grew 12%..."},
-          {
-            "heading": "Quarterly Data",
-            "body": "See table below.",
-            "table": [["Quarter","Revenue","Growth"],["Q1","$1.2M","+8%"],["Q2","$1.4M","+12%"]]
-          }
-        ]
-
-    Returns JSON with the saved file path and page count.
-    """
+    """Create a multi-section PDF report with optional tables (no math). Required: filename, title, sections (list of dicts with keys: heading, body markdown, optional table 2D list; first row is header). Optional: author. Returns JSON {status,filename,path,pages}."""
     try:
         from fpdf import FPDF  # noqa: F401
     except ImportError:

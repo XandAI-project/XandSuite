@@ -1150,7 +1150,45 @@ pub async fn send_message_inner(
                   <artifact type=\"html\" title=\"...\"> tag. NEVER pass HTML to execute_code.\n\
                 - **NEVER store HTML/CSS inside a Python variable** (e.g. `html = \"\"\"...\"\"\"`). \
                   This is always wrong — Python cannot render HTML, and the call will fail. \
-                  Write the `<artifact type=\"html\">` tag directly instead.\n\n\
+                  Write the `<artifact type=\"html\">` tag directly instead.\n\
+                \n\
+                ### LaTeX / PDF output rule (NON-NEGOTIABLE)\n\
+                - If the user asks for LaTeX, a PDF, equations, a math document, math \
+                  typesetting, a theorem write-up, or anything involving `\\documentclass`, \
+                  `\\begin{...}`, or `$..$` math, your ONLY valid response is a tool call \
+                  to one of the `latex_pdf__*` tools.\n\
+                - You MUST NOT write `\\documentclass`, `\\begin{document}`, `$$..$$`, or \
+                  any LaTeX source in your assistant message text. LaTeX source goes \
+                  INSIDE the tool's `source`, `content`, `sections`, or `equation` argument \
+                  — never in the reply itself.\n\
+                - You MUST NOT call `execute_code` with `pdflatex`, `xelatex`, `lualatex`, \
+                  `tectonic`, or `latexmk`. Those calls are blocked by the executor and \
+                  will be rejected. `subprocess.run([\"pdflatex\", ...])`, `os.system(...)`, \
+                  and `shutil.which(...)` for any TeX binary are equally forbidden.\n\
+                - The available `latex_pdf__*` tools (Tectonic is auto-downloaded on first use):\n\
+                    • `latex_pdf__compile_latex`       — raw `.tex` passthrough; required: `source`, `filename`.\n\
+                    • `latex_pdf__create_latex_pdf`    — Markdown body + `$..$` math; required: `filename`, `title`, `content`.\n\
+                    • `latex_pdf__create_math_document` — multi-section doc; required: `filename`, `title`, `sections`.\n\
+                    • `latex_pdf__render_equation`     — single tightly-cropped equation; required: `equation`, `filename`.\n\
+                    • `latex_pdf__ensure_latex_engine` — pre-warm the engine cache; no args.\n\
+                - **Math delimiters (NON-NEGOTIABLE)**: inside any `body`, `content`, or Markdown-typed \
+                  argument, inline math MUST use `$...$` and display math MUST use `$$...$$`. You MUST \
+                  NOT use `\\(...\\)`, `\\[...\\]`, or `\\begin{equation}` inside a body/content field — \
+                  those delimiters are not enabled in this preamble and cause `Bad math environment \
+                  delimiter` compilation errors. For numbered standalone equations, put them in a \
+                  section's `equations` array (the tool strips any outer `$..$`, `$$..$$`, `\\(..\\)`, \
+                  or `\\[..\\]` wrapping and emits a numbered equation block — don't wrap them in \
+                  `\\begin{equation}` yourself, and prefer the bare expression).\n\
+                - If the `latex_pdf__*` tools are not present in this turn's tool list, \
+                  reply EXACTLY: \"The latex_pdf package is required for this request. \
+                  Please enable it in the Packages view.\" — do NOT fall back to `execute_code`.\n\n\
+                ### Tool-call argument rule (NON-NEGOTIABLE)\n\
+                When you call a tool, you MUST emit a JSON object that includes EVERY field \
+                listed as required in the tool's `parameters.required` array. An empty `{}` \
+                is never valid. Do not omit fields, do not substitute `null` for a required \
+                field, and do not pass the content as plain assistant text instead of as a \
+                tool argument. If you are unsure of a value, pick a sensible default rather \
+                than leaving it blank.\n\n\
                 MANDATORY behaviour:\n\
                 1. Whenever you write a Python, JavaScript (Node.js), or Shell code snippet that the user \
                    wants to run, or whenever you produce computed results, ALWAYS call \

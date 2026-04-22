@@ -119,6 +119,13 @@ impl LlamaServerManager {
         // b5000+: --flash-attn expects an explicit value [on|off|auto]
         cmd.arg("--flash-attn").arg(if settings.flash_attention { "on" } else { "off" });
 
+        // Required for OpenAI-shaped tool calls + JSON-schema-constrained sampling.
+        // Without --jinja, llama-server silently ignores the `tools` array on the
+        // /v1/chat/completions request. With it, `response_format: json_schema`
+        // is enforced at decode time (llama.cpp tools/server/README.md).
+        cmd.arg("--jinja");
+        cmd.arg("--tools").arg("all");
+
         // Reasoning/thinking format — exposes <think> content via API
         if settings.reasoning_format != "none" {
             cmd.arg("--reasoning-format").arg(&settings.reasoning_format);

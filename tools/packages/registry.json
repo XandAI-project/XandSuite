@@ -306,6 +306,48 @@
           "arg_prefix": "--output-dir"
         }
       ]
+    },
+    {
+      "id": "latex_pdf",
+      "name": "LaTeX PDF",
+      "description": "Generate beautifully typeset PDFs with complex math equations, Greek symbols, matrices, integrals, and scientific notation. Compiles real LaTeX via Tectonic (recommended — a single standalone engine binary that auto-downloads packages on demand) or a classic TeX distribution (pdflatex / xelatex / lualatex from TeX Live / MiKTeX). ZERO-CONFIG: when no engine is on PATH, Tectonic is automatically downloaded to a per-user cache (~50 MB, one-time) on the first compile call — no manual install required. Disable the auto-download with the 'No auto-install' option for offline / restricted environments.",
+      "category": "Productivity",
+      "icon": "Sigma",
+      "script": "${TOOLS_DIR}/packages/official/latex_pdf.py",
+      "requires": [],
+      "args_schema": [
+        {
+          "name": "output_dir",
+          "label": "PDF Output Directory",
+          "type": "string",
+          "required": false,
+          "placeholder": "~/Desktop",
+          "arg_prefix": "--output-dir"
+        },
+        {
+          "name": "engine",
+          "label": "LaTeX Engine (auto | tectonic | pdflatex | xelatex | lualatex)",
+          "type": "string",
+          "required": false,
+          "placeholder": "auto",
+          "arg_prefix": "--latex-engine"
+        },
+        {
+          "name": "timeout",
+          "label": "Compile Timeout (seconds)",
+          "type": "string",
+          "required": false,
+          "placeholder": "120",
+          "arg_prefix": "--timeout"
+        },
+        {
+          "name": "no_auto_install",
+          "label": "Disable automatic Tectonic download (offline mode)",
+          "type": "boolean",
+          "required": false,
+          "arg_prefix": "--no-auto-install"
+        }
+      ]
     }
   ]
 }

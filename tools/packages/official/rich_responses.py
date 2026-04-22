@@ -135,31 +135,7 @@ def line_chart(
     series: list[dict],
     y_label: str = "",
 ) -> str:
-    """
-    Render a line chart inline in the chat.
-
-    Use for time-series data, trends, and multi-series comparisons.
-
-    Parameters
-    ----------
-    title     Chart title shown above the SVG.
-    x_labels  List of X-axis labels (dates, names, categories).
-    series    List of series dicts: [{"label": "MSFT", "data": [1,2,3], "color": "#4e9af1"}].
-              Omit "color" to use automatic palette colours.
-    y_label   Optional Y-axis label.
-
-    Example
-    -------
-    line_chart(
-        title="Stock performance (normalized %)",
-        x_labels=["Jan", "Feb", "Mar", "Apr"],
-        series=[
-            {"label": "MSFT", "data": [-2, 5, 12, 8]},
-            {"label": "GOOGL", "data": [10, 30, 72, 65]},
-        ],
-        y_label="%",
-    )
-    """
+    """Render an inline-SVG line chart (time-series, trends). Required: title, x_labels (list[str]), series (list of {label, data[], color?}). Optional: y_label. Returns rich-response JSON with inline HTML."""
     if not series or not x_labels:
         return json.dumps({"error": "series and x_labels are required."})
 
@@ -233,27 +209,7 @@ def bar_chart(
     y_label: str = "",
     horizontal: bool = False,
 ) -> str:
-    """
-    Render a bar chart inline in the chat.
-
-    Use for categorical comparisons and ranked data.
-
-    Parameters
-    ----------
-    title       Chart title.
-    labels      Category labels (X axis for vertical, Y axis for horizontal).
-    series      List of series dicts: [{"label": "Revenue", "data": [10, 20, 15], "color": "#hex"}].
-    y_label     Optional value-axis label.
-    horizontal  If true, bars grow left-to-right (good for ranked lists).
-
-    Example
-    -------
-    bar_chart(
-        title="Revenue by Quarter",
-        labels=["Q1", "Q2", "Q3", "Q4"],
-        series=[{"label": "Revenue ($M)", "data": [12.3, 15.1, 18.7, 21.2]}],
-    )
-    """
+    """Render an inline-SVG bar chart (categorical, ranked). Required: title, labels (list[str]), series (list of {label, data[], color?}). Optional: y_label, horizontal (bool). Returns rich-response JSON."""
     if not series or not labels:
         return json.dumps({"error": "series and labels are required."})
 
@@ -344,26 +300,7 @@ def pie_chart(
     values: list[float],
     colors: Optional[list[str]] = None,
 ) -> str:
-    """
-    Render a pie / donut chart inline in the chat.
-
-    Use for showing proportions or distributions.
-
-    Parameters
-    ----------
-    title   Chart title.
-    labels  Slice labels.
-    values  Numeric values for each slice (need not sum to 100).
-    colors  Optional list of hex colour strings. Defaults to the palette.
-
-    Example
-    -------
-    pie_chart(
-        title="Market Share",
-        labels=["MSFT", "GOOGL", "AMZN", "Other"],
-        values=[32, 28, 18, 22],
-    )
-    """
+    """Render an inline-SVG pie/donut chart (proportions). Required: title, labels (list[str]), values (list[float], any scale). Optional: colors (list[str] hex). Returns rich-response JSON."""
     if not labels or not values or len(labels) != len(values):
         return json.dumps({"error": "labels and values must be non-empty and same length."})
 
@@ -427,31 +364,7 @@ def data_table(
     rows: list[list],
     highlight_last_col: bool = False,
 ) -> str:
-    """
-    Render a styled data table inline in the chat.
-
-    Use for structured data, comparisons, and lists with multiple attributes.
-
-    Parameters
-    ----------
-    title               Table title shown above.
-    columns             Column header strings.
-    rows                List of rows; each row is a list of cell values (strings or numbers).
-    highlight_last_col  If true, the last column is highlighted (useful for % change, delta, etc.).
-
-    Example
-    -------
-    data_table(
-        title="Top Performers",
-        columns=["Ticker", "Price", "Market Cap", "52-wk Change"],
-        rows=[
-            ["MSFT", "$358.96", "$2.67T", "-4.2%"],
-            ["GOOGL", "$273.50", "$3.31T", "+72.3%"],
-            ["AMZN", "$200.95", "$2.16T", "+9.0%"],
-        ],
-        highlight_last_col=True,
-    )
-    """
+    """Render a styled data table inline. Required: title, columns (list[str]), rows (list[list]). Optional: highlight_last_col (bool) to colour +/- deltas. Returns rich-response JSON."""
     if not columns or not rows:
         return json.dumps({"error": "columns and rows are required."})
 
@@ -498,33 +411,7 @@ def metric_cards(
     cards: list[dict],
     title: str = "",
 ) -> str:
-    """
-    Render a row of metric / KPI cards inline in the chat.
-
-    Use for dashboards, stock quotes, performance summaries, or any set of
-    key numbers that benefit from visual emphasis.
-
-    Parameters
-    ----------
-    cards   List of card dicts. Each card may have:
-              - label    (str)   displayed as the card header
-              - value    (str)   the main number / metric
-              - change   (str, optional) e.g. "+0.61%" or "-4.2%"
-              - positive (bool, optional) true = green, false = red, omit = neutral
-              - sub      (str, optional) secondary line of text below change
-    title   Optional section title above the cards.
-
-    Example
-    -------
-    metric_cards(
-        title="Market Snapshot",
-        cards=[
-            {"label": "MSFT", "value": "$358.96", "change": "-4.2%", "positive": False},
-            {"label": "GOOGL", "value": "$273.50", "change": "+72.3%", "positive": True},
-            {"label": "AMZN", "value": "$200.95", "change": "+9.0%", "positive": True},
-        ],
-    )
-    """
+    """Render a row of KPI / metric cards inline (dashboards, quotes). Required: cards (list of {label, value, change?, positive?, sub?}). Optional: title. Returns rich-response JSON."""
     if not cards:
         return json.dumps({"error": "cards list is required."})
 
@@ -576,40 +463,7 @@ def comparison_grid(
     items: list[dict],
     attributes: Optional[list[dict]] = None,
 ) -> str:
-    """
-    Render a side-by-side comparison grid inline in the chat.
-
-    Use when comparing multiple items across a set of attributes (e.g. products,
-    stocks, models, pricing plans). Each item column shows all its attribute values.
-
-    Parameters
-    ----------
-    title       Grid title.
-    items       List of item dicts. Each has:
-                  - name       (str) item name / ticker
-                  - subtitle   (str, optional) e.g. company name
-                  - highlight  (str, optional) colour hex for the top border
-                  - attrs      (dict) attribute_key → display_value
-    attributes  Optional list of {"key": ..., "label": ...} to control order and
-                labels of displayed attributes. If omitted, keys from the first
-                item's attrs dict are used.
-
-    Example
-    -------
-    comparison_grid(
-        title="Stock Comparison",
-        items=[
-          {
-            "name": "MSFT", "subtitle": "Microsoft", "highlight": "#4e9af1",
-            "attrs": {"Price": "$358.96", "Market Cap": "$2.67T", "P/E": "22.5x", "52-wk": "-4.2%"}
-          },
-          {
-            "name": "GOOGL", "subtitle": "Alphabet", "highlight": "#4ef1a0",
-            "attrs": {"Price": "$273.50", "Market Cap": "$3.31T", "P/E": "25.3x", "52-wk": "+72.3%"}
-          },
-        ],
-    )
-    """
+    """Render a side-by-side comparison grid (products, stocks, plans). Required: title, items (list of {name, subtitle?, highlight?, attrs dict}). Optional: attributes (list of {key,label}) to pin order. Returns rich-response JSON."""
     if not items:
         return json.dumps({"error": "items list is required."})
 

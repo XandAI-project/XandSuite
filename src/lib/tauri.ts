@@ -331,6 +331,21 @@ export interface ToolCallEvent {
   turn: number;
 }
 
+/**
+ * Fired by the backend the moment a tool call is recognised in the LLM's
+ * streaming response — before arguments have finished arriving and well
+ * before dispatch. Carries only the identity of the call so the UI can
+ * render a "pending" tool card immediately. The full `ToolCallEvent` (with
+ * arguments) and `ToolResultEvent` follow once streaming and execution
+ * complete.
+ */
+export interface ToolCallPendingEvent {
+  conversation_id: string;
+  tool_call_id: string;
+  function_name: string;
+  turn: number;
+}
+
 export interface ToolResultEvent {
   conversation_id: string;
   tool_call_id: string;
