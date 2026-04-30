@@ -4,6 +4,27 @@ A local LLM desktop application built with Rust, Tauri v2, and React. XandSuite 
 
 ---
 
+## Screenshots
+
+### Reasoning & Tool Use
+The model thinks through its plan step by step, then uses built-in tools — like PDF creation — directly from the chat window.
+
+![XandSuite chat with reasoning and PDF tool](https://www.xandai.org/screenshots/Captura%20de%20tela%202026-04-11%20150642.png)
+
+### Image Generation — ComfyUI
+Describe your scene in plain language. XandSuite routes your prompt through ComfyUI and delivers the result directly in the chat window — entirely offline.
+
+![XandSuite image generation via ComfyUI](https://www.xandai.org/screenshots/Captura%20de%20tela%202026-04-11%20150855.png)
+
+### Model Management — HuggingFace Browser
+Browse thousands of GGUF models from HuggingFace, download them with a single click, and run them locally. No API keys. No data leaving your machine.
+
+![XandSuite model manager browsing HuggingFace](https://www.xandai.org/screenshots/Captura%20de%20tela%202026-04-11%20150921.png)
+
+More screenshots and feature walkthroughs at [xandai.org](https://www.xandai.org/).
+
+---
+
 ## Features
 
 ### Chat
