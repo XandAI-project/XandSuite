@@ -31,6 +31,36 @@ interface GalleryStore {
 // "all" is the key for fetchAllImages; a conversationId string is the key for fetchImages.
 const _inFlight = new Set<string>();
 
+/** Fields that affect how an image tile renders. */
+function sameImage(a: GalleryImage, b: GalleryImage): boolean {
+  return (
+    a.id === b.id &&
+    a.file_path === b.file_path &&
+    a.image_data === b.image_data &&
+    a.mime_type === b.mime_type &&
+    a.source === b.source
+  );
+}
+
+/**
+ * Merge a freshly-fetched image list into the previous one while preserving the
+ * object identity of unchanged entries. Returning the same references lets the
+ * memoized `ImageTile`s skip re-rendering, which is what kills the flicker when
+ * a new image arrives and the whole list is refetched. If nothing changed, the
+ * previous array reference is returned so Zustand skips the update entirely.
+ */
+function mergeImages(prev: GalleryImage[], next: GalleryImage[]): GalleryImage[] {
+  const prevById = new Map(prev.map((img) => [img.id, img]));
+  let changed = prev.length !== next.length;
+  const merged = next.map((n) => {
+    const old = prevById.get(n.id);
+    if (old && sameImage(old, n)) return old; // reuse reference
+    changed = true;
+    return n;
+  });
+  return changed ? merged : prev;
+}
+
 export const useGalleryStore = create<GalleryStore>((set, get) => ({
   images: [],
   scope: "conversation",
@@ -43,10 +73,14 @@ export const useGalleryStore = create<GalleryStore>((set, get) => ({
     if (_inFlight.has(key)) return;
     _inFlight.add(key);
     try {
-      const images = await invoke<GalleryImage[]>("list_gallery_images", {
+      const fetched = await invoke<GalleryImage[]>("list_gallery_images", {
         conversationId,
       });
-      set({ images, activeConversationId: conversationId, isInitialized: true });
+      set((s) => ({
+        images: mergeImages(s.images, fetched),
+        activeConversationId: conversationId,
+        isInitialized: true,
+      }));
     } catch (e) {
       console.error("Failed to fetch gallery images:", e);
     } finally {
@@ -59,8 +93,8 @@ export const useGalleryStore = create<GalleryStore>((set, get) => ({
     if (_inFlight.has(key)) return;
     _inFlight.add(key);
     try {
-      const images = await invoke<GalleryImage[]>("list_all_gallery_images");
-      set({ images, isInitialized: true });
+      const fetched = await invoke<GalleryImage[]>("list_all_gallery_images");
+      set((s) => ({ images: mergeImages(s.images, fetched), isInitialized: true }));
     } catch (e) {
       console.error("Failed to fetch all gallery images:", e);
     } finally {
@@ -107,7 +141,9 @@ export const useGalleryStore = create<GalleryStore>((set, get) => ({
   toggleGallery: () => set((s) => ({ galleryOpen: !s.galleryOpen })),
 
   setScope: (scope) => {
-    set({ scope, isInitialized: false });
+    // Keep `isInitialized` true so the existing grid stays on screen while the
+    // new scope loads — flipping it to false would flash the loading spinner.
+    set({ scope });
     const { activeConversationId, fetchImages, fetchAllImages } = get();
     if (scope === "all") {
       fetchAllImages();

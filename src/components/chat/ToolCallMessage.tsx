@@ -1,4 +1,4 @@
-import { useState, useEffect, memo } from "react";
+import { useState, useEffect, useRef, memo } from "react";
 import {
   ChevronDown,
   ChevronRight,
@@ -264,19 +264,56 @@ interface ImageGenResultData {
   prompt?: string;
 }
 
+// A persisted gallery image is served at this local URL, but the Tauri WebView
+// cannot load it over HTTP (the HTTP server only runs when the mobile API is
+// enabled). We must always resolve such images through the gallery store.
+const LOCAL_GALLERY_RE = /\/images\/([^/?#]+)/;
+
 /** Resolve the best image src for a generated image.
- *  Prefers the on-disk file via asset:// protocol, then persisted base64,
- *  and falls back to the live ComfyUI URL. */
-function useImageSrc(result: ImageGenResultData): string | undefined {
+ *
+ *  When the image was persisted to the gallery (`gallery_id`, or an
+ *  `.../images/<id>` URL) we resolve it through the gallery store as an
+ *  asset:// path / base64 data URL — the raw localhost HTTP URL is never
+ *  loadable in the desktop WebView. While the gallery entry is still being
+ *  fetched we report `pending` so the caller can show a skeleton instead of a
+ *  broken image. Non-gallery URLs (e.g. a live ComfyUI `/view` URL) are used
+ *  as-is. */
+function useImageSrc(result: ImageGenResultData): { src?: string; pending: boolean } {
   const galleryImages = useGalleryStore((s) => s.images);
-  if (result.gallery_id) {
-    const galleryEntry = galleryImages.find((img) => img.id === result.gallery_id);
-    if (galleryEntry) {
-      const resolved = resolveGallerySrc(galleryEntry);
-      if (resolved) return resolved;
+
+  // Determine the gallery id, either explicit or embedded in the URL.
+  const galleryId =
+    result.gallery_id ||
+    (result.image_url ? result.image_url.match(LOCAL_GALLERY_RE)?.[1] : undefined) ||
+    null;
+
+  // Hold the last successfully-resolved src so transient gallery refetches
+  // (which momentarily replace the list) don't flash a skeleton.
+  const stableSrcRef = useRef<string | undefined>(undefined);
+
+  // Trigger a gallery fetch when we have an id but the entry isn't loaded yet.
+  const entry = galleryId ? galleryImages.find((img) => img.id === galleryId) : null;
+  useEffect(() => {
+    if (!galleryId || entry) return;
+    const s = useGalleryStore.getState();
+    if (s.scope === "all") s.fetchAllImages();
+    else if (s.activeConversationId) s.fetchImages(s.activeConversationId);
+  }, [galleryId, entry]);
+
+  if (entry) {
+    const resolved = resolveGallerySrc(entry);
+    if (resolved) {
+      stableSrcRef.current = resolved;
+      return { src: resolved, pending: false };
     }
   }
-  return result.image_url;
+  if (stableSrcRef.current) {
+    return { src: stableSrcRef.current, pending: false };
+  }
+  // A gallery image we couldn't resolve yet → pending (don't show the raw
+  // localhost URL). A non-gallery URL → use it directly.
+  if (galleryId) return { src: undefined, pending: true };
+  return { src: result.image_url, pending: false };
 }
 
 
@@ -284,14 +321,25 @@ function useImageSrc(result: ImageGenResultData): string | undefined {
 
 function AlwaysVisibleImagePreview({ raw }: { raw: string }) {
   let r: ImageGenResultData = {};
+  let parsed = true;
   try {
     r = JSON.parse(raw);
   } catch {
-    return null;
+    parsed = false;
   }
 
   // eslint-disable-next-line react-hooks/rules-of-hooks
-  const src = useImageSrc(r);
+  const { src, pending } = useImageSrc(parsed ? r : {});
+  if (!parsed) return null;
+
+  if (pending) {
+    return (
+      <div className="border-t border-purple-500/20 px-3 pb-3 pt-2">
+        <div className="rounded-md border border-border bg-muted/30 animate-pulse w-full h-48" />
+      </div>
+    );
+  }
+
   if (!src) return null;
 
   return (

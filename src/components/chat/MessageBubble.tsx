@@ -560,6 +560,13 @@ export const markdownComponents: React.ComponentProps<typeof ReactMarkdown>["com
     if (isVideoUrl(href)) {
       return <InlineVideo src={href!} />;
     }
+    // The LLM frequently links generated images as `[View Image](.../images/<id>)`
+    // instead of embedding them with `![](...)`. Render those as the actual
+    // image (resolved through the gallery store) rather than a plain hyperlink.
+    if (href && LOCAL_GALLERY_RE.test(href)) {
+      const label = typeof children === "string" ? children : undefined;
+      return <GalleryAwareImage src={href} alt={label} />;
+    }
     return (
       <a href={href} target="_blank" rel="noreferrer" className="text-primary underline hover:no-underline">
         {children}
