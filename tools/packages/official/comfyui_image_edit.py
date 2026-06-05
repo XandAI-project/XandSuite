@@ -228,6 +228,24 @@ def _upload_image(image_source: str) -> tuple[str | None, str | None]:
             # Local file path
             if not os.path.isfile(image_source):
                 return None, f"Input image file not found: '{image_source}'"
+            # Validate the file is actually an image (guards against empty or
+            # corrupt files from gallery resolution).
+            try:
+                with open(image_source, "rb") as _check_fh:
+                    _check_bytes = _check_fh.read(512)
+                if not _check_bytes:
+                    return None, (
+                        f"Input image file is empty (0 bytes): '{image_source}'. "
+                        "The gallery image may not have been saved correctly."
+                    )
+                if _detect_image_ext(_check_bytes) is None:
+                    snippet = _check_bytes[:80].decode("utf-8", errors="replace").replace("\n", " ")
+                    return None, (
+                        f"Input file does not appear to be a valid image: '{image_source}' "
+                        f"(starts with: {snippet!r}). Expected PNG, JPEG, WebP, GIF or BMP."
+                    )
+            except OSError as exc:
+                return None, f"Could not read input image file: {exc}"
             upload_path = image_source
             upload_name = os.path.basename(image_source)
 

@@ -2729,9 +2729,11 @@ fn walk_and_replace(
         Value::String(s) => {
             if s.starts_with(prefix) {
                 let gallery_id = &s[prefix.len()..];
-                if let Some(path) = gallery_id_to_temp_file(gallery_id, state) {
+                if let Some((path, is_temp)) = gallery_id_to_local_path(gallery_id, state) {
                     *s = path.clone();
-                    temp_files.push(TempFile(path));
+                    if is_temp {
+                        temp_files.push(TempFile(path));
+                    }
                 }
             }
         }
@@ -2749,42 +2751,79 @@ fn walk_and_replace(
     }
 }
 
-fn gallery_id_to_temp_file(gallery_id: &str, state: &crate::state::AppState) -> Option<String> {
-    // Load image_data and mime_type from the gallery.
-    let (image_data, mime_type, filename): (String, String, String) = {
+/// Resolve a gallery image to a local file path the Python subprocess can read.
+///
+/// Returns `(path, is_temp)`.  When `is_temp` is **true** the caller must
+/// track the path in a `TempFile` so it gets cleaned up after the tool call.
+/// When **false** the path points to the permanent gallery file on disk and
+/// must NOT be deleted.
+fn gallery_id_to_local_path(
+    gallery_id: &str,
+    state: &crate::state::AppState,
+) -> Option<(String, bool)> {
+    let (file_path, image_data, mime_type, filename): (String, String, String, String) = {
         let db = state.db.lock().unwrap();
         db.conn.query_row(
-            "SELECT image_data, mime_type, filename FROM gallery_images WHERE id = ?1",
+            "SELECT COALESCE(file_path, ''), image_data, mime_type, filename \
+             FROM gallery_images WHERE id = ?1",
             rusqlite::params![gallery_id],
             |row| Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
             )),
         ).ok()?
     };
 
-    // If `image_data` is base64 — decode to bytes.
-    // If it's still a URL (legacy), we can't help here; skip.
-    if image_data.starts_with("http://") || image_data.starts_with("https://") {
-        log::warn!(
-            "[gallery-resolve] Gallery entry {} has a URL instead of base64 data; skipping temp-file resolution",
-            gallery_id
+    // Preferred: the image is already on disk via the gallery file_path column.
+    if !file_path.is_empty() && std::path::Path::new(&file_path).is_file() {
+        log::info!(
+            "[gallery-resolve] Using on-disk gallery file for {}: {}",
+            gallery_id, file_path
         );
+        return Some((file_path, false));
+    }
+
+    // Legacy / fallback: image_data is base64.  URL values can't be turned
+    // into a local file here — the Python tool can download them itself.
+    if image_data.is_empty()
+        || image_data.starts_with("http://")
+        || image_data.starts_with("https://")
+    {
+        if image_data.is_empty() {
+            log::warn!(
+                "[gallery-resolve] Gallery entry {} has no file_path and no image_data",
+                gallery_id
+            );
+        } else {
+            log::warn!(
+                "[gallery-resolve] Gallery entry {} has a URL instead of local data; skipping",
+                gallery_id
+            );
+        }
         return None;
     }
 
     use base64::Engine as _;
-    let bytes = base64::engine::general_purpose::STANDARD.decode(&image_data).ok()?;
+    let bytes = match base64::engine::general_purpose::STANDARD.decode(&image_data) {
+        Ok(b) if b.is_empty() => {
+            log::warn!("[gallery-resolve] Empty base64 for gallery entry {}", gallery_id);
+            return None;
+        }
+        Ok(b) => b,
+        Err(e) => {
+            log::warn!("[gallery-resolve] base64 decode failed for {}: {}", gallery_id, e);
+            return None;
+        }
+    };
 
-    // Determine extension from mime type.
     let ext = match mime_type.as_str() {
         "image/jpeg" | "image/jpg" => ".jpg",
         "image/png" => ".png",
         "image/webp" => ".webp",
         "image/gif" => ".gif",
         _ => {
-            // Fall back to the filename's extension.
             std::path::Path::new(&filename)
                 .extension()
                 .and_then(|e| e.to_str())
@@ -2800,11 +2839,10 @@ fn gallery_id_to_temp_file(gallery_id: &str, state: &crate::state::AppState) -> 
     match std::fs::write(&tmp_path, &bytes) {
         Ok(_) => {
             log::info!(
-                "[gallery-resolve] Wrote gallery image {} to {}",
-                gallery_id,
-                tmp_path.display()
+                "[gallery-resolve] Wrote {} bytes for gallery {} to {}",
+                bytes.len(), gallery_id, tmp_path.display()
             );
-            Some(tmp_path.to_string_lossy().into_owned())
+            Some((tmp_path.to_string_lossy().into_owned(), true))
         }
         Err(e) => {
             log::error!("[gallery-resolve] Failed to write temp file: {}", e);

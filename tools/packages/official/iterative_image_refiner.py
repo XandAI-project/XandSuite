@@ -202,6 +202,17 @@ def _upload_image(image_source: str) -> tuple[str | None, str | None]:
         else:
             if not os.path.isfile(image_source):
                 return None, f"File not found: {image_source}"
+            # Validate the file contains actual image data.
+            try:
+                with open(image_source, "rb") as _cf:
+                    _hdr = _cf.read(16)
+                if not _hdr:
+                    return None, f"Input image file is empty (0 bytes): {image_source}"
+                _known = [b"\x89PNG", b"\xff\xd8\xff", b"RIFF", b"GIF8", b"BM"]
+                if not any(_hdr.startswith(m) for m in _known):
+                    return None, f"Input file does not look like a valid image: {image_source}"
+            except OSError as exc:
+                return None, f"Could not read input image: {exc}"
             upload_path = image_source
             upload_name = os.path.basename(image_source)
 
