@@ -1,5 +1,18 @@
 import { create } from "zustand";
 import { invoke } from "@/lib/tauri";
+import { useSkillsStore } from "@/stores/skillsStore";
+
+/**
+ * Refresh the skills store after a package change so the connected-server list,
+ * the tool count and the available-tools list stay in sync with the live
+ * backend MCP servers — no app restart required. Runs alongside the backend
+ * `skills_updated` event for transports where that event isn't delivered.
+ */
+function refreshSkills() {
+  const s = useSkillsStore.getState();
+  void s.fetchServers();
+  void s.fetchTools();
+}
 
 // ── Types mirroring Rust structs ──────────────────────────────────────────────
 
@@ -108,6 +121,7 @@ export const usePackagesStore = create<PackagesStore>((set, get) => ({
     try {
       await invoke("install_package", { packageId, config });
       await get().fetchOfficial();
+      refreshSkills();
       set({ isLoading: false });
     } catch (e) {
       set({ error: String(e), isLoading: false });
@@ -120,6 +134,7 @@ export const usePackagesStore = create<PackagesStore>((set, get) => ({
     try {
       await invoke("uninstall_package", { packageId });
       await get().fetchOfficial();
+      refreshSkills();
       set({ isLoading: false });
     } catch (e) {
       set({ error: String(e), isLoading: false });
@@ -155,6 +170,7 @@ export const usePackagesStore = create<PackagesStore>((set, get) => ({
     try {
       await invoke("delete_custom_package", { id });
       await get().fetchCustom();
+      refreshSkills();
       set({ isLoading: false });
     } catch (e) {
       set({ error: String(e), isLoading: false });
@@ -167,6 +183,7 @@ export const usePackagesStore = create<PackagesStore>((set, get) => ({
     try {
       await invoke("install_custom_package", { id });
       await get().fetchCustom();
+      refreshSkills();
       set({ isLoading: false });
     } catch (e) {
       set({ error: String(e), isLoading: false });
@@ -179,6 +196,7 @@ export const usePackagesStore = create<PackagesStore>((set, get) => ({
     try {
       await invoke("uninstall_custom_package", { id });
       await get().fetchCustom();
+      refreshSkills();
       set({ isLoading: false });
     } catch (e) {
       set({ error: String(e), isLoading: false });

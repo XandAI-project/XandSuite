@@ -147,6 +147,16 @@ export const useSkillsStore = create<SkillsStore>((set, get) => {
     }));
   });
 
+  // Emitted by the backend whenever the set of connected MCP servers changes
+  // (package installed / uninstalled / reconfigured). Re-fetch so the tool
+  // count, skills panel and available-tools list reflect the change without an
+  // app restart. The backend tool context for the LLM is already live; this
+  // keeps the frontend view in sync.
+  listen("skills_updated", () => {
+    void get().fetchServers();
+    void get().fetchTools();
+  });
+
   return {
     servers: [],
     tools: [],

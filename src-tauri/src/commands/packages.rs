@@ -44,6 +44,15 @@ fn emit_log(app: &tauri::AppHandle, level: &str, message: &str) {
     }
 }
 
+/// Notify the frontend that the set of connected MCP servers changed (a package
+/// was installed, uninstalled or reconfigured). The skills store listens for
+/// this and re-fetches `list_skill_servers` / `list_tools`, so the tool count,
+/// the skills panel and the LLM tool context all reflect the change without an
+/// app restart.
+fn emit_skills_updated(app: &tauri::AppHandle) {
+    let _ = app.emit("skills_updated", json!({ "ts": chrono::Utc::now().to_rfc3339() }));
+}
+
 /// Format the full anyhow error chain so no cause is hidden.
 ///
 /// Example output:
@@ -558,6 +567,7 @@ async fn install_package_impl(
     });
     save_installed(&state, &installed)?;
 
+    emit_skills_updated(&state.app_handle);
     emit_log(&state.app_handle, "info", &format!("[packages] '{}' installed successfully", package_id));
     Ok(())
 }
@@ -568,6 +578,7 @@ pub async fn uninstall_package_inner(package_id: &str, state: &AppState) -> Resu
     let mut installed = load_installed(state);
     installed.retain(|i| i.mcp_server_id != mcp_id);
     save_installed(state, &installed)?;
+    emit_skills_updated(&state.app_handle);
     log::info!("[packages] '{}' uninstalled", package_id);
     Ok(())
 }
@@ -703,6 +714,7 @@ pub async fn delete_custom_package_inner(id: &str, state: &AppState) -> Result<(
     meta_list.retain(|m| m.id != id);
     save_custom_meta(state, &meta_list)?;
     let _ = std::fs::remove_file(packages_dir().join("custom").join(format!("{}.py", id)));
+    emit_skills_updated(&state.app_handle);
     log::info!("[packages] custom '{}' deleted", id);
     Ok(())
 }
@@ -800,6 +812,7 @@ async fn install_custom_package_impl(id: String, state: &AppState) -> Result<(),
     });
     save_installed(&state, &installed)?;
 
+    emit_skills_updated(&state.app_handle);
     emit_log(&state.app_handle, "info", &format!("[packages] custom '{}' installed successfully", id));
     Ok(())
 }
@@ -810,6 +823,7 @@ pub async fn uninstall_custom_package_inner(id: &str, state: &AppState) -> Resul
     let mut installed = load_installed(state);
     installed.retain(|i| i.mcp_server_id != mcp_id);
     save_installed(state, &installed)?;
+    emit_skills_updated(&state.app_handle);
     log::info!("[packages] custom '{}' uninstalled", id);
     Ok(())
 }

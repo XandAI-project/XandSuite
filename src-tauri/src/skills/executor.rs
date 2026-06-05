@@ -257,6 +257,18 @@ impl SkillsExecutor {
 
         let any_hit = scores.iter().any(|(_, s)| *s > 0) || sticky_server.is_some();
 
+        // Capability families with at least one positively-scored member.
+        // Every installed member of an active family is co-scoped so related
+        // tools (e.g. image generate + edit + refine) are discovered together.
+        let active_families: std::collections::HashSet<&'static str> = scores
+            .iter()
+            .filter(|(_, s)| *s > 0)
+            .filter_map(|(sid, _)| server_family(sid))
+            .collect();
+        // The sticky server (last tool the model used) also activates its family
+        // so a follow-up turn keeps sibling tools available.
+        let sticky_family = sticky_server.as_deref().and_then(server_family);
+
         let kept: Vec<(String, Vec<ToolDefinition>, i32)> = by_server
             .into_iter()
             .filter_map(|(sid, tools)| {
@@ -273,6 +285,10 @@ impl SkillsExecutor {
                     return None;
                 }
                 let is_browser_always_on = browser_mode && sid == "browser_agent";
+                // Member of a family that another tool already activated.
+                let in_active_family = server_family(&sid)
+                    .map(|f| active_families.contains(f) || sticky_family == Some(f))
+                    .unwrap_or(false);
 
                 let keep = if browser_autostart_only && sid == "browser_agent" {
                     // Autostart-only browser tools require an explicit web-intent
@@ -281,7 +297,11 @@ impl SkillsExecutor {
                 } else if !any_hit {
                     true // general chat — keep everything
                 } else {
-                    score > 0 || is_sticky || is_always_on_util || is_browser_always_on
+                    score > 0
+                        || is_sticky
+                        || is_always_on_util
+                        || is_browser_always_on
+                        || in_active_family
                 };
 
                 if keep {
@@ -1928,19 +1948,25 @@ fn server_keywords(server_id: &str) -> Option<&'static [&'static str]> {
         ]),
         "comfyui_image" => Some(&[
             "image", "draw", "picture", "render", "illustration", "portrait",
+            "photo", "generate an image", "create an image",
         ]),
         "comfyui_image_edit" => Some(&[
-            "edit image", "modify image", "inpaint", "alter image", "retouch",
+            "edit", "inpaint", "outpaint", "retouch", "img2img",
+            "edit image", "image edit", "modify image", "alter image",
+            "change the image", "change the picture", "modify the picture",
+            "remove background", "replace background", "edit photo",
+            "edit picture", "redraw", "mask", "adjust the image",
         ]),
         "iterative_image_refiner" => Some(&[
             "image", "refine", "iterate", "artifact", "quality",
-            "draw", "picture", "render", "illustration", "portrait",
+            "draw", "picture", "render", "illustration", "portrait", "photo",
         ]),
         "comfyui_video" => Some(&[
             "video", "animate", "motion", "clip",
         ]),
         "comfyui_img2video" => Some(&[
-            "video from image", "animate image", "img2video", "image to video",
+            "video", "video from image", "animate image", "img2video",
+            "image to video", "animate", "motion",
         ]),
         "blender_mcp" => Some(&[
             "blender", "3d", "mesh", "viewport", "polyhaven", "poly haven",
@@ -1955,6 +1981,29 @@ fn server_keywords(server_id: &str) -> Option<&'static [&'static str]> {
             "open page", "open url", "open website",
             "go to site", "go to website",
         ]),
+        _ => None,
+    }
+}
+
+/// Capability family for a server, used for co-scoping related tools.
+///
+/// Tools in the same family are about the same kind of task (e.g. generating,
+/// editing and refining an image). The scope scorer keeps every installed
+/// member of a family in scope as soon as ANY member gets a positive keyword
+/// hit. This is what lets the model discover `comfyui_image_edit` when the
+/// user is talking about images even if they never typed the exact phrase
+/// "edit image" — the related `comfyui_image` package scores on "image" and
+/// drags the whole family along.
+///
+/// `pkg__` prefixes are stripped so installed packages map to the same family
+/// as their bare ids.
+fn server_family(server_id: &str) -> Option<&'static str> {
+    let server_id = server_id.strip_prefix("pkg__").unwrap_or(server_id);
+    match server_id {
+        // Image generation / editing / refinement all operate on images.
+        "comfyui_image" | "comfyui_image_edit" | "iterative_image_refiner" => Some("image"),
+        // Video generation, including image-to-video.
+        "comfyui_video" | "comfyui_img2video" => Some("video"),
         _ => None,
     }
 }
@@ -3081,6 +3130,40 @@ mod tests {
             score_server("pkg__blender_mcp", text),
             score_server("blender_mcp", text)
         );
+    }
+
+    #[test]
+    fn score_server_matches_natural_image_edit_phrases() {
+        // Common ways a user asks for an edit must score the edit package so it
+        // isn't filtered out alongside the generation package.
+        assert!(score_server("comfyui_image_edit", "edit this image to add a hat") > 0);
+        assert!(score_server("comfyui_image_edit", "inpaint the background") > 0);
+        assert!(score_server("comfyui_image_edit", "remove background from the photo") > 0);
+        assert!(score_server("pkg__comfyui_image_edit", "img2img on this picture") > 0);
+    }
+
+    // ── server_family ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn server_family_groups_image_tools() {
+        assert_eq!(server_family("comfyui_image"), Some("image"));
+        assert_eq!(server_family("comfyui_image_edit"), Some("image"));
+        assert_eq!(server_family("iterative_image_refiner"), Some("image"));
+        // pkg__ prefix is stripped before lookup.
+        assert_eq!(server_family("pkg__comfyui_image_edit"), Some("image"));
+    }
+
+    #[test]
+    fn server_family_groups_video_tools() {
+        assert_eq!(server_family("comfyui_video"), Some("video"));
+        assert_eq!(server_family("comfyui_img2video"), Some("video"));
+    }
+
+    #[test]
+    fn server_family_none_for_unrelated_servers() {
+        assert_eq!(server_family("blender_mcp"), None);
+        assert_eq!(server_family("latex_pdf"), None);
+        assert_eq!(server_family("file_ops"), None);
     }
 
     // ── is_always_on ────────────────────────────────────────────────────────
