@@ -1087,6 +1087,13 @@ def compile_latex(source: str, filename: str) -> str:
         )
 
     result = _run_latex(source, filename, engine_path, TIMEOUT)
+    if result.get("status") == "created":
+        result["source"] = {
+            "generator_tool": "compile_latex",
+            "format": "latex",
+            "body": source,
+            "args": {"filename": filename},
+        }
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -1108,6 +1115,13 @@ def create_latex_pdf(
     body_latex = _markdown_to_latex(content or "")
     source = _build_document(title=title or "", author=author or "", body_latex=body_latex)
     result = _run_latex(source, filename, engine_path, TIMEOUT)
+    if result.get("status") == "created":
+        result["source"] = {
+            "generator_tool": "create_latex_pdf",
+            "format": "markdown",
+            "body": content,
+            "args": {"filename": filename, "title": title, "author": author},
+        }
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -1155,6 +1169,13 @@ def render_equation(
         r"\end{document}" + "\n"
     )
     result = _run_latex(source, filename, engine_path, TIMEOUT)
+    if result.get("status") == "created":
+        result["source"] = {
+            "generator_tool": "render_equation",
+            "format": "latex",
+            "body": source,
+            "args": {"equation": equation, "filename": filename, "display": display, "fontsize": fontsize},
+        }
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -1211,6 +1232,13 @@ def create_math_document(
     body_latex = "\n\n".join(body_parts)
     source = _build_document(title=title or "", author=author or "", body_latex=body_latex)
     result = _run_latex(source, filename, engine_path, TIMEOUT)
+    if result.get("status") == "created":
+        result["source"] = {
+            "generator_tool": "create_math_document",
+            "format": "sections",
+            "body": json.dumps(sections, ensure_ascii=False),
+            "args": {"filename": filename, "title": title, "author": author},
+        }
     return json.dumps(result, ensure_ascii=False)
 
 

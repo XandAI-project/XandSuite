@@ -1,7 +1,9 @@
 #![allow(dead_code)]
 
 mod agent;
+mod agent_browser;
 mod api_server;
+mod artifact_editor;
 mod code_runner;
 mod coding;
 mod commands;
@@ -268,6 +270,23 @@ pub fn run() {
             // KokoroTTS sidecar manager
             let tts = Arc::new(TokioMutex::new(KokoroManager::new()));
 
+            // Browser Agent infrastructure (lazy — the Chromium process is
+            // only launched when the user opens the Browser Agent tab and
+            // starts a session).
+            let browser_sessions = Arc::new(
+                crate::agent_browser::session::BrowserSessionRegistry::new(),
+            );
+            let browser_profiles = Arc::new(
+                crate::agent_browser::profile::ProfileManager::new(&data_dir),
+            );
+            let browser_safety = Arc::new(
+                crate::agent_browser::safety::SafetyGate::default(),
+            );
+            let browser_cookie_vault = Arc::new(
+                crate::agent_browser::cookie_vault::CookieVault::open(&data_dir)
+                    .expect("failed to open browser cookie vault"),
+            );
+
             let app_state = AppState {
                 db,
                 engine,
@@ -288,6 +307,10 @@ pub fn run() {
                 app_handle,
                 generation_cancelled: Arc::new(AtomicBool::new(false)),
                 tool_active,
+                browser_sessions,
+                browser_profiles,
+                browser_safety,
+                browser_cookie_vault,
             };
 
             // Create an Arc<AppState> for the HTTP server (shares all Arc fields)
@@ -406,6 +429,7 @@ pub fn run() {
             commands::artifacts::list_all_artifacts,
             commands::artifacts::delete_artifact,
             commands::artifacts::update_artifact,
+            commands::artifacts::undo_artifact_edit,
             commands::attachments::read_attachment,
             commands::attachments::read_file_as_base64,
             commands::coding::create_coding_session,
@@ -460,6 +484,28 @@ pub fn run() {
             commands::tts::download_tts_models,
             commands::tts::get_tts_log,
             commands::tts::setup_tts_deps,
+            commands::browser_agent::start_browser_session,
+            commands::browser_agent::stop_browser_session,
+            commands::browser_agent::start_browser_screencast,
+            commands::browser_agent::stop_browser_screencast,
+            commands::browser_agent::pause_browser_session,
+            commands::browser_agent::resume_browser_session,
+            commands::browser_agent::set_browser_takeover,
+            commands::browser_agent::forward_browser_mouse,
+            commands::browser_agent::forward_browser_key,
+            commands::browser_agent::get_browser_session_status,
+            commands::browser_agent::browser_toolbar_navigate,
+            commands::browser_agent::browser_toolbar_reload,
+            commands::browser_agent::browser_toolbar_back,
+            commands::browser_agent::browser_toolbar_forward,
+            commands::browser_agent::list_browser_cookie_sessions,
+            commands::browser_agent::preview_cookie_paste,
+            commands::browser_agent::save_browser_cookie_session,
+            commands::browser_agent::update_browser_cookie_session,
+            commands::browser_agent::delete_browser_cookie_session,
+            commands::browser_agent::inject_cookies,
+            commands::browser_agent::get_browser_agent_autostart,
+            commands::browser_agent::set_browser_agent_autostart,
         ])
         .build(tauri::generate_context!())
         .expect("error building XandSuite")

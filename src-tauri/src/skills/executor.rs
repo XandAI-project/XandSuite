@@ -26,8 +26,14 @@ use crate::db::AppDb;
 use crate::engine::remote::RemoteEngine;
 use crate::models::InferenceConfig;
 
-const MAX_TOOL_TURNS: usize = 8;
+/// Browser agent tasks can require many sequential steps (navigate → snapshot
+/// → find input → type → enter → wait → snapshot → read results → done).
+/// Allow enough turns so the agent can complete a realistic multi-step web task
+/// without hitting the ceiling prematurely.
+const MAX_TOOL_TURNS: usize = 30;
 const CODE_RUNNER_SERVER_ID: &str = "code_runner";
+const BROWSER_AGENT_SERVER_ID: &str = "browser_agent";
+const ARTIFACT_EDITOR_SERVER_ID: &str = "artifact_editor";
 /// Maximum number of times we'll re-issue a turn because the model emitted
 /// invalid tool-call JSON (missing required fields or unparseable arguments).
 /// Beyond this the executor surfaces the validation error instead of looping.
@@ -90,7 +96,30 @@ pub struct SkillsExecutor {
     /// LaTeX compile failures) so we can force a bounded retry with a pinned
     /// `tool_choice`. Capped by `MAX_TOOL_ERROR_RETRIES`.
     tool_error_retries: AtomicUsize,
+    /// When set, the browser_agent built-in tools are injected and dispatched
+    /// against the active session for this conversation.
+    browser_agent_enabled: bool,
+    /// True when an active browser session already exists (tab open). False
+    /// when the tools are only present for LLM-initiated autostart. In
+    /// autostart-only mode the scope scorer must positively match web-related
+    /// keywords before the tools are surfaced — otherwise the LLM reaches for
+    /// the browser on every turn.
+    browser_session_active: bool,
+    /// Counts consecutive "no-op" browser-agent turns (no URL change, no
+    /// interactive-node delta) so the executor can inject a corrective user
+    /// message and break the loop out of a stuck plan.
+    browser_stuck_count: AtomicUsize,
+    /// Last (tool_name, arguments_json) pair seen in the browser_agent branch.
+    /// Used to detect consecutive identical calls — the cheapest robust
+    /// heuristic for "the plan isn't making progress".
+    browser_last_call: Mutex<Option<(String, String)>>,
 }
+
+/// How many consecutive identical browser_agent calls are tolerated before
+/// we inject a corrective prompt. Set high enough to not fire on legitimate
+/// sequential snapshots (e.g. scroll-then-snapshot chains), but low enough to
+/// catch genuine infinite loops.
+const MAX_BROWSER_STUCK_TURNS: usize = 4;
 
 impl SkillsExecutor {
     pub fn new(skills: Arc<SkillsManager>) -> Self {
@@ -101,7 +130,25 @@ impl SkillsExecutor {
             code_exec_retries: AtomicUsize::new(0),
             tool_call_retries: AtomicUsize::new(0),
             tool_error_retries: AtomicUsize::new(0),
+            browser_agent_enabled: false,
+            browser_session_active: false,
+            browser_stuck_count: AtomicUsize::new(0),
+            browser_last_call: Mutex::new(None),
         }
+    }
+
+    /// Enable the built-in browser_agent tools for this invocation.
+    ///
+    /// `session_active` should be `true` when a live `BrowserSession` already
+    /// exists for the conversation (the tab is open). When `false`, the tools
+    /// are registered for LLM-initiated autostart but will be hidden by the
+    /// scope scorer unless the user's message contains explicit web-related
+    /// keywords — preventing the model from reaching for the browser on
+    /// every normal chat turn.
+    pub fn with_browser_agent(mut self, session_active: bool) -> Self {
+        self.browser_agent_enabled = true;
+        self.browser_session_active = session_active;
+        self
     }
 
     /// Enable the built-in code execution tools for this invocation.
@@ -143,6 +190,14 @@ impl SkillsExecutor {
             tools.push(code_runner_list_artifacts_tool());
         }
 
+        if self.browser_agent_enabled {
+            tools.extend(crate::agent_browser::tools::browser_agent_tool_definitions());
+        }
+
+        if self.code_runner_db.is_some() {
+            tools.extend(artifact_editor_tool_definitions());
+        }
+
         tools
     }
 
@@ -172,6 +227,19 @@ impl SkillsExecutor {
         let recent_user_text = collect_recent_user_text(messages, 2);
         let sticky_server = last_assistant_tool_server(messages);
         let strong_latex = has_strong_latex_intent(&recent_user_text);
+        // When the executor has an *active* browser session, the browser
+        // tools are always in scope and `code_runner` is kept out of the way
+        // (the agent should never shell out — the prompt also forbids it).
+        // In autostart-only mode (`browser_agent_enabled && !browser_session_active`)
+        // browser tools are treated like any other package: they only appear
+        // when the scope scorer gives them a positive keyword match.
+        let browser_mode = self.browser_session_active;
+        // True when browser tools are registered for LLM autostart but no
+        // session is live yet. In this state we must NEVER surface browser
+        // tools via the "keep everything" general-chat fallback — only when
+        // the user's message explicitly scores for web intent. Otherwise the
+        // model reaches for `browser_agent__*` (e.g. `done`) on unrelated turns.
+        let browser_autostart_only = self.browser_agent_enabled && !self.browser_session_active;
 
         // Group tools by server_id so we can include/exclude whole servers.
         let mut by_server: std::collections::BTreeMap<String, Vec<ToolDefinition>> =
@@ -199,11 +267,21 @@ impl SkillsExecutor {
                     .unwrap_or(0);
                 let is_sticky = sticky_server.as_deref() == Some(sid.as_str());
                 let is_always_on_util = is_always_on(&sid, strong_latex);
+                // In browser mode, browser_agent is always in scope and
+                // code_runner is dropped — same shape as the LaTeX guard.
+                if browser_mode && sid == "code_runner" {
+                    return None;
+                }
+                let is_browser_always_on = browser_mode && sid == "browser_agent";
 
-                let keep = if !any_hit {
+                let keep = if browser_autostart_only && sid == "browser_agent" {
+                    // Autostart-only browser tools require an explicit web-intent
+                    // keyword hit; never kept by the general-chat catch-all.
+                    score > 0
+                } else if !any_hit {
                     true // general chat — keep everything
                 } else {
-                    score > 0 || is_sticky || is_always_on_util
+                    score > 0 || is_sticky || is_always_on_util || is_browser_always_on
                 };
 
                 if keep {
@@ -307,6 +385,18 @@ impl SkillsExecutor {
         // (b) re-pin `tool_choice` so the retry hits the same tool again.
         let mut prior_tool_error: Option<(String, String)> = None;
 
+        // Set to true once the agent calls `browser_agent__done`. Only
+        // meaningful when `self.browser_agent_enabled` is set. We use it to
+        // refuse to terminate the loop on a prose-only turn — the model must
+        // explicitly call `done` to exit an active browsing task.
+        let mut browser_done_called = false;
+        // Count turns where the model emitted prose instead of a tool call
+        // during a browser-agent session. Three consecutive no-tool turns
+        // means the model is genuinely stuck (not just chatty); at that point
+        // we give up and let the text through so the user isn't blocked.
+        let mut browser_no_tool_turns: usize = 0;
+        const MAX_BROWSER_NO_TOOL_TURNS: usize = 3;
+
         for turn in 0..MAX_TOOL_TURNS {
             // Check cancellation at the start of every turn (covers the gap
             // between tool dispatch and the next LLM call).
@@ -323,6 +413,24 @@ impl SkillsExecutor {
             // call updates the sticky-server bias.
             let tools =
                 self.scope_tools_for_turn(full_tools.clone(), &messages, n_ctx);
+
+            // History-level trimming. `scope_tools_for_turn` only drops tool
+            // *definitions*; the history itself grows unbounded across a long
+            // agent loop (browser snapshots, read_page, code_runner stdout…)
+            // and will eventually blow past the llama-server context window
+            // with a `500 Context size has been exceeded`. The trimmer here
+            // truncates oversized old tool results first, and only drops the
+            // oldest turn groups if that still isn't enough.
+            let trimmed_chars = trim_history_to_budget(&mut messages, &tools, n_ctx);
+            if trimmed_chars > 0 {
+                log_event(
+                    "info",
+                    format!(
+                        "[executor] Turn {} — trimmed {} chars of old history to fit context (n_ctx={})",
+                        turn, trimmed_chars, n_ctx
+                    ),
+                );
+            }
 
             if tools.is_empty() {
                 // Shouldn't happen (scoping always keeps at least something in
@@ -502,6 +610,58 @@ impl SkillsExecutor {
                     continue;
                 }
 
+                // ── Browser agent: force the loop to continue until `done` ──
+                //
+                // Without this the model happily emits prose like "I'll search
+                // for that…" and the executor mistakes it for a final answer,
+                // terminating the loop after a single action. In browser-agent
+                // mode the contract is clear: the task only ends when the
+                // model calls `browser_agent__done`. Anything else is the
+                // model getting distracted mid-task and needs to be nudged
+                // back into acting.
+                if self.browser_session_active && !browser_done_called {
+                    browser_no_tool_turns += 1;
+                    if browser_no_tool_turns >= MAX_BROWSER_NO_TOOL_TURNS {
+                        log_event("warn", format!(
+                            "[executor] Turn {} — browser agent emitted prose {} turns in a row; \
+                             giving up and letting the message through.",
+                            turn, browser_no_tool_turns
+                        ));
+                        // Fall through to the normal "streaming complete" exit.
+                    } else {
+                        log_event("warn", format!(
+                            "[executor] Turn {} — browser agent emitted prose without a tool call \
+                             (attempt {}/{}). Forcing continuation.",
+                            turn, browser_no_tool_turns, MAX_BROWSER_NO_TOOL_TURNS
+                        ));
+                        // Persist the prose as an assistant message so the
+                        // model can see its own reasoning next turn (helps it
+                        // pick up where it left off).
+                        if !result.content.is_empty() {
+                            let hist = json!({
+                                "role": "assistant",
+                                "content": result.content.clone(),
+                            });
+                            messages.push((
+                                "assistant".to_string(),
+                                serde_json::to_string(&hist).unwrap_or_default(),
+                            ));
+                        }
+                        messages.push((
+                            "user".to_string(),
+                            "You are in Browser Agent mode and the task is NOT complete. \
+                             You must emit a tool call right now — either the next browser \
+                             action that moves the task forward, or `browser_agent__done` if \
+                             the task is genuinely finished. Do NOT reply in prose. Your next \
+                             response MUST be a tool call.".to_string(),
+                        ));
+                        // Don't pin a specific tool — we don't know which one
+                        // is correct; just force the model to pick any tool.
+                        pinned_tool_choice = Some(json!("required"));
+                        continue;
+                    }
+                }
+
                 // No tool calls — the final answer was already streamed live.
                 log_event("info", format!(
                     "[executor] Turn {} — no tool calls detected, streaming complete (finish_reason={})",
@@ -678,13 +838,12 @@ impl SkillsExecutor {
             // We store the assistant message in the same JSON shape as the old
             // non-streaming path so that `build_messages` in remote.rs can
             // correctly reconstruct it on the next turn.
+            // OpenAI spec: when tool_calls is present, content may be an
+            // empty string but MUST NOT be null — several servers (including
+            // llama-server) reject the request with a 400 if it is null.
             let assistant_history_msg = json!({
                 "role": "assistant",
-                "content": if result.content.is_empty() {
-                    Value::Null
-                } else {
-                    Value::String(result.content.clone())
-                },
+                "content": Value::String(result.content.clone()),
                 "tool_calls": result.tool_calls_raw,
             });
             messages.push((
@@ -699,6 +858,12 @@ impl SkillsExecutor {
             // corrected arguments instead of narrating around the failure.
             let mut turn_tool_errors: Vec<(String, String)> = Vec::new();
 
+            // Last browser_agent call dispatched this turn, for stuck
+            // detection against previous turns. Only populated when the
+            // agent is active, and only for tools under the browser_agent
+            // server prefix.
+            let mut turn_last_browser_call: Option<(String, String)> = None;
+
             // ── Execute each tool call ─────────────────────────────────────
             for (tc, args) in validated {
                 let tc = &tc;
@@ -709,6 +874,22 @@ impl SkillsExecutor {
                     .chars()
                     .take(120)
                     .collect::<String>();
+
+                if self.browser_agent_enabled
+                    && fn_name.starts_with(&format!("{}__", BROWSER_AGENT_SERVER_ID))
+                {
+                    // Canonicalise so ordering-only differences don't look "changed".
+                    let canonical = serde_json::to_string(&args).unwrap_or_default();
+                    turn_last_browser_call = Some((fn_name.clone(), canonical));
+                    // Flip the "done flag" the moment the model invokes the
+                    // terminal tool so the empty-tool-call branch knows it is
+                    // allowed to exit the loop cleanly.
+                    if fn_name.ends_with("__done") {
+                        browser_done_called = true;
+                    }
+                    // Any legitimate tool call resets the prose-only counter.
+                    browser_no_tool_turns = 0;
+                }
                 log_event("info", format!(
                     "[executor] Dispatching tool '{}' (id={}) args={}", fn_name, tc.id, args_preview
                 ));
@@ -776,6 +957,20 @@ impl SkillsExecutor {
                     state.tool_active.store(false, Ordering::Relaxed);
                 }
 
+                // ── Emit artifact_updated for artifact_editor mutations ──
+                if fn_name.starts_with(&format!("{}__", ARTIFACT_EDITOR_SERVER_ID))
+                    && *fn_name != format!("{}__view", ARTIFACT_EDITOR_SERVER_ID)
+                {
+                    if let Ok(parsed) = serde_json::from_str::<Value>(&result_text) {
+                        if parsed.get("error").is_none() {
+                            let _ = app.emit("artifact_updated", json!({
+                                "source": "artifact_editor",
+                                "tool": fn_name,
+                            }));
+                        }
+                    }
+                }
+
                 // ── Check cancellation after potentially long tool call ──
                 if cancelled.load(Ordering::Relaxed) {
                     log_event("info", format!(
@@ -808,6 +1003,8 @@ impl SkillsExecutor {
                 // `latex_pdf` packages publish this shape; relying on the shape
                 // instead of the function name means new PDF-producing tools
                 // get picked up automatically without code changes here.
+                // The `source` block (added by pdf_tools/latex_pdf) is preserved
+                // so the artifact_editor can patch the source and re-render.
                 {
                     if let Ok(rv) = serde_json::from_str::<Value>(&result_text) {
                         let status = rv.get("status").and_then(|v| v.as_str()).unwrap_or("");
@@ -831,6 +1028,18 @@ impl SkillsExecutor {
                             });
                             if !engine.is_empty() {
                                 payload["engine"] = json!(engine);
+                            }
+                            // Persist source block for artifact_editor patching
+                            if let Some(source) = rv.get("source") {
+                                let server_id = extract_server_id(fn_name);
+                                let mut source_with_server = source.clone();
+                                if let Some(obj) = source_with_server.as_object_mut() {
+                                    obj.insert(
+                                        "generator_server_id".to_string(),
+                                        json!(server_id),
+                                    );
+                                }
+                                payload["source"] = source_with_server;
                             }
                             let content = serde_json::to_string(&payload).unwrap_or_default();
                             log_event("info", format!(
@@ -921,6 +1130,59 @@ impl SkillsExecutor {
                 ));
             }
 
+            // ── Post-dispatch: browser-agent stuck detection ──────────────
+            //
+            // If the model calls the same browser_agent tool with identical
+            // arguments on back-to-back turns (and none of them errored), the
+            // plan is looping. Force a re-observation by pinning `snapshot`
+            // and tell the model to change its approach.
+            if self.browser_agent_enabled
+                && turn_tool_errors.is_empty()
+                && turn_last_browser_call.is_some()
+                && !browser_done_called
+            {
+                let last = turn_last_browser_call.clone();
+                let same_as_prev = {
+                    let guard = self.browser_last_call.lock().unwrap();
+                    matches!((guard.as_ref(), last.as_ref()), (Some(a), Some(b)) if a == b)
+                };
+                if same_as_prev {
+                    let stuck = self.browser_stuck_count.fetch_add(1, Ordering::Relaxed) + 1;
+                    if stuck >= MAX_BROWSER_STUCK_TURNS {
+                        let (stuck_tool, _) = last.clone().unwrap();
+                        log_event("warn", format!(
+                            "[executor] Browser agent stuck on `{}` for {} turns — forcing snapshot.",
+                            stuck_tool, stuck
+                        ));
+                        messages.push((
+                            "user".to_string(),
+                            format!(
+                                "You called `{tool}` with the same arguments {n} turns in a row \
+                                 with no progress. Your plan is looping. Your next action MUST be \
+                                 a call to `{ba}__snapshot` to re-observe the page, then pick a \
+                                 DIFFERENT interactive element or call `{ba}__done` if the task \
+                                 cannot be completed from here.",
+                                tool = stuck_tool,
+                                n = stuck,
+                                ba = BROWSER_AGENT_SERVER_ID,
+                            ),
+                        ));
+                        pinned_tool_choice = Some(json!({
+                            "type": "function",
+                            "function": {
+                                "name": format!("{}__snapshot", BROWSER_AGENT_SERVER_ID),
+                            },
+                        }));
+                        self.browser_stuck_count.store(0, Ordering::Relaxed);
+                        *self.browser_last_call.lock().unwrap() = None;
+                        continue;
+                    }
+                } else {
+                    self.browser_stuck_count.store(0, Ordering::Relaxed);
+                }
+                *self.browser_last_call.lock().unwrap() = last;
+            }
+
             // ── Post-dispatch: handle tool runtime errors ─────────────────
             //
             // At least one dispatched tool returned an error-shaped result.
@@ -969,7 +1231,50 @@ impl SkillsExecutor {
                 self.tool_error_retries.store(0, Ordering::Relaxed);
                 prior_tool_error = None;
             }
+
+            // ── Browser-agent terminal exit ───────────────────────────────
+            //
+            // Once `browser_agent__done` has been dispatched the task is over
+            // — the executor must NOT take another tool-call round, or the
+            // model will happily keep calling `done` on every subsequent turn
+            // (observed in practice: turns 11,12,13,15,16,17 all "Done" in a
+            // row). Break the agentic loop and fall through to a final
+            // tool-less streaming call so the user sees a proper prose reply.
+            if self.browser_agent_enabled && browser_done_called {
+                log_event(
+                    "info",
+                    format!(
+                        "[executor] Turn {} — browser_agent__done dispatched; exiting tool loop for final reply.",
+                        turn
+                    ),
+                );
+                break;
+            }
             // Continue the loop for the next model turn
+        }
+
+        // ── Final tool-less reply after `browser_agent__done` ─────────────
+        //
+        // If we broke out because the browser agent finished its task, make
+        // ONE more streaming call with the tool list empty so the model is
+        // forced to emit prose summarising what it did. The summary text
+        // from the `done` call is already in message history, but the model
+        // still writes its own user-facing reply here.
+        if self.browser_agent_enabled && browser_done_called {
+            messages.push((
+                "user".to_string(),
+                "The browser task is complete — you already called \
+                 `browser_agent__done`. Write a concise final reply to the \
+                 user now, summarising what you accomplished and citing any \
+                 relevant content you read from the page. Do NOT call any \
+                 tools. Reply in natural language only."
+                    .to_string(),
+            ));
+            log_event(
+                "info",
+                "[executor] Streaming final tool-less reply after browser_agent__done".to_string(),
+            );
+            return engine.chat_stream(messages, config, token_tx).await;
         }
 
         // Exceeded max turns — inform the user
@@ -993,6 +1298,16 @@ impl SkillsExecutor {
         // ── Built-in code_runner dispatch ─────────────────────────────────
         if let Some(tool_name) = qualified_name.strip_prefix(&format!("{}__", CODE_RUNNER_SERVER_ID)) {
             return self.dispatch_code_runner(tool_name, arguments).await;
+        }
+
+        // ── Built-in artifact_editor dispatch ──────────────────────────────
+        if let Some(tool_name) = qualified_name.strip_prefix(&format!("{}__", ARTIFACT_EDITOR_SERVER_ID)) {
+            return self.dispatch_artifact_editor(tool_name, arguments);
+        }
+
+        // ── Built-in browser_agent dispatch ───────────────────────────────
+        if let Some(tool_name) = qualified_name.strip_prefix(&format!("{}__", BROWSER_AGENT_SERVER_ID)) {
+            return self.dispatch_browser_agent(tool_name, arguments, app, conv_id).await;
         }
 
         // ── MCP server dispatch ───────────────────────────────────────────
@@ -1263,6 +1578,242 @@ impl SkillsExecutor {
         }
     }
 
+    /// Dispatch a built-in `artifact_editor__*` tool call.
+    fn dispatch_artifact_editor(&self, tool_name: &str, arguments: Value) -> Result<String> {
+        let db = self
+            .code_runner_db
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("artifact_editor requires code_runner context"))?;
+
+        match tool_name {
+            "view" => {
+                let artifact_id = arguments
+                    .get("artifact_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let view_range = arguments.get("view_range").and_then(|v| {
+                    let arr = v.as_array()?;
+                    let start = arr.first()?.as_u64()? as usize;
+                    let end = arr.get(1)?.as_u64()? as usize;
+                    Some((start, end))
+                });
+                match crate::artifact_editor::view(db, artifact_id, view_range) {
+                    Ok(r) => Ok(serde_json::to_string(&r).unwrap_or_default()),
+                    Err(e) => Ok(json!({"error": e.to_string()}).to_string()),
+                }
+            }
+            "str_replace" => {
+                let artifact_id = arguments
+                    .get("artifact_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let old_str = arguments
+                    .get("old_str")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let new_str = arguments
+                    .get("new_str")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let replace_all = arguments
+                    .get("replace_all")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                match crate::artifact_editor::str_replace(db, artifact_id, old_str, new_str, replace_all) {
+                    Ok(r) => Ok(serde_json::to_string(&r).unwrap_or_default()),
+                    Err(e) => Ok(json!({"error": e.to_string()}).to_string()),
+                }
+            }
+            "insert" => {
+                let artifact_id = arguments
+                    .get("artifact_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let insert_line = arguments
+                    .get("insert_line")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as usize;
+                let new_str = arguments
+                    .get("new_str")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                match crate::artifact_editor::insert(db, artifact_id, insert_line, new_str) {
+                    Ok(r) => Ok(serde_json::to_string(&r).unwrap_or_default()),
+                    Err(e) => Ok(json!({"error": e.to_string()}).to_string()),
+                }
+            }
+            "undo_edit" => {
+                let artifact_id = arguments
+                    .get("artifact_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                match crate::artifact_editor::undo_edit(db, artifact_id) {
+                    Ok(r) => Ok(serde_json::to_string(&r).unwrap_or_default()),
+                    Err(e) => Ok(json!({"error": e.to_string()}).to_string()),
+                }
+            }
+            "rename" => {
+                let artifact_id = arguments
+                    .get("artifact_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let new_title = arguments
+                    .get("new_title")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                match crate::artifact_editor::rename(db, artifact_id, new_title) {
+                    Ok(r) => Ok(serde_json::to_string(&r).unwrap_or_default()),
+                    Err(e) => Ok(json!({"error": e.to_string()}).to_string()),
+                }
+            }
+            other => anyhow::bail!("Unknown artifact_editor tool: '{}'", other),
+        }
+    }
+
+    /// Dispatch a built-in `browser_agent__*` tool call against the active
+    /// session for this conversation.
+    ///
+    /// The executor intentionally looks the session up lazily from `AppState`
+    /// so `with_browser_agent()` can be called before a Chromium process is
+    /// actually live. When no session exists we return a structured error the
+    /// LLM can recover from (ask the UI to click "Start browser agent").
+    async fn dispatch_browser_agent(
+        &self,
+        tool_name: &str,
+        arguments: Value,
+        app: &tauri::AppHandle,
+        conv_id: &str,
+    ) -> Result<String> {
+        use tauri::Manager;
+        let state = app
+            .try_state::<crate::state::AppState>()
+            .ok_or_else(|| anyhow::anyhow!("AppState not available"))?;
+
+        // `start_session` is special: it's the one browser_agent tool that
+        // runs WITHOUT an active session. Intercept it before the registry
+        // lookup and delegate to the shared core so the Tauri command and
+        // the LLM launch identically (same cookie resolution, same events).
+        if tool_name == "start_session" {
+            use crate::commands::browser_agent::{
+                start_browser_session_core, StartSessionOptions,
+            };
+            let profile_name = arguments
+                .get("profile_name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let initial_url = arguments
+                .get("initial_url")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let reason = arguments
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            // Respect the user preference: if they've turned off LLM-initiated
+            // launches in the settings, bounce with a structured error instead
+            // of silently starting a browser behind their back.
+            if !state.browser_agent_autostart_allowed() {
+                return Ok(serde_json::to_string(&json!({
+                    "error": "LLM-initiated browser launches are disabled in \
+                              Settings → Browser. Ask the user to enable \
+                              \"Let the agent start the browser\" or to click \
+                              the Start browser button themselves.",
+                    "reason": reason,
+                }))
+                .unwrap_or_default());
+            }
+
+            let result = start_browser_session_core(
+                app,
+                state.inner(),
+                conv_id.to_string(),
+                StartSessionOptions {
+                    profile_name,
+                    initial_url,
+                    chrome_executable: None,
+                    cookie_session_id: None,
+                    source: "llm".to_string(),
+                },
+            )
+            .await;
+            return match result {
+                Ok(v) => {
+                    // Fold the LLM-supplied rationale back into the tool
+                    // result so the surfaced tool-panel shows it verbatim.
+                    let mut v = v;
+                    if let Some(obj) = v.as_object_mut() {
+                        if !reason.is_empty() {
+                            obj.insert("reason".to_string(), Value::String(reason));
+                        }
+                    }
+                    Ok(serde_json::to_string(&v).unwrap_or_default())
+                }
+                Err(e) => Ok(serde_json::to_string(&json!({
+                    "error": format!("Failed to start browser session: {}", e),
+                }))
+                .unwrap_or_default()),
+            };
+        }
+
+        let session = match state.browser_sessions.get(conv_id).await {
+            Some(s) => s,
+            None => {
+                // Structured error — flows through the existing tool-error
+                // retry pipeline without exploding the turn. Hints at
+                // `start_session` so the LLM has a self-recovery path.
+                return Ok(serde_json::to_string(&json!({
+                    "error": "Browser Agent session not active. Either ask the \
+                              user to click \"Start browser\" in the Browser \
+                              Agent tab, OR call `browser_agent__start_session` \
+                              yourself to launch one before retrying this tool."
+                }))
+                .unwrap_or_default());
+            }
+        };
+        let safety = state.browser_safety.clone();
+        let result = crate::agent_browser::tools::dispatch_browser_agent(
+            tool_name,
+            arguments,
+            &session,
+            &safety,
+        )
+        .await;
+
+        // Auto-inject cookies after a successful navigate. Uses the URL
+        // the page actually landed on (the tool result carries it post-
+        // redirect) so matches are accurate. Any parse/inject failure is
+        // logged and swallowed — the original tool result is what the
+        // LLM sees.
+        if tool_name == "navigate" {
+            if let Ok(body) = result.as_ref() {
+                if let Ok(v) = serde_json::from_str::<Value>(body) {
+                    if let Some(url) = v.get("url").and_then(|u| u.as_str()) {
+                        match session
+                            .auto_inject_cookies(url, &state.browser_cookie_vault)
+                            .await
+                        {
+                            Ok(n) if n > 0 => log::info!(
+                                "[executor] auto-injected {} cookie(s) for {}",
+                                n,
+                                url
+                            ),
+                            Ok(_) => {}
+                            Err(e) => log::warn!(
+                                "[executor] auto cookie inject failed for {}: {}",
+                                url,
+                                e
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+
+        result
+    }
+
 }
 
 // ── Intent scoring + per-turn tool scoping helpers ────────────────────────────
@@ -1346,6 +1897,10 @@ fn has_strong_latex_intent(text_lower: &str) -> bool {
 /// default (they'll only be kept via the `any_hit=false` fallback or as
 /// always-on utilities).
 fn server_keywords(server_id: &str) -> Option<&'static [&'static str]> {
+    // Installed packages are registered with a `pkg__` prefix on their server
+    // id (e.g. `pkg__comfyui_image`). Strip it so keyword scoring matches the
+    // bare package ids below.
+    let server_id = server_id.strip_prefix("pkg__").unwrap_or(server_id);
     match server_id {
         "latex_pdf" => Some(&[
             "latex", "pdf", "equation", "math", "\\", "formula", "theorem",
@@ -1377,11 +1932,28 @@ fn server_keywords(server_id: &str) -> Option<&'static [&'static str]> {
         "comfyui_image_edit" => Some(&[
             "edit image", "modify image", "inpaint", "alter image", "retouch",
         ]),
+        "iterative_image_refiner" => Some(&[
+            "image", "refine", "iterate", "artifact", "quality",
+            "draw", "picture", "render", "illustration", "portrait",
+        ]),
         "comfyui_video" => Some(&[
             "video", "animate", "motion", "clip",
         ]),
         "comfyui_img2video" => Some(&[
             "video from image", "animate image", "img2video", "image to video",
+        ]),
+        "blender_mcp" => Some(&[
+            "blender", "3d", "mesh", "viewport", "polyhaven", "poly haven",
+            "sketchfab", "hyper3d", "hunyuan", "3d model", "3d scene",
+            "render scene", "low poly", "bpy",
+        ]),
+        "browser_agent" => Some(&[
+            "browser", "browse", "web page", "website",
+            "http://", "https://", "www.", ".com", ".org", ".net",
+            "scrape", "fill form", "login to site",
+            "search online", "search the web",
+            "open page", "open url", "open website",
+            "go to site", "go to website",
         ]),
         _ => None,
     }
@@ -1469,6 +2041,162 @@ fn budget_trim(
 /// Rough char→token estimate (same heuristic as `chat.rs::estimate_tokens`).
 fn estimate_tokens(text: &str) -> usize {
     (text.len() + 3) / 4
+}
+
+// ── In-loop history trimmer ─────────────────────────────────────────────────
+//
+// `scope_tools_for_turn` already drops *tool groups* to fit the budget, but it
+// never touches the message history. Inside a long agent loop (especially the
+// browser agent, where every `snapshot` / `read_page` result is several KB of
+// text) the history alone can blow past the n_ctx budget after ~10 turns and
+// llama.cpp returns `500 Context size has been exceeded`.
+//
+// This helper runs right before each LLM call and reshapes the history in
+// two passes, least-destructive first:
+//
+//   1. **Truncate old tool results.** Tool result bodies older than the last
+//      few turns get replaced with a short placeholder that keeps the
+//      `tool::<id>` role intact (so the API still sees a matching pair for
+//      every assistant `tool_calls` entry).
+//   2. **Drop oldest turns.** If still over budget, walk from the oldest
+//      non-preserved message and remove full assistant-tool-result groups
+//      (an assistant `tool_calls` message plus every `tool::` message that
+//      immediately follows it) or plain user/assistant messages until the
+//      budget fits.
+//
+// Invariants:
+//   - All `"system"` messages are always kept.
+//   - The last `KEEP_LAST_MSGS` non-system messages are always kept verbatim.
+//   - A `tool::` message is never separated from the assistant `tool_calls`
+//     message that introduced it (they're dropped together).
+//
+// The function returns the number of characters removed for observability.
+
+/// How many trailing non-system messages to preserve verbatim.
+const KEEP_LAST_MSGS: usize = 6;
+/// Tool result bodies larger than this (in chars) will be truncated when they
+/// fall outside the "last-N preserved" window.
+const TOOL_RESULT_TRIM_ABOVE: usize = 500;
+/// Replacement length for truncated tool results (prefix of the original).
+const TOOL_RESULT_TRIM_PREFIX: usize = 280;
+
+fn trim_history_to_budget(
+    messages: &mut Vec<(String, String)>,
+    tools: &[ToolDefinition],
+    n_ctx: usize,
+) -> usize {
+    let budget = ((n_ctx as f32) * CTX_BUDGET_FRACTION) as usize;
+    let tools_tokens: usize = tools
+        .iter()
+        .map(|t| estimate_tokens_for_tool(t))
+        .sum();
+
+    // Helper to measure current history tokens.
+    let history_tokens = |msgs: &[(String, String)]| -> usize {
+        msgs.iter().map(|(_, c)| estimate_tokens(c)).sum()
+    };
+
+    // Fast path: already fits.
+    if tools_tokens + history_tokens(messages) <= budget {
+        return 0;
+    }
+
+    let original_chars: usize = messages.iter().map(|(_, c)| c.len()).sum();
+
+    // Indices we must never trim. `preserve_from` is the first index that
+    // belongs to the "recent" window; everything at or after it is kept
+    // verbatim.
+    let non_system_indices: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, (role, _))| role != "system")
+        .map(|(i, _)| i)
+        .collect();
+    let preserve_from = if non_system_indices.len() > KEEP_LAST_MSGS {
+        non_system_indices[non_system_indices.len() - KEEP_LAST_MSGS]
+    } else {
+        // Too few messages to trim: nothing we can safely do here.
+        return 0;
+    };
+
+    // ── Pass 1: truncate oversized tool results outside the recent window ──
+    for (i, (role, content)) in messages.iter_mut().enumerate() {
+        if i >= preserve_from {
+            break;
+        }
+        if !role.starts_with("tool::") {
+            continue;
+        }
+        if content.len() <= TOOL_RESULT_TRIM_ABOVE {
+            continue;
+        }
+        let prefix: String = content.chars().take(TOOL_RESULT_TRIM_PREFIX).collect();
+        let dropped = content.len().saturating_sub(prefix.len());
+        *content = format!(
+            "{prefix}… [truncated {dropped} chars of older tool output to fit context]"
+        );
+    }
+
+    if tools_tokens + history_tokens(messages) <= budget {
+        return original_chars.saturating_sub(
+            messages.iter().map(|(_, c)| c.len()).sum::<usize>(),
+        );
+    }
+
+    // ── Pass 2: drop oldest non-system groups until we fit ──────────────────
+    //
+    // A "group" is either a single user/assistant/system message or an
+    // assistant message carrying `tool_calls` bundled with the run of
+    // `tool::<id>` messages that immediately follow it. We must keep those
+    // grouped so the API never sees an orphaned tool response.
+    loop {
+        if tools_tokens + history_tokens(messages) <= budget {
+            break;
+        }
+        // Find the oldest droppable group.
+        let Some(start_idx) = messages.iter().position(|(role, _)| role != "system") else {
+            break; // only system messages left — nothing more to do
+        };
+        // Refresh the preserve boundary each iteration (indices shift).
+        let non_system_indices: Vec<usize> = messages
+            .iter()
+            .enumerate()
+            .filter(|(_, (role, _))| role != "system")
+            .map(|(i, _)| i)
+            .collect();
+        if non_system_indices.len() <= KEEP_LAST_MSGS {
+            break; // don't eat into the recent window
+        }
+        let preserve_from = non_system_indices[non_system_indices.len() - KEEP_LAST_MSGS];
+        if start_idx >= preserve_from {
+            break;
+        }
+
+        // Determine group end: if the starting message is an assistant with
+        // tool_calls, include the following tool:: messages.
+        let is_assistant_with_tools = messages[start_idx].0 == "assistant"
+            && messages[start_idx]
+                .1
+                .contains("\"tool_calls\"");
+        let mut end_idx = start_idx + 1;
+        if is_assistant_with_tools {
+            while end_idx < messages.len()
+                && messages[end_idx].0.starts_with("tool::")
+                && end_idx < preserve_from
+            {
+                end_idx += 1;
+            }
+        }
+        // Guard: never let the drop cross into the preserved window.
+        end_idx = end_idx.min(preserve_from);
+        if end_idx <= start_idx {
+            break;
+        }
+        messages.drain(start_idx..end_idx);
+    }
+
+    let final_chars: usize = messages.iter().map(|(_, c)| c.len()).sum();
+    original_chars.saturating_sub(final_chars)
 }
 
 /// Approximate the token cost of a single serialised tool definition.
@@ -1707,7 +2435,10 @@ async fn maybe_save_image_to_gallery(
     conv_id: &str,
 ) -> String {
     let fn_lower = fn_name.to_lowercase();
-    if !fn_lower.contains("generate_image") && !fn_lower.contains("edit_image") {
+    if !fn_lower.contains("generate_image")
+        && !fn_lower.contains("edit_image")
+        && !fn_lower.contains("screenshot")
+    {
         return result_text.to_string();
     }
 
@@ -1718,7 +2449,14 @@ async fn maybe_save_image_to_gallery(
 
     let status = result_val.get("status").and_then(|v| v.as_str()).unwrap_or("");
     let image_url = result_val.get("image_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    if status != "generated" || image_url.is_empty() {
+    // Some tools (e.g. the Blender viewport screenshot) return raw base64 bytes
+    // in `image_b64` instead of a downloadable `image_url`. Accept either.
+    let image_b64 = result_val
+        .get("image_b64")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if status != "generated" || (image_url.is_empty() && image_b64.is_empty()) {
         return result_text.to_string();
     }
 
@@ -1765,7 +2503,30 @@ async fn maybe_save_image_to_gallery(
     let mut file_path_str = String::new();
     let mut fallback_image_data = String::new();
 
-    if image_url.starts_with("http://") || image_url.starts_with("https://") {
+    if !image_b64.is_empty() {
+        // Inline base64 payload (e.g. Blender viewport screenshot): decode and
+        // write straight to disk, no HTTP round-trip.
+        use base64::Engine as _;
+        match base64::engine::general_purpose::STANDARD.decode(image_b64.as_bytes()) {
+            Ok(bytes) => match std::fs::write(&dest_path, &bytes) {
+                Ok(_) => {
+                    file_path_str = dest_path.to_string_lossy().to_string();
+                    log::info!(
+                        "[image-gallery] Saved {} bytes from base64 to {}",
+                        bytes.len(), file_path_str
+                    );
+                }
+                Err(e) => {
+                    log::warn!("[image-gallery] fs::write (base64) failed: {}", e);
+                    fallback_image_data = image_b64.clone();
+                }
+            },
+            Err(e) => {
+                log::warn!("[image-gallery] base64 decode failed: {}", e);
+                fallback_image_data = image_b64.clone();
+            }
+        }
+    } else if image_url.starts_with("http://") || image_url.starts_with("https://") {
         let mut downloaded = false;
         for attempt in 1..=3u32 {
             match client.get(&image_url).send().await {
@@ -1843,6 +2604,11 @@ async fn maybe_save_image_to_gallery(
                 result_val["image_url"] = json!(local_url);
                 if let Some(fp) = db_file_path {
                     result_val["file_path"] = json!(fp);
+                }
+                // Drop the bulky base64 payload so it never re-enters the LLM
+                // context once the image is safely on disk.
+                if let Some(obj) = result_val.as_object_mut() {
+                    obj.remove("image_b64");
                 }
             }
             Err(e) => {
@@ -2090,6 +2856,144 @@ fn code_runner_list_artifacts_tool() -> ToolDefinition {
     }
 }
 
+// ── Artifact editor tool schema definitions ──────────────────────────────────
+
+fn artifact_editor_tool_definitions() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition {
+            kind: "function".to_string(),
+            function: FunctionDef {
+                name: format!("{}__view", ARTIFACT_EDITOR_SERVER_ID),
+                description: "View the content of an existing artifact with line numbers. \
+                    Use code_runner__list_recent_artifacts first to find the artifact_id. \
+                    For PDF artifacts, returns the editable source text (not the rendered PDF). \
+                    Returns numbered lines like '1: content'. Use view_range for large artifacts."
+                    .to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "required": ["artifact_id"],
+                    "properties": {
+                        "artifact_id": {
+                            "type": "string",
+                            "description": "The UUID of the artifact to view."
+                        },
+                        "view_range": {
+                            "type": "array",
+                            "items": { "type": "number" },
+                            "minItems": 2,
+                            "maxItems": 2,
+                            "description": "Optional [start, end] line range (1-indexed, inclusive). Omit to view the entire file."
+                        }
+                    }
+                }),
+            },
+        },
+        ToolDefinition {
+            kind: "function".to_string(),
+            function: FunctionDef {
+                name: format!("{}__str_replace", ARTIFACT_EDITOR_SERVER_ID),
+                description: "Replace an exact text match in an artifact. The old_str must match \
+                    EXACTLY one location (including whitespace and indentation). Use \
+                    artifact_editor__view first to see the current content. If old_str matches \
+                    multiple times, either provide more surrounding context or set replace_all=true."
+                    .to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "required": ["artifact_id", "old_str", "new_str"],
+                    "properties": {
+                        "artifact_id": {
+                            "type": "string",
+                            "description": "The UUID of the artifact to edit."
+                        },
+                        "old_str": {
+                            "type": "string",
+                            "description": "The exact text to find and replace. Must match the artifact content precisely including whitespace."
+                        },
+                        "new_str": {
+                            "type": "string",
+                            "description": "The replacement text."
+                        },
+                        "replace_all": {
+                            "type": "boolean",
+                            "description": "If true, replace ALL occurrences of old_str. Default: false (requires exactly one match)."
+                        }
+                    }
+                }),
+            },
+        },
+        ToolDefinition {
+            kind: "function".to_string(),
+            function: FunctionDef {
+                name: format!("{}__insert", ARTIFACT_EDITOR_SERVER_ID),
+                description: "Insert new text after a specific line number in an artifact. \
+                    Use artifact_editor__view first to identify the correct line number. \
+                    Line 0 means insert at the very top of the file."
+                    .to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "required": ["artifact_id", "insert_line", "new_str"],
+                    "properties": {
+                        "artifact_id": {
+                            "type": "string",
+                            "description": "The UUID of the artifact to edit."
+                        },
+                        "insert_line": {
+                            "type": "number",
+                            "description": "The line number AFTER which to insert. 0 = top of file. Use the line numbers from artifact_editor__view."
+                        },
+                        "new_str": {
+                            "type": "string",
+                            "description": "The text to insert."
+                        }
+                    }
+                }),
+            },
+        },
+        ToolDefinition {
+            kind: "function".to_string(),
+            function: FunctionDef {
+                name: format!("{}__undo_edit", ARTIFACT_EDITOR_SERVER_ID),
+                description: "Undo the last edit made to an artifact, restoring the previous version. \
+                    Up to 5 levels of undo history are kept per artifact."
+                    .to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "required": ["artifact_id"],
+                    "properties": {
+                        "artifact_id": {
+                            "type": "string",
+                            "description": "The UUID of the artifact to undo."
+                        }
+                    }
+                }),
+            },
+        },
+        ToolDefinition {
+            kind: "function".to_string(),
+            function: FunctionDef {
+                name: format!("{}__rename", ARTIFACT_EDITOR_SERVER_ID),
+                description: "Rename an artifact. Rejects title collisions within the same \
+                    conversation and artifact type."
+                    .to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "required": ["artifact_id", "new_title"],
+                    "properties": {
+                        "artifact_id": {
+                            "type": "string",
+                            "description": "The UUID of the artifact to rename."
+                        },
+                        "new_title": {
+                            "type": "string",
+                            "description": "The new title for the artifact."
+                        }
+                    }
+                }),
+            },
+        },
+    ]
+}
+
 // ── Unit tests ──────────────────────────────────────────────────────────────
 //
 // These tests cover the pure helpers that drive scoping, token budgeting, and
@@ -2165,6 +3069,18 @@ mod tests {
     #[test]
     fn score_server_unknown_server_scores_zero() {
         assert_eq!(score_server("made_up_server", "any text"), 0);
+    }
+
+    #[test]
+    fn score_server_strips_pkg_prefix() {
+        // Installed packages carry a `pkg__` prefix on their server id; the
+        // keyword scorer must still match the bare id keywords.
+        let text = "create a 3d scene in blender with a low poly dragon";
+        assert!(score_server("pkg__blender_mcp", text) >= 2);
+        assert_eq!(
+            score_server("pkg__blender_mcp", text),
+            score_server("blender_mcp", text)
+        );
     }
 
     // ── is_always_on ────────────────────────────────────────────────────────
@@ -2272,6 +3188,168 @@ mod tests {
             "latex_pdf (highest score) must survive — got {:?}",
             kept_names
         );
+    }
+
+    // ── trim_history_to_budget ──────────────────────────────────────────────
+
+    fn msg(role: &str, content: &str) -> (String, String) {
+        (role.to_string(), content.to_string())
+    }
+
+    #[test]
+    fn trim_history_is_noop_when_under_budget() {
+        let mut messages = vec![
+            msg("system", "you are a helpful assistant"),
+            msg("user", "hello"),
+            msg("assistant", "hi there"),
+        ];
+        let before = messages.clone();
+        let removed = trim_history_to_budget(&mut messages, &[], 32_768);
+        assert_eq!(removed, 0);
+        assert_eq!(messages, before);
+    }
+
+    #[test]
+    fn trim_history_truncates_old_tool_results() {
+        // Build: system + 2 old assistant/tool pairs + KEEP_LAST_MSGS recent
+        // messages. The two old tool results are huge (3KB each) and will be
+        // collapsed to the placeholder prefix.
+        let big = "a".repeat(3_000);
+        let mut messages = vec![
+            msg("system", "sys"),
+            msg("assistant", r#"{"tool_calls":[{"id":"1","function":{"name":"x"}}]}"#),
+            msg("tool::1", &big),
+            msg("assistant", r#"{"tool_calls":[{"id":"2","function":{"name":"y"}}]}"#),
+            msg("tool::2", &big),
+        ];
+        // Add KEEP_LAST_MSGS recent messages so both old tool:: fall outside
+        // the preserved window.
+        for i in 0..KEEP_LAST_MSGS {
+            messages.push(msg("user", &format!("q{}", i)));
+        }
+
+        // Pick a tight budget that forces truncation but not full drops.
+        // Pre-trim history ≈ 1500 tokens (two 3KB tool results). Post-trim
+        // history ≈ 170 tokens. Budget = 1000 * 0.85 = 850 — lands between.
+        let n_ctx = 1_000;
+        let removed = trim_history_to_budget(&mut messages, &[], n_ctx);
+        assert!(removed > 0, "expected characters to be trimmed");
+
+        // Both old tool:: messages should be collapsed to the placeholder.
+        let old_tool_bodies: Vec<&String> = messages
+            .iter()
+            .filter(|(r, _)| r.starts_with("tool::"))
+            .map(|(_, c)| c)
+            .collect();
+        assert_eq!(old_tool_bodies.len(), 2);
+        for body in old_tool_bodies {
+            assert!(
+                body.len() < 3_000,
+                "old tool result should have been truncated, got {} chars",
+                body.len()
+            );
+            assert!(
+                body.contains("[truncated"),
+                "truncation placeholder missing: {}",
+                body
+            );
+        }
+    }
+
+    #[test]
+    fn trim_history_drops_oldest_groups_when_truncation_not_enough() {
+        // When even truncated tool results can't make history fit, oldest
+        // assistant+tool pairs get dropped whole, keeping the preserved
+        // window (last KEEP_LAST_MSGS) intact.
+        let mut messages = vec![msg("system", "sys")];
+        // 8 full assistant+tool old rounds, each tool result ~1.5KB.
+        let big = "b".repeat(1_500);
+        for i in 0..8 {
+            messages.push(msg(
+                "assistant",
+                &format!(
+                    r#"{{"tool_calls":[{{"id":"{i}","function":{{"name":"x"}}}}]}}"#
+                ),
+            ));
+            messages.push(msg(&format!("tool::{}", i), &big));
+        }
+        // KEEP_LAST_MSGS recent messages to pin down the preserved window.
+        for i in 0..KEEP_LAST_MSGS {
+            messages.push(msg("user", &format!("recent{}", i)));
+        }
+
+        let original_len = messages.len();
+        // Budget must sit below the post-truncation floor (~780 tokens for
+        // 8 rounds) so the loop is forced to drop whole groups.
+        let n_ctx = 800;
+        let _ = trim_history_to_budget(&mut messages, &[], n_ctx);
+
+        // System always survives.
+        assert_eq!(messages[0].0, "system");
+        // All KEEP_LAST_MSGS recent messages survive.
+        let tail = &messages[messages.len() - KEEP_LAST_MSGS..];
+        for (i, (role, content)) in tail.iter().enumerate() {
+            assert_eq!(role, "user");
+            assert_eq!(content, &format!("recent{}", i));
+        }
+        // At least some older content was dropped.
+        assert!(
+            messages.len() < original_len,
+            "expected older messages to be dropped, still have {} of {}",
+            messages.len(),
+            original_len
+        );
+    }
+
+    #[test]
+    fn trim_history_never_orphans_tool_messages() {
+        // Regression guard: the drop loop must never remove an assistant
+        // tool_calls message without also removing its paired tool:: replies
+        // (llama-server returns 400 for an orphaned `role:"tool"`).
+        let mut messages = vec![msg("system", "sys")];
+        let payload = "c".repeat(1_000);
+        for i in 0..6 {
+            messages.push(msg(
+                "assistant",
+                &format!(
+                    r#"{{"tool_calls":[{{"id":"{i}","function":{{"name":"x"}}}}]}}"#
+                ),
+            ));
+            messages.push(msg(&format!("tool::{}", i), &payload));
+        }
+        for i in 0..KEEP_LAST_MSGS {
+            messages.push(msg("user", &format!("recent{}", i)));
+        }
+
+        let _ = trim_history_to_budget(&mut messages, &[], 900);
+
+        // Every surviving assistant message with `tool_calls` must be
+        // immediately followed by the matching tool:: reply (or directly by
+        // the preserved recent window).
+        for i in 0..messages.len() {
+            let (role, content) = &messages[i];
+            if role == "assistant" && content.contains("\"tool_calls\"") {
+                // Pull ids from the serialised message — the matching tool::
+                // entries must appear starting at i+1.
+                if let Ok(v) = serde_json::from_str::<Value>(content) {
+                    if let Some(arr) = v.get("tool_calls").and_then(|x| x.as_array()) {
+                        for (offset, tc) in arr.iter().enumerate() {
+                            let id = tc
+                                .get("id")
+                                .and_then(|x| x.as_str())
+                                .unwrap_or_default();
+                            let expected = format!("tool::{}", id);
+                            let next = messages.get(i + 1 + offset);
+                            assert!(
+                                next.map(|(r, _)| r == &expected).unwrap_or(false),
+                                "assistant tool_call id={} lost its matching tool:: reply",
+                                id
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // ── validate_tool_args ──────────────────────────────────────────────────

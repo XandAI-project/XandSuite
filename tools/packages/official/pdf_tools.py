@@ -430,6 +430,12 @@ def create_pdf_document(
             "filename": os.path.basename(out_path),
             "path": out_path,
             "pages": pdf.page,
+            "source": {
+                "generator_tool": "create_pdf_document",
+                "format": "markdown",
+                "body": content,
+                "args": {"filename": filename, "title": title, "author": author},
+            },
         }, ensure_ascii=False)
     except Exception as exc:
         return json.dumps({"error": str(exc)})
@@ -506,6 +512,12 @@ def create_pdf_report(
             "filename": os.path.basename(out_path),
             "path": out_path,
             "pages": pdf.page,
+            "source": {
+                "generator_tool": "create_pdf_report",
+                "format": "sections",
+                "body": json.dumps(sections, ensure_ascii=False),
+                "args": {"filename": filename, "title": title, "author": author},
+            },
         }, ensure_ascii=False)
     except Exception as exc:
         return json.dumps({"error": str(exc)})

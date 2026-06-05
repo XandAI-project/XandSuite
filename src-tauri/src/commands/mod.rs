@@ -1,6 +1,7 @@
 pub mod agents;
 pub mod artifacts;
 pub mod attachments;
+pub mod browser_agent;
 pub mod chat;
 pub mod coding;
 pub mod database;

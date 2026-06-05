@@ -6,6 +6,10 @@ use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::broadcast;
 
 use crate::agent::AgentRuntime;
+use crate::agent_browser::cookie_vault::CookieVault;
+use crate::agent_browser::profile::ProfileManager;
+use crate::agent_browser::safety::SafetyGate;
+use crate::agent_browser::session::BrowserSessionRegistry;
 use crate::api_server::events::ApiEvent;
 use crate::coding::CodingRuntime;
 use crate::db::AppDb;
@@ -61,6 +65,37 @@ pub struct AppState {
     /// The idle-watcher uses this to avoid killing the LLM server while a
     /// long-running tool (e.g. video generation) is still in progress.
     pub tool_active: Arc<AtomicBool>,
+    /// Registry of active Browser Agent sessions keyed by conversation id.
+    pub browser_sessions: Arc<BrowserSessionRegistry>,
+    /// Per-app browser profile manager (disposable / named user-data-dirs).
+    pub browser_profiles: Arc<ProfileManager>,
+    /// Shared safety gate for browser-agent actions.
+    pub browser_safety: Arc<SafetyGate>,
+    /// Disk-backed vault of pasted cookie sessions (LinkedIn, Gmail, …).
+    pub browser_cookie_vault: Arc<CookieVault>,
+}
+
+impl AppState {
+    /// Whether the LLM is allowed to call `browser_agent__start_session`
+    /// on its own. Persisted in the `settings` table under the key
+    /// `browser_agent_autostart`; defaults to `true` because the feature was
+    /// introduced opt-out (the toggle lives in Settings → Browser).
+    ///
+    /// Reads are cheap (one SQLite lookup through `AppDb::get_setting`) and
+    /// happen once per `start_session` tool call, so we don't bother caching.
+    pub fn browser_agent_autostart_allowed(&self) -> bool {
+        let db = match self.db.lock() {
+            Ok(guard) => guard,
+            // Poisoned mutex: fail closed — no autostart until the user
+            // restarts the app and we can read the setting cleanly again.
+            Err(_) => return false,
+        };
+        match db.get_setting("browser_agent_autostart") {
+            Ok(Some(v)) => v != "0" && v.to_ascii_lowercase() != "false",
+            Ok(None) => true,
+            Err(_) => true,
+        }
+    }
 }
 
 // Safety: all fields are wrapped in Arc<Mutex<...>> or are Send+Sync
@@ -89,6 +124,10 @@ impl Clone for AppState {
             app_handle: self.app_handle.clone(),
             generation_cancelled: self.generation_cancelled.clone(),
             tool_active: self.tool_active.clone(),
+            browser_sessions: self.browser_sessions.clone(),
+            browser_profiles: self.browser_profiles.clone(),
+            browser_safety: self.browser_safety.clone(),
+            browser_cookie_vault: self.browser_cookie_vault.clone(),
         }
     }
 }

@@ -199,9 +199,19 @@ impl RemoteEngine {
                     // { role, content: <whole object> } which would cause a 400.
                     match serde_json::from_str::<JsonValue>(&content) {
                         Ok(obj) if obj.is_object() && obj.get("tool_calls").is_some() => {
+                            // When tool_calls is present the content field may be
+                            // null (written by older executor code) or missing.
+                            // The OpenAI API spec allows an empty string here but
+                            // rejects null with a 400, so we normalise to "".
+                            let content_val = match obj.get("content") {
+                                Some(JsonValue::Null) | None => {
+                                    JsonValue::String(String::new())
+                                }
+                                Some(v) => v.clone(),
+                            };
                             ChatMessage {
                                 role,
-                                content: obj.get("content").cloned().unwrap_or(JsonValue::Null),
+                                content: content_val,
                                 tool_call_id: None,
                                 tool_calls: obj.get("tool_calls").cloned(),
                             }

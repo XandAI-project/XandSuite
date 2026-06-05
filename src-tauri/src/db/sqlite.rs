@@ -292,6 +292,17 @@ impl AppDb {
             CREATE INDEX IF NOT EXISTS idx_artifacts_conversation
                 ON artifacts(conversation_id);
 
+            CREATE TABLE IF NOT EXISTS artifact_edit_history (
+                id TEXT PRIMARY KEY,
+                artifact_id TEXT NOT NULL,
+                prev_title TEXT NOT NULL,
+                prev_content TEXT NOT NULL,
+                edited_at TEXT NOT NULL,
+                FOREIGN KEY (artifact_id) REFERENCES artifacts(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_artifact_edit_history_aid_time
+                ON artifact_edit_history(artifact_id, edited_at DESC);
+
             CREATE TABLE IF NOT EXISTS coding_sessions (
                 id TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
@@ -469,8 +480,11 @@ Include:
         );
 
         // ── Built-in package-powered templates ────────────────────────────────
+        // Use INSERT OR REPLACE so template content is always refreshed on
+        // app launch — this ensures prompt changes in code updates actually
+        // reach users who already have the old version in their DB.
         self.conn.execute_batch(r#"
-            INSERT OR IGNORE INTO prompt_templates
+            INSERT OR REPLACE INTO prompt_templates
                 (id, title, content, description, category, shortcut, requires, use_count, created_at, updated_at)
             VALUES
 
@@ -582,8 +596,163 @@ For each metric show:
 - A change indicator (green for positive, red for negative)
 Display them in a responsive grid. Add a one-line summary after the cards.',
              'Display key numbers as visual metric cards', 'Productivity', '/metrics',
-             'Rich Responses', 0, datetime('now'), datetime('now'));
+             'Rich Responses', 0, datetime('now'), datetime('now')),
+
+            -- Iterative Image Refiner
+            ('builtin-image-think', 'Iterative image refinement',
+'You are an iterative image refinement agent. Your workflow is simple: plan → generate → inspect → edit → repeat.
+
+## Task
+{{prompt}}
+Iterations: {{iterations, e.g. 3}}
+
+## Step 1: Plan
+Call `iterative_image_refiner__plan_refinement` with the prompt. Save the enhanced_prompt and negative_prompt.
+
+## Step 2: Generate
+Generate the image. Use whichever image generation tool is available:
+- `iterative_image_refiner__generate_initial_image` (if configured with ComfyUI)
+- `comfyui_image__generate_image` (if installed)
+Pass the enhanced_prompt and negative_prompt. Save the image_url.
+
+## Step 3: Inspect + Log
+Look at the image. Rate each of the 10 checklist categories (none/minor/major/critical).
+Call `iterative_image_refiner__log_iteration` with your findings.
+If next_action is "edit", go to Step 4. If "accept", go to Step 5.
+
+## Step 4: Edit
+Edit the image using the corrective_prompt_hint from the log. Use whichever edit tool is available:
+- `iterative_image_refiner__refine_image` (if configured)
+- `comfyui_image_edit__edit_image` (if installed)
+Go back to Step 3.
+
+## Step 5: Present
+Show the final image and quality score.
+
+## Rules
+- Call ONE tool per turn. Do not write code — use the tools above.
+- Never skip inspection. Be honest about artifacts.
+- Fix worst issues first (critical > major > minor).',
+             'Generate an image and iteratively refine it by inspecting for AI artifacts (hands, text, anatomy, lighting) and editing to fix them. Uses vision-guided multi-pass refinement.', 'Creative', '/image-think',
+             'Iterative Image Refiner', 0, datetime('now'), datetime('now')),
+
+            -- Blender MCP
+            ('builtin-blender', 'Blender 3D scene builder',
+'You are a Blender 3D assistant driving Blender through the BlenderMCP tools. Build, modify, and inspect 3D scenes from natural-language requests.
+
+## Your task
+{{request — e.g. Create a low-poly dungeon scene with a dragon guarding a pot of gold}}
+
+## Protocol
+
+### Step 1: Inspect the scene first
+ALWAYS call `blender_mcp__get_scene_info` before making changes, so you know what already exists. Use `blender_mcp__get_viewport_screenshot` whenever you need to see the current state visually.
+
+### Step 2: Choose the best asset source
+Check which integrations are enabled and prefer ready-made assets over scripting:
+1. `blender_mcp__get_sketchfab_status` — Sketchfab has the widest variety of realistic downloadable models. Search with `search_sketchfab_models`, then `download_sketchfab_model` (always pass a real-world `target_size` in meters).
+2. `blender_mcp__get_polyhaven_status` — Poly Haven is best for HDRIs (environment lighting), textures, and generic models. Use `search_polyhaven_assets` then `download_polyhaven_asset`.
+3. `blender_mcp__get_hyper3d_status` / `get_hunyuan3d_status` — for custom/unique single objects not in the libraries, generate via text or images, poll the job status, then import.
+
+### Step 3: Build — use the high-level wrapper tools (NOT raw code)
+ALWAYS prefer these wrapper tools over `execute_blender_code`:
+- `create_object(type, name, location, scale, ...)` — create primitives: CUBE, SPHERE, ICO_SPHERE, CYLINDER, CONE, PLANE, TORUS, CIRCLE, MONKEY
+- `move_object(name, location)` — move to [x, y, z]
+- `rotate_object(name, rotation, degrees=True)` — rotate to [rx, ry, rz] in degrees
+- `scale_object(name, scale)` — scale to [sx, sy, sz]
+- `set_material(name, color, material_name, metallic, roughness)` — apply color [R,G,B] 0-1
+- `delete_object(name)` — delete by name
+- `rename_object(old_name, new_name)` — rename
+- `duplicate_object(name, new_name, offset)` — copy with offset
+- `join_objects(names, result_name)` — merge objects
+- `clear_scene(keep_camera, keep_lights)` — remove all objects
+- `add_modifier(name, modifier_type, levels)` — SUBSURF, MIRROR, ARRAY, etc.
+- `set_origin(name, origin_type)` — GEOMETRY, CURSOR, BOUNDS
+
+**Complex objects** — build multi-part shapes in a SINGLE call:
+- `create_compound_object(name, parts, join, color, location)` — assemble multiple primitives at once. Each part: {type, name, location, rotation, scale, size, radius, depth, color}. Optionally join + color all parts.
+- `create_text_3d(text, name, size, extrude, color, ...)` — 3D text with font, alignment, color
+- `create_array(source_name, pattern, count, offset, radius, merge)` — LINEAR, GRID, or CIRCULAR copies
+
+Only use `execute_blender_code` for operations that the wrappers cannot do (custom geometry, node setups, animation, etc.).
+
+#### Example 1: simple object (use individual tools)
+Call 1: `create_object(type="CYLINDER", name="Fuselage", radius=0.5, depth=3)`
+Call 2: `rotate_object(name="Fuselage", rotation=[90, 0, 0])`
+Call 3: `set_material(name="Fuselage", color=[1, 0, 0])`
+
+#### Example 2: complex object (use create_compound_object — preferred for multi-part objects)
+ONE call: `create_compound_object(name="Airplane", parts=[{"type":"CYLINDER","name":"Fuselage","radius":0.3,"depth":4,"rotation":[0,90,0]}, {"type":"PLANE","name":"Wings","scale":[3,0.5,1]}, {"type":"CONE","name":"Nose","radius":0.3,"depth":0.8,"location":[2.4,0,0],"rotation":[0,90,0]}], join=True, color=[0.2,0.4,0.8])`
+
+#### Rules for building
+- For multi-part objects, ALWAYS prefer `create_compound_object` over individual `create_object` calls.
+- Verify with `get_scene_info` after building.
+- NEVER reference object names you did not create or confirm via `get_scene_info`.
+- Downloaded/generated assets (Sketchfab, Poly Haven, Hyper3D, Hunyuan3D) are imported by their own tools.
+
+### Step 4: Verify spatial layout
+Check each object''s bounding box via `blender_mcp__get_object_info` and adjust with `move_object`/`scale_object` so nothing clips.
+
+### Step 5: Show the result
+Capture a final `blender_mcp__get_viewport_screenshot` and summarize what you built.
+
+## Rules
+- Inspect before you act; never assume the scene is empty.
+- Prefer downloaded/generated assets over hand-scripted geometry unless a simple primitive is explicitly requested.
+- ALWAYS prefer wrapper tools (create_object, move_object, etc.) over execute_blender_code.
+- Requires Blender running with the BlenderMCP addon and "Connect to Claude" enabled.',
+             'Build and edit 3D scenes in Blender: create objects, apply materials, run bpy code, and pull assets from Sketchfab, Poly Haven, Hyper3D, and Hunyuan3D.', 'Creative', '/blender',
+             'Blender MCP', 0, datetime('now'), datetime('now'));
         "#).context("Failed to seed package templates")?;
+
+        // ── Built-in Browser Agent templates ──────────────────────────────────
+        // Kept in a separate batch so adding/updating them doesn't risk
+        // breaking the larger package-template seed above. `INSERT OR IGNORE`
+        // makes this a safe no-op on every subsequent launch.
+        //
+        // SQLite string-literal escaping note
+        // ────────────────────────────────────
+        // Inside a single-quoted SQL string, a literal apostrophe must be
+        // doubled (`'` -> `''`). The `content` column for WhatsApp therefore
+        // uses `''` for every English contraction ("person''s", "don''t").
+        self.conn.execute_batch(r#"
+            INSERT OR REPLACE INTO prompt_templates
+                (id, title, content, description, category, shortcut, requires, use_count, created_at, updated_at)
+            VALUES
+
+            ('builtin-whatsapp-agent', 'WhatsApp Web Agent',
+'You are operating WhatsApp Web (https://web.whatsapp.com) inside the Browser Agent tab.
+
+## Page layout
+- LEFT SIDEBAR: list of recent conversations. Each row shows a contact photo, the contact/group name, a preview of the last message, and a timestamp. CLICKING a row OPENS that chat in the right panel.
+- RIGHT PANEL: the currently-open chat. Messages appear here; a text input ("Type a message") sits at the very bottom.
+- SEARCH BAR: at the top of the left sidebar ("Search or start a new chat" / "Pesquisar ou comecar uma nova conversa"). Use it to find a contact by name when the contact is not visible in the sidebar.
+
+## How to open a chat (MANDATORY)
+1. Take a `browser_agent__snapshot` first so you can see the indexed interactive nodes.
+2. Look in the LEFT SIDEBAR for the contact name. If you find it, CLICK ONCE on that conversation row. One click is enough to open the chat — do NOT double-click.
+3. If the contact is NOT visible in the first screen of the sidebar, DO NOT scroll the sidebar more than twice. Switch to search instead:
+   a. Click the SEARCH input at the top of the sidebar.
+   b. Type the contact name with `browser_agent__type`.
+   c. Wait ~500ms, take a new snapshot, and click the matching result row.
+4. Confirm success by taking a snapshot and verifying the RIGHT PANEL header shows the contact name and the message history is visible.
+
+## How to send a message
+1. Confirm the correct chat is open (right-panel header matches the contact).
+2. Click the message input field at the BOTTOM of the right panel (placeholder "Type a message" / "Digite uma mensagem"). This element is a `contenteditable` textbox — the snapshot exposes it with role `textbox`.
+3. Type the message with `browser_agent__type`.
+4. Press Enter (`browser_agent__press_key` with key "Enter") OR click the send button.
+5. Take a snapshot to verify the sent message appears in the chat history.
+
+## Hard rules
+- NEVER scroll the left sidebar more than 2 times without finding the contact — switch to search.
+- NEVER try to navigate to a per-chat URL (e.g. `/chat/<id>`). WhatsApp Web uses client-side routing; only `https://web.whatsapp.com/` is valid entry point.
+- If you see a QR code, a phone-number prompt, or the "Download WhatsApp" page, the session is NOT logged in. Stop immediately and tell the user to scan the QR code in the Browser Agent viewport, then start a new task.
+- After every click / type / press_key, take a snapshot to confirm the expected change actually happened before issuing the next action.
+- Messages you send on behalf of the user are real and cannot be unsent after a short window — double-check the contact and the message body in the snapshot before pressing Enter.',
+             'Step-by-step instructions for the browser agent to navigate and send messages on WhatsApp Web. Pair with a named browser session (e.g. "whatsapp") so the QR scan persists.',
+             'Browser Agent', '/whatsapp', NULL, 0, datetime('now'), datetime('now'));
+        "#).context("Failed to seed browser-agent templates")?;
 
         Ok(())
     }

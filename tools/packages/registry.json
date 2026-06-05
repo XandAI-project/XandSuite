@@ -348,6 +348,70 @@
           "arg_prefix": "--no-auto-install"
         }
       ]
+    },
+    {
+      "id": "iterative_image_refiner",
+      "name": "Iterative Image Refiner",
+      "description": "Self-contained iterative image refinement: generate an image, visually inspect it against a 10-category artifact checklist, score it, and edit to fix issues — repeating until quality passes. Connects directly to ComfyUI for generation and editing.",
+      "category": "Creative",
+      "icon": "ScanEye",
+      "script": "${TOOLS_DIR}/packages/official/iterative_image_refiner.py",
+      "requires": ["requests"],
+      "args_schema": [
+        {
+          "name": "comfyui_url",
+          "label": "ComfyUI Server URL",
+          "type": "string",
+          "required": true,
+          "placeholder": "http://localhost:8188",
+          "arg_prefix": "--comfyui-url"
+        },
+        {
+          "name": "gen_workflow",
+          "label": "txt2img Workflow (API format JSON)",
+          "type": "file",
+          "required": true,
+          "file_extensions": ["json"],
+          "placeholder": "Browse for your txt2img workflow JSON…",
+          "arg_prefix": "--gen-workflow"
+        },
+        {
+          "name": "edit_workflow",
+          "label": "img2img Workflow (API format JSON)",
+          "type": "file",
+          "required": true,
+          "file_extensions": ["json"],
+          "placeholder": "Browse for your img2img workflow JSON…",
+          "arg_prefix": "--edit-workflow"
+        }
+      ]
+    },
+    {
+      "id": "blender_mcp",
+      "name": "Blender MCP",
+      "description": "Connect to Blender 3D through the BlenderMCP addon. Create, modify, and delete 3D objects, apply materials, execute Python code, capture viewport screenshots, and access Poly Haven, Sketchfab, Hyper3D Rodin, and Hunyuan3D asset libraries - all from the chat window. Requires the BlenderMCP addon running in Blender with 'Connect to Claude' enabled.",
+      "category": "Creative",
+      "icon": "Box",
+      "script": "${TOOLS_DIR}/packages/official/blender_mcp.py",
+      "requires": [],
+      "args_schema": [
+        {
+          "name": "host",
+          "label": "Blender Host (default: 127.0.0.1)",
+          "type": "string",
+          "required": false,
+          "placeholder": "127.0.0.1",
+          "arg_prefix": "--host"
+        },
+        {
+          "name": "port",
+          "label": "Blender Port (default: 9876)",
+          "type": "string",
+          "required": false,
+          "placeholder": "9876",
+          "arg_prefix": "--port"
+        }
+      ]
     }
   ]
 }

@@ -1,11 +1,12 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { vscDarkPlus } from "react-syntax-highlighter/dist/esm/styles/prism";
 import {
-  X, Copy, Check, Download, Pencil, Save, Trash2,
+  X, Copy, Check, Download, Pencil, Save, Trash2, Undo2,
   Code, FileText, Globe, AlignLeft, FileDown, Loader2, FileJson,
   ChevronDown, ChevronRight, ExternalLink, FolderOpen,
 } from "lucide-react";
@@ -444,7 +445,7 @@ function ArtifactContent({ artifact, iframeRef }: ArtifactContentProps) {
 }
 
 export function ArtifactPanel() {
-  const { artifacts, activeArtifactId, closePanel, openArtifact, updateArtifact, deleteArtifact, dismissArtifact } =
+  const { artifacts, activeArtifactId, closePanel, openArtifact, updateArtifact, deleteArtifact, dismissArtifact, fetchArtifacts } =
     useArtifactStore();
 
   const [copied, setCopied] = useState(false);
@@ -452,6 +453,8 @@ export function ArtifactPanel() {
   const [editTitle, setEditTitle] = useState("");
   const [editContent, setEditContent] = useState("");
   const [exporting, setExporting] = useState(false);
+  const [aiEdited, setAiEdited] = useState(false);
+  const [undoing, setUndoing] = useState(false);
 
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
 
@@ -474,6 +477,33 @@ export function ArtifactPanel() {
     window.addEventListener("message", handleExportMessage);
     return () => window.removeEventListener("message", handleExportMessage);
   }, [handleExportMessage]);
+
+  useEffect(() => {
+    const unlisten = listen("artifact_updated", (event: any) => {
+      if (event.payload?.source === "artifact_editor") {
+        setAiEdited(true);
+        const timer = setTimeout(() => setAiEdited(false), 3000);
+        return () => clearTimeout(timer);
+      }
+    });
+    return () => { unlisten.then((fn) => fn()); };
+  }, []);
+
+  const handleUndoAiEdit = async () => {
+    if (!active || undoing) return;
+    setUndoing(true);
+    try {
+      await invoke("undo_artifact_edit", { id: active.id });
+      const convId = active.conversation_id;
+      if (convId) {
+        await fetchArtifacts(convId);
+      }
+    } catch (e) {
+      console.error("Undo failed:", e);
+    } finally {
+      setUndoing(false);
+    }
+  };
 
   const handleExportPdf = () => {
     if (!active || exporting) return;
@@ -610,6 +640,11 @@ export function ArtifactPanel() {
             {meta?.label}
             {active.language ? ` · ${active.language}` : ""}
           </span>
+          {aiEdited && (
+            <span className="text-[10px] text-primary bg-primary/10 border border-primary/30 px-1.5 py-0.5 rounded shrink-0 animate-pulse">
+              Edited by AI
+            </span>
+          )}
         </div>
 
         <div className="flex items-center gap-0.5 shrink-0">
@@ -655,6 +690,16 @@ export function ArtifactPanel() {
                   </button>
                 </>
               )}
+              <button
+                onClick={handleUndoAiEdit}
+                className="p-1.5 rounded hover:bg-secondary transition-colors"
+                title="Undo last AI edit"
+                disabled={undoing}
+              >
+                {undoing
+                  ? <Loader2 className="w-3.5 h-3.5 text-muted-foreground animate-spin" />
+                  : <Undo2 className="w-3.5 h-3.5 text-muted-foreground" />}
+              </button>
               <button onClick={handleDelete} className="p-1.5 rounded hover:bg-secondary transition-colors" title="Delete artifact">
                 <Trash2 className="w-3.5 h-3.5 text-muted-foreground hover:text-destructive" />
               </button>

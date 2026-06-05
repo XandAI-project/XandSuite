@@ -514,6 +514,68 @@ export interface AppSettings {
   tts_device: string;
 }
 
+// ── Browser Agent ────────────────────────────────────────────────────────────
+
+/**
+ * One screencast frame forwarded from the Rust `BrowserController` to the
+ * React `<canvas>` renderer via the `browser_agent_frame` Tauri event.
+ * Frames are NEVER stored in Zustand — the canvas draws them on arrival and
+ * discards the buffer.
+ */
+export interface BrowserAgentFrameEvent {
+  session_id: string;
+  /** Base64 JPEG bytes — no `data:` prefix. */
+  data_base64: string;
+  width: number;
+  height: number;
+  ts_ms: number;
+}
+
+export interface BrowserAgentUrlEvent {
+  session_id: string;
+  url: string;
+}
+
+export interface BrowserAgentTitleEvent {
+  session_id: string;
+  title: string;
+}
+
+export interface BrowserAgentLoadStateEvent {
+  session_id: string;
+  state: "loading" | "complete" | string;
+}
+
+/**
+ * Emitted after a browser session is launched. `source` is `"user"` when the
+ * launch came from the toolbar click and `"llm"` when the agent invoked
+ * `browser_agent__start_session` itself.
+ */
+export interface BrowserAgentSessionStartedEvent {
+  session_id: string;
+  conversation_id: string;
+  source: "user" | "llm" | string;
+  url: string;
+}
+
+/** Payload of a safety-gate confirmation request fired by the backend. */
+export interface BrowserAgentConfirmRequestEvent {
+  session_id: string;
+  conversation_id: string;
+  request_id: string;
+  action: string;
+  target?: string;
+  rationale: string;
+}
+
+export interface BrowserSessionStatus {
+  session_id: string;
+  url: string;
+  title: string;
+  paused: boolean;
+  takeover: boolean;
+}
+
 export interface GalleryImage {
   id: string;
   conversation_id: string;

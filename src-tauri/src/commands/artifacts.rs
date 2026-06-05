@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use tauri::State;
 use uuid::Uuid;
 
+use crate::artifact_editor;
 use crate::state::AppState;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -157,4 +158,14 @@ pub fn update_artifact(
     ).map_err(|e| e.to_string())?;
 
     Ok(artifact)
+}
+
+#[tauri::command]
+pub fn undo_artifact_edit(
+    id: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    artifact_editor::undo_edit(&state.db, &id)
+        .map(|r| serde_json::to_string(&r).unwrap_or_default())
+        .map_err(|e| e.to_string())
 }

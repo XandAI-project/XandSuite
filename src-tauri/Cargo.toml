@@ -1,6 +1,6 @@
 [package]
 name = "xandsuite"
-version = "0.3.3"
+version = "0.4.0"
 description = "XandSuite - Local LLM Desktop Application"
 authors = ["XandNet"]
 edition = "2021"
@@ -98,6 +98,13 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = { version = "0.7", features = ["io"] }
 tower-http = { version = "0.5", features = ["cors", "fs"] }
 futures-util = "0.3"
+
+# Embedded browser agent (Chrome DevTools Protocol driver).
+# Drives a sidecar Chromium/Chrome instance for the Browser Agent tab.
+# `default-features = false` disables the `bytes` feature pull which conflicts
+# with the reqwest 0.12 we already depend on; the fetcher feature is off so we
+# rely on a system Chrome/Edge install (surfaced as a setup step in the UI).
+chromiumoxide = { version = "0.9", default-features = false }
 
 [dev-dependencies]
 tokio-test = "0.4"

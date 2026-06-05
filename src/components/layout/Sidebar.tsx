@@ -13,6 +13,7 @@ import {
   UserCircle2,
   LayoutTemplate,
   Package,
+  Globe,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useModelStore } from "@/stores/modelStore";
@@ -31,6 +32,7 @@ const codingEnabled = import.meta.env.VITE_ENABLE_CODING === "true";
 // AI-facing tools group
 const aiNavItems = [
   { to: "/chat",       icon: MessageSquare,  label: "Chat" },
+  { to: "/browser",    icon: Globe,          label: "Browser Agent" },
   { to: "/personas",   icon: UserCircle2,    label: "Personas" },
   { to: "/templates",  icon: LayoutTemplate, label: "Templates" },
   ...(codingEnabled ? [{ to: "/coding", icon: Code2, label: "Coding" }] : []),

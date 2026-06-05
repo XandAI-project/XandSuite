@@ -10,6 +10,16 @@ import {
   Clock,
   ImageIcon,
   Video,
+  Globe,
+  MousePointerClick,
+  Keyboard,
+  Camera,
+  FileSearch,
+  ArrowLeftCircle,
+  RotateCw,
+  Flag,
+  Hourglass,
+  ScrollText,
 } from "lucide-react";
 import { cn, resolveGallerySrc } from "@/lib/utils";
 import type { ToolStep } from "@/stores/skillsStore";
@@ -25,6 +35,136 @@ function prettifyName(name: string): string {
   // "builtin-web-search__web_search" → "web search"
   const bare = name.includes("__") ? name.split("__").pop()! : name;
   return bare.replace(/_/g, " ");
+}
+
+// ── Browser-agent tool metadata ──────────────────────────────────────────────
+
+/** Map a browser_agent tool short-name to its icon and accent color. */
+function browserToolMeta(
+  shortName: string
+):
+  | {
+      Icon: React.ComponentType<{ className?: string }>;
+      tone: string;
+      border: string;
+      bg: string;
+    }
+  | null {
+  switch (shortName) {
+    case "navigate":
+      return {
+        Icon: Globe,
+        tone: "text-sky-300",
+        border: "border-sky-500/30",
+        bg: "bg-sky-500/5",
+      };
+    case "click":
+      return {
+        Icon: MousePointerClick,
+        tone: "text-indigo-300",
+        border: "border-indigo-500/30",
+        bg: "bg-indigo-500/5",
+      };
+    case "type":
+      return {
+        Icon: Keyboard,
+        tone: "text-violet-300",
+        border: "border-violet-500/30",
+        bg: "bg-violet-500/5",
+      };
+    case "press_key":
+      return {
+        Icon: Keyboard,
+        tone: "text-violet-300",
+        border: "border-violet-500/30",
+        bg: "bg-violet-500/5",
+      };
+    case "snapshot":
+      return {
+        Icon: Camera,
+        tone: "text-cyan-300",
+        border: "border-cyan-500/30",
+        bg: "bg-cyan-500/5",
+      };
+    case "extract":
+      return {
+        Icon: FileSearch,
+        tone: "text-amber-300",
+        border: "border-amber-500/30",
+        bg: "bg-amber-500/5",
+      };
+    case "go_back":
+      return {
+        Icon: ArrowLeftCircle,
+        tone: "text-slate-300",
+        border: "border-slate-500/30",
+        bg: "bg-slate-500/5",
+      };
+    case "reload":
+      return {
+        Icon: RotateCw,
+        tone: "text-slate-300",
+        border: "border-slate-500/30",
+        bg: "bg-slate-500/5",
+      };
+    case "scroll":
+      return {
+        Icon: ScrollText,
+        tone: "text-slate-300",
+        border: "border-slate-500/30",
+        bg: "bg-slate-500/5",
+      };
+    case "wait":
+      return {
+        Icon: Hourglass,
+        tone: "text-slate-300",
+        border: "border-slate-500/30",
+        bg: "bg-slate-500/5",
+      };
+    case "done":
+      return {
+        Icon: Flag,
+        tone: "text-emerald-300",
+        border: "border-emerald-500/30",
+        bg: "bg-emerald-500/5",
+      };
+    default:
+      return null;
+  }
+}
+
+/** Extract the short name (after the last `__`) for matching. */
+function shortToolName(name: string): string {
+  return name.includes("__") ? name.split("__").pop()! : name;
+}
+
+/** Compact preview for the most common browser args, shown inline in the header. */
+function browserArgPreview(
+  shortName: string,
+  args: Record<string, unknown>
+): string | null {
+  switch (shortName) {
+    case "navigate":
+      return typeof args.url === "string" ? String(args.url) : null;
+    case "click":
+      return args.index !== undefined ? `[${args.index}]` : null;
+    case "type": {
+      const idx = args.index !== undefined ? `[${args.index}] ` : "";
+      const txt =
+        typeof args.text === "string"
+          ? args.text.length > 48
+            ? args.text.slice(0, 48) + "…"
+            : args.text
+          : "";
+      return `${idx}${txt}`.trim() || null;
+    }
+    case "press_key":
+      return typeof args.key === "string" ? String(args.key) : null;
+    case "extract":
+      return typeof args.query === "string" ? String(args.query) : null;
+    default:
+      return null;
+  }
 }
 
 // ── Code execution result renderer ───────────────────────────────────────────
@@ -283,6 +423,16 @@ const ToolStepCard = memo(function ToolStepCard({
     ?.toLowerCase()
     .includes("generate_video");
 
+  const isBrowserAgent = step.function_name
+    ?.toLowerCase()
+    .startsWith("browser_agent");
+  const browserMeta = isBrowserAgent
+    ? browserToolMeta(shortToolName(step.function_name))
+    : null;
+  const browserPreview = isBrowserAgent
+    ? browserArgPreview(shortToolName(step.function_name), step.arguments || {})
+    : null;
+
   // Auto-open code execution, image, and video generation steps so output is visible immediately.
   // Done in useEffect (not during render) to comply with React rules and avoid extra render cycles.
   const [autoOpened, setAutoOpened] = useState(false);
@@ -307,6 +457,8 @@ const ToolStepCard = memo(function ToolStepCard({
           ? "border-purple-500/30 bg-purple-500/5"
           : isCodeExec
           ? "border-blue-500/30 bg-blue-500/5"
+          : browserMeta
+          ? cn(browserMeta.border, browserMeta.bg)
           : "border-emerald-500/30 bg-emerald-500/5"
       )}
     >
@@ -325,10 +477,14 @@ const ToolStepCard = memo(function ToolStepCard({
           <ImageIcon className="w-3 h-3 text-purple-400 shrink-0" />
         ) : isCodeExec ? (
           <Terminal className="w-3 h-3 text-blue-400 shrink-0" />
+        ) : browserMeta ? (
+          <browserMeta.Icon className={cn("w-3 h-3 shrink-0", browserMeta.tone)} />
         ) : (
           <CheckCircle2 className="w-3 h-3 text-emerald-400 shrink-0" />
         )}
-        <Wrench className="w-3 h-3 text-muted-foreground shrink-0" />
+        {!browserMeta && (
+          <Wrench className="w-3 h-3 text-muted-foreground shrink-0" />
+        )}
         <span
           className={cn(
             "font-medium capitalize",
@@ -342,11 +498,21 @@ const ToolStepCard = memo(function ToolStepCard({
             ? "text-purple-300"
             : isCodeExec
             ? "text-blue-300"
+            : browserMeta
+            ? browserMeta.tone
             : "text-emerald-300"
           )}
         >
           {prettifyName(step.function_name)}
         </span>
+        {browserPreview && (
+          <span
+            className="ml-1 min-w-0 truncate text-[10px] text-muted-foreground/80 font-mono"
+            title={browserPreview}
+          >
+            {browserPreview}
+          </span>
+        )}
         <span className="ml-auto text-muted-foreground/50 text-[10px]">
           turn {step.turn + 1}
         </span>

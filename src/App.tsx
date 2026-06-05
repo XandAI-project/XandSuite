@@ -16,12 +16,14 @@ import { ServerConnect } from "@/components/onboarding/ServerConnect";
 import { PersonasView } from "@/components/personas/PersonasView";
 import { TemplatesView } from "@/components/templates/TemplatesView";
 import { PackagesView } from "@/components/packages/PackagesView";
+import { BrowserAgentTab } from "@/components/browser/BrowserAgentTab";
 import { useModelStore } from "@/stores/modelStore";
 import { useLogStore } from "@/stores/logStore";
 import { useServerStore } from "@/stores/serverStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { isTauri } from "@/lib/transport";
 import { hasServerConfig } from "@/lib/serverConfig";
+import { useBrowserKillSwitch } from "@/hooks/useBrowserKillSwitch";
 
 const codingEnabled = import.meta.env.VITE_ENABLE_CODING === "true";
 
@@ -33,6 +35,8 @@ function App() {
 
   // Web mode: show a connection screen until the user has configured a backend URL.
   const [serverReady, setServerReady] = useState(() => isTauri() || hasServerConfig());
+
+  useBrowserKillSwitch();
 
   useEffect(() => {
     if (!serverReady) return;
@@ -56,6 +60,7 @@ function App() {
         <Routes>
           <Route path="/" element={<Navigate to="/chat" replace />} />
           <Route path="/chat" element={<ChatView />} />
+          <Route path="/browser" element={<BrowserAgentTab />} />
           <Route path="/personas" element={<PersonasView />} />
           <Route path="/templates" element={<TemplatesView />} />
           {codingEnabled && <Route path="/coding" element={<CodingView />} />}

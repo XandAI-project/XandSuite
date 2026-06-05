@@ -10,6 +10,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { Progress } from "@/components/ui/progress";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { BrowserCookieSessions } from "@/components/settings/BrowserCookieSessions";
 import { useServerStore } from "@/stores/serverStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { cn } from "@/lib/utils";
@@ -146,6 +147,7 @@ export function SettingsView() {
               { value: "voice",    label: "Voice" },
               { value: "remote",   label: "Remote" },
               { value: "knowledge",label: "Knowledge" },
+              { value: "browser",  label: "Browser" },
               { value: "advanced", label: "Advanced" },
               { value: "profile",  label: "Profile" },
             ].map(({ value, label }) => (
@@ -789,6 +791,16 @@ export function SettingsView() {
         </ScrollArea>
         </TabsContent>
 
+        {/* ── Browser tab ── */}
+        <TabsContent value="browser" className="flex-1 overflow-hidden mt-0">
+          <ScrollArea className="h-full px-6 py-6">
+            <div className="max-w-2xl space-y-8">
+              <BrowserAgentAutostartField />
+              <BrowserCookieSessions />
+            </div>
+          </ScrollArea>
+        </TabsContent>
+
         {/* ── Advanced tab ── */}
         <TabsContent value="advanced" className="flex-1 overflow-hidden mt-0">
         <ScrollArea className="h-full px-6 py-6">
@@ -1120,6 +1132,70 @@ function Field({ label, description, children }: { label: string; description?: 
       {description && <p className="text-xs text-muted-foreground mb-1.5">{description}</p>}
       {children}
     </div>
+  );
+}
+
+/**
+ * Controls the `browser_agent_autostart` preference persisted in the SQLite
+ * `settings` table. When on, the LLM may invoke `browser_agent__start_session`
+ * on its own for browser-shaped user requests; when off, it has to ask the
+ * user to click Start browser first.
+ */
+function BrowserAgentAutostartField() {
+  const [enabled, setEnabled] = useState<boolean | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const v = await invoke<boolean>("get_browser_agent_autostart");
+        if (!cancelled) setEnabled(v);
+      } catch {
+        if (!cancelled) setEnabled(true); // match backend default
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const onToggle = async (next: boolean) => {
+    setSaving(true);
+    try {
+      await invoke("set_browser_agent_autostart", { enabled: next });
+      setEnabled(next);
+    } catch (e) {
+      console.error("[settings] failed to save autostart pref:", e);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Section title="Agent Autonomy">
+      <Field
+        label="Let the agent start the browser"
+        description="When the user asks something that clearly needs the web (search, open a URL, log in to a site), the AI can launch the embedded browser itself instead of waiting for you to click Start browser. It still runs in the same isolated profile and respects all safety rules."
+      >
+        <label className="flex items-center gap-2 cursor-pointer select-none">
+          <input
+            type="checkbox"
+            className="w-4 h-4 accent-primary"
+            checked={enabled ?? false}
+            disabled={enabled === null || saving}
+            onChange={(e) => void onToggle(e.target.checked)}
+          />
+          <span className="text-sm">
+            {enabled === null
+              ? "Loading…"
+              : enabled
+                ? "Enabled — the agent can launch browsers autonomously"
+                : "Disabled — only you can start a browser session"}
+          </span>
+        </label>
+      </Field>
+    </Section>
   );
 }
 
