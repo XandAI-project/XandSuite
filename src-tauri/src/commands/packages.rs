@@ -234,9 +234,63 @@ fn parse_requirements(requirements: &str) -> Vec<String> {
         .collect()
 }
 
+/// Outcome of a single `pip install` invocation.
+enum PipRun {
+    /// Install succeeded.
+    Ok,
+    /// Interpreter binary was not found on PATH.
+    InterpreterMissing,
+    /// pip ran but exited non-zero. Carries the combined stdout+stderr.
+    Failed(String),
+}
+
+/// Run `<interpreter> -m pip install [extra_flags] <pkgs>` once.
+async fn run_pip_once(interpreter: &str, pkgs: &[String], extra_flags: &[&str]) -> Result<PipRun, String> {
+    let mut cmd = tokio::process::Command::new(interpreter);
+    cmd.hide_window();
+    cmd.args(["-m", "pip", "install", "--quiet", "--no-warn-script-location"]);
+    cmd.args(extra_flags);
+    cmd.args(pkgs);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let output = tokio::time::timeout(
+        tokio::time::Duration::from_secs(180),
+        cmd.output(),
+    )
+    .await;
+
+    match output {
+        Err(_) => Err(format!(
+            "pip install timed out after 3 minutes while running '{} -m pip install'",
+            interpreter
+        )),
+        Ok(Err(_)) => Ok(PipRun::InterpreterMissing),
+        Ok(Ok(out)) if out.status.success() => Ok(PipRun::Ok),
+        Ok(Ok(out)) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            Ok(PipRun::Failed(format!(
+                "exit {}:\n{}{}",
+                out.status.code().unwrap_or(-1),
+                stdout,
+                stderr
+            )))
+        }
+    }
+}
+
 /// Install Python packages with `python -m pip install`.
 /// Falls back to `python3 -m pip install` if `python` is not found.
 /// The `mcp` package (required by all FastMCP scripts) is always included.
+///
+/// On PEP 668 "externally-managed-environment" systems (modern Debian/Ubuntu,
+/// Python ≥ 3.11), a plain `pip install` into the system interpreter is blocked.
+/// We detect that specific failure and transparently retry into the per-user
+/// site-packages (`pip install --user --break-system-packages`). That keeps the
+/// install user-scoped (writes to `~/.local`, never touches the OS Python) while
+/// still being importable by the same system `python` we launch package scripts
+/// with.
 async fn pip_install_packages(extra: &[String]) -> Result<(), String> {
     // Always ensure mcp is present; merge with caller-supplied packages.
     let mut pkgs: Vec<String> = vec!["mcp".to_string()];
@@ -248,54 +302,56 @@ async fn pip_install_packages(extra: &[String]) -> Result<(), String> {
 
     log::info!("[packages] pip install: {}", pkgs.join(", "));
 
-    let run = |interpreter: &str| {
-        let mut cmd = tokio::process::Command::new(interpreter);
-        cmd.hide_window();
-        cmd.args(["-m", "pip", "install", "--quiet", "--no-warn-script-location"]);
-        cmd.args(&pkgs);
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-        cmd
-    };
-
     // Try `python` first, then `python3`.
     for interpreter in &["python", "python3"] {
-        let output = tokio::time::timeout(
-            tokio::time::Duration::from_secs(180),
-            run(interpreter).output(),
-        )
-        .await;
-
-        match output {
-            // timeout
-            Err(_) => {
-                return Err(format!(
-                    "pip install timed out after 3 minutes while running '{} -m pip install'",
-                    interpreter
-                ));
-            }
-            // interpreter not found — try the next one
-            Ok(Err(_)) if *interpreter == "python" => continue,
-            // interpreter not found — both failed
-            Ok(Err(e)) => return Err(format!("Could not run pip: {}", e)),
-            Ok(Ok(out)) if out.status.success() => {
+        match run_pip_once(interpreter, &pkgs, &[]).await? {
+            PipRun::Ok => {
                 log::info!("[packages] pip install succeeded via {}", interpreter);
                 return Ok(());
             }
-            Ok(Ok(out)) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                return Err(format!(
-                    "pip install failed (exit {}):\n{}{}",
-                    out.status.code().unwrap_or(-1),
-                    stdout,
-                    stderr
-                ));
+            // Interpreter not found — try the next candidate.
+            PipRun::InterpreterMissing => continue,
+            PipRun::Failed(err) => {
+                // PEP 668: retry into the user site with --break-system-packages.
+                if is_externally_managed_error(&err) {
+                    log::warn!(
+                        "[packages] {} is externally managed (PEP 668); retrying with --user --break-system-packages",
+                        interpreter
+                    );
+                    match run_pip_once(
+                        interpreter,
+                        &pkgs,
+                        &["--user", "--break-system-packages"],
+                    )
+                    .await?
+                    {
+                        PipRun::Ok => {
+                            log::info!(
+                                "[packages] pip install succeeded via {} (--user --break-system-packages)",
+                                interpreter
+                            );
+                            return Ok(());
+                        }
+                        PipRun::InterpreterMissing => continue,
+                        PipRun::Failed(retry_err) => {
+                            return Err(format!("pip install failed ({})", retry_err));
+                        }
+                    }
+                }
+                return Err(format!("pip install failed ({})", err));
             }
         }
     }
 
     Err("Neither 'python' nor 'python3' found. Please install Python 3 and ensure it is on your PATH.".to_string())
+}
+
+/// Detect the PEP 668 externally-managed-environment failure from pip's output.
+fn is_externally_managed_error(stderr: &str) -> bool {
+    let lower = stderr.to_lowercase();
+    lower.contains("externally-managed-environment")
+        || lower.contains("externally managed")
+        || lower.contains("break-system-packages")
 }
 
 // ── Official packages ─────────────────────────────────────────────────────────
