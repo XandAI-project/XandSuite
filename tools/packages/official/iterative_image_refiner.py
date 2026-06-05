@@ -115,6 +115,8 @@ def _inject_prompts(wf: dict, positive: str, negative: str) -> None:
                  "CLIPTextEncodeFlux": "text", "PrimitiveStringMultiline": "value",
                  "TextEncodeQwenImageEditPlus": "prompt"}
     for _nid, node in wf.items():
+        if not isinstance(node, dict):
+            continue
         ct = node.get("class_type", "")
         if ct not in clip_types:
             continue
@@ -715,6 +717,8 @@ def refine_image(
 
     # Inject the uploaded image into the first LoadImage node
     for _nid, node in wf.items():
+        if not isinstance(node, dict):
+            continue
         if node.get("class_type") == "LoadImage":
             node.setdefault("inputs", {})["image"] = comfyui_name
             break
@@ -737,6 +741,8 @@ def refine_image(
 
     # Inject denoise on KSampler nodes if no placeholder was found
     for _nid, node in wf.items():
+        if not isinstance(node, dict):
+            continue
         ct = node.get("class_type", "")
         if ct in ("KSampler", "KSamplerAdvanced"):
             inputs = node.get("inputs", {})

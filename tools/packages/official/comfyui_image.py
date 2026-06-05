@@ -425,6 +425,8 @@ def get_workflow_info() -> str:
     placeholders_found: list[dict] = []
 
     for node_id, node in workflow.items():
+        if not isinstance(node, dict):
+            continue
         class_type = node.get("class_type", "unknown")
         inputs = node.get("inputs", {})
         nodes.append({"id": node_id, "class_type": class_type})
