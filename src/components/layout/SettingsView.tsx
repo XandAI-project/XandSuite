@@ -13,6 +13,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { BrowserCookieSessions } from "@/components/settings/BrowserCookieSessions";
 import { useServerStore } from "@/stores/serverStore";
 import { useSettingsStore } from "@/stores/settingsStore";
+import { useModelStore } from "@/stores/modelStore";
 import { cn } from "@/lib/utils";
 import type { AppSettings } from "@/lib/tauri";
 
@@ -24,6 +25,7 @@ export function SettingsView() {
   const [modelsDir, setModelsDir] = useState("");
   const [previewingVoice, setPreviewingVoice] = useState<string | null>(null);
   const [previewLoadingVoice, setPreviewLoadingVoice] = useState<string | null>(null);
+  const [remoteStatus, setRemoteStatus] = useState<{ ok: boolean; msg: string } | null>(null);
   const previewSourceRef = useRef<AudioBufferSourceNode | null>(null);
   const previewCtxRef = useRef<AudioContext | null>(null);
 
@@ -66,6 +68,8 @@ export function SettingsView() {
     fetchStatus, detectGpu, downloadBinary, listenToProgress,
   } = useServerStore();
 
+  const { connectRemote } = useModelStore();
+
   // Keep the global settings store in sync so other components (e.g. InputBar)
   // always reflect the latest saved values.
   const { fetchSettings: syncSettingsStore } = useSettingsStore();
@@ -83,6 +87,7 @@ export function SettingsView() {
   const handleSave = async () => {
     if (!settings) return;
     setIsSaving(true);
+    setRemoteStatus(null);
     try {
       await invoke("save_settings", { settings });
       // Refresh the global store so InputBar and other consumers
@@ -90,6 +95,25 @@ export function SettingsView() {
       await syncSettingsStore();
       // Re-resolve the models dir in case it was changed
       invoke<string>("get_models_dir").then(setModelsDir).catch(console.error);
+      // Refresh server store so engineMode-dependent UI (ModelBrowser) updates.
+      await fetchStatus();
+
+      // When remote mode is active, connect (and health-check) the engine now
+      // so the user gets immediate feedback instead of a failed first chat.
+      if (settings.default_engine_mode === "remote") {
+        const url = settings.remote_server_url?.trim();
+        if (url) {
+          const ok = await connectRemote(url, settings.remote_api_key ?? undefined);
+          setRemoteStatus(
+            ok
+              ? { ok: true, msg: `Connected to remote server at ${url}` }
+              : { ok: false, msg: `Could not reach remote server at ${url}. Check the URL and that the server is running.` }
+          );
+        } else {
+          setRemoteStatus({ ok: false, msg: "Remote mode is selected but no Server URL is set (Remote tab)." });
+        }
+      }
+
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
     } catch (e) {
@@ -124,6 +148,10 @@ export function SettingsView() {
     );
   }
 
+  // In remote mode the local llama-server is unused, so its configuration
+  // fields are greyed out and the user is pointed at the Remote tab instead.
+  const isRemote = settings.default_engine_mode === "remote";
+
   return (
     <div className="flex flex-col h-full">
       {/* Header */}
@@ -132,10 +160,17 @@ export function SettingsView() {
           <h1 className="text-xl font-semibold">Settings</h1>
           <p className="text-sm text-muted-foreground mt-0.5">Configure XandSuite preferences</p>
         </div>
-        <Button onClick={handleSave} disabled={isSaving} className="gap-2">
-          {isSaving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
-          {saved ? "Saved!" : "Save Settings"}
-        </Button>
+        <div className="flex items-center gap-3">
+          {remoteStatus && (
+            <span className={cn("text-xs max-w-md text-right", remoteStatus.ok ? "text-emerald-400" : "text-destructive")}>
+              {remoteStatus.msg}
+            </span>
+          )}
+          <Button onClick={handleSave} disabled={isSaving} className="gap-2">
+            {isSaving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+            {saved ? "Saved!" : "Save Settings"}
+          </Button>
+        </div>
       </div>
 
       <Tabs defaultValue="models" className="flex flex-col flex-1 overflow-hidden">
@@ -231,10 +266,17 @@ export function SettingsView() {
                 <option value="local">Local (llama.cpp)</option>
                 <option value="remote">Remote server</option>
               </select>
+              {isRemote && (
+                <p className="mt-2 text-xs text-blue-400">
+                  Model loading is managed by the remote server. Configure the endpoint in the{" "}
+                  <span className="font-medium">Remote</span> tab. Local server settings below are inactive.
+                </p>
+              )}
             </Field>
           </Section>
 
           {/* Local server */}
+          <div className={cn(isRemote && "opacity-50 pointer-events-none select-none")}>
           <Section title="Local Server (llama-server)">
             {/* Binary download */}
             <Field
@@ -453,6 +495,7 @@ export function SettingsView() {
               </label>
             </Field>
           </Section>
+          </div>
 
           {/* Reasoning */}
           <Section title="Reasoning / Chain-of-Thought">
@@ -461,7 +504,7 @@ export function SettingsView() {
               description="How llama-server parses <think> tokens. 'deepseek' puts reasoning in a separate field (works for Qwen3, DeepSeek-R1, and most thinking models). Requires server restart."
             >
               <select
-                className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm"
+                className="flex h-9 w-full rounded-md border border-input bg-background text-foreground px-3 py-1 text-sm [&>option]:bg-background [&>option]:text-foreground"
                 value={settings.reasoning_format}
                 onChange={(e) => update("reasoning_format", e.target.value)}
               >
@@ -692,7 +735,7 @@ export function SettingsView() {
                         update("tts_language", lang);
                         stopVoicePreview();
                       }}
-                      className="text-sm bg-background border border-border rounded px-2 py-1 h-8"
+                      className="text-sm bg-background text-foreground border border-border rounded px-2 py-1 h-8 [&>optgroup]:bg-background [&>option]:bg-background [&>option]:text-foreground"
                     >
                       <optgroup label="English (US)">
                         {["af_heart","af_bella","af_sarah","af_sky","am_adam","am_michael"].map(v => (
@@ -913,7 +956,7 @@ export function SettingsView() {
               description="Model name sent to the running llama-server (or Ollama) /v1/embeddings endpoint. llama-server ignores this field and uses whatever model is currently loaded; Ollama uses it to route to the right model."
             >
               <select
-                className="w-full bg-background border border-input rounded-md px-3 py-2 text-sm"
+                className="w-full bg-background text-foreground border border-input rounded-md px-3 py-2 text-sm [&>option]:bg-background [&>option]:text-foreground"
                 value={settings.embedding_model ?? "nomic-embed-text-v1.5"}
                 onChange={(e) => update("embedding_model", e.target.value)}
               >
@@ -992,7 +1035,7 @@ export function SettingsView() {
                     description="Backend vector store used by graphrag-server. lancedb is embedded (no extra process)."
                   >
                     <select
-                      className="w-full bg-background border border-input rounded-md px-3 py-2 text-sm"
+                      className="w-full bg-background text-foreground border border-input rounded-md px-3 py-2 text-sm [&>option]:bg-background [&>option]:text-foreground"
                       value={settings.graph_rag_vector_db ?? "lancedb"}
                       onChange={(e) => update("graph_rag_vector_db", e.target.value)}
                     >
@@ -1411,7 +1454,7 @@ function WhisperModelRow({
         <select
           value={selectedSize}
           onChange={(e) => setSelectedSize(e.target.value)}
-          className="text-sm bg-background border border-border rounded px-2 py-1 h-8"
+          className="text-sm bg-background text-foreground border border-border rounded px-2 py-1 h-8 [&>option]:bg-background [&>option]:text-foreground"
         >
           {WHISPER_SIZES.map((s) => (
             <option key={s.id} value={s.id}>

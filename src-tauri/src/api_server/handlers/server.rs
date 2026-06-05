@@ -46,7 +46,7 @@ pub async fn start_local_server(
         format!("http://127.0.0.1:{}", port),
         None,
         None,
-    );
+    ).await;
 
     {
         let mut s = state.settings.lock().unwrap();

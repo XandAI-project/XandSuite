@@ -119,12 +119,17 @@
     background: hsl(var(--secondary)) !important;
   }
 
-  /* Native <select> dropdown options need explicit colors in dark themes */
+  /* Native <select> dropdown options need explicit colors in dark themes.
+     `color-scheme: dark` is the critical hint for Linux/WebKitGTK: without it
+     the native GTK dropdown popup renders with a light system background while
+     the option text stays light, producing white-on-white text. */
   select {
+    color-scheme: dark;
     background-color: hsl(var(--background));
     color: hsl(var(--foreground));
   }
   option {
+    color-scheme: dark;
     background-color: hsl(var(--background));
     color: hsl(var(--foreground));
   }

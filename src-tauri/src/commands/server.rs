@@ -274,7 +274,7 @@ pub async fn get_server_status(state: State<'_, AppState>) -> Result<ServerStatu
             // Reconnect the engine to the already-running server.
             drop(server);
             let url = format!("http://127.0.0.1:{}", probe_port);
-            let _ = state.engine.connect_remote(url, None, None);
+            let _ = state.engine.connect_remote(url, None, None).await;
 
             let binary_exists = LlamaServerManager::binary_exists(&state.data_dir);
             return Ok(ServerStatus {
@@ -552,6 +552,7 @@ pub async fn start_local_server(
     state
         .engine
         .connect_remote(server_url, None, None)
+        .await
         .map_err(|e| e.to_string())?;
 
     Ok(())
@@ -611,6 +612,7 @@ pub async fn ensure_server_running(state: State<'_, AppState>) -> Result<bool, S
     state
         .engine
         .connect_remote(format!("http://127.0.0.1:{}", port), None, None)
+        .await
         .map_err(|e| e.to_string())?;
 
     Ok(true)

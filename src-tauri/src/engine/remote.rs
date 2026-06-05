@@ -115,6 +115,21 @@ pub struct StreamWithToolsResult {
     pub finish_reason: String,
 }
 
+/// Normalize a user-provided remote server URL.
+///
+/// - Trims surrounding whitespace.
+/// - Prepends `http://` when no scheme is present (e.g. `192.168.0.2:8080`).
+/// - Strips any trailing slashes so endpoint paths concatenate cleanly.
+pub fn normalize_server_url(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let with_scheme = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        trimmed.to_string()
+    } else {
+        format!("http://{}", trimmed)
+    };
+    with_scheme.trim_end_matches('/').to_string()
+}
+
 #[derive(Clone)]
 pub struct RemoteEngine {
     client: Client,
@@ -141,7 +156,7 @@ impl RemoteEngine {
             .unwrap_or_default();
         Self {
             client,
-            server_url,
+            server_url: normalize_server_url(&server_url),
             api_key,
             model_name: model_name.unwrap_or_else(|| "local-model".to_string()),
             enable_thinking: true,

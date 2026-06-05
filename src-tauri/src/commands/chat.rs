@@ -1362,7 +1362,7 @@ pub async fn send_message_inner(
                     }
                     let _ = state.engine.connect_remote(
                         format!("http://127.0.0.1:{}", port), None, None
-                    );
+                    ).await;
                 }
             }
         }

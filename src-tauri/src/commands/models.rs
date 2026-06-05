@@ -210,7 +210,7 @@ pub async fn connect_remote_server(
     );
     let is_alive = engine.test_connection().await.map_err(|e| e.to_string())?;
     if is_alive {
-        state.engine.connect_remote(server_url, api_key, model_name).map_err(|e| e.to_string())?;
+        state.engine.connect_remote(server_url, api_key, model_name).await.map_err(|e| e.to_string())?;
     }
     Ok(is_alive)
 }

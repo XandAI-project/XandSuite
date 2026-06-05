@@ -358,6 +358,35 @@ pub fn run() {
                 });
             }
 
+            // Auto-connect the remote engine at startup when remote mode is the
+            // configured default and a server URL is present. Without this the
+            // engine stays `None` until the user re-saves settings, so the first
+            // chat after launch fails with "No model loaded".
+            {
+                let (engine_mode, remote_url, remote_key) = {
+                    let s = state_arc.settings.lock().unwrap();
+                    (
+                        s.default_engine_mode.clone(),
+                        s.remote_server_url.clone(),
+                        s.remote_api_key.clone(),
+                    )
+                };
+                if engine_mode == "remote" {
+                    if let Some(url) = remote_url.filter(|u| !u.trim().is_empty()) {
+                        let engine_arc = state_arc.engine.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let url = crate::engine::remote::normalize_server_url(&url);
+                            log::info!("Auto-connecting remote engine at startup: {}", url);
+                            if let Err(e) =
+                                engine_arc.connect_remote(url, remote_key, None).await
+                            {
+                                log::warn!("Remote engine auto-connect failed: {}", e);
+                            }
+                        });
+                    }
+                }
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

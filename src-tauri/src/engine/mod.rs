@@ -32,18 +32,19 @@ impl EngineManager {
         Ok(())
     }
 
-    pub fn connect_remote(
+    pub async fn connect_remote(
         &self,
         server_url: String,
         api_key: Option<String>,
         model_name: Option<String>,
     ) -> Result<()> {
         let engine = remote::RemoteEngine::new(server_url, api_key, model_name);
-        let engine_clone = self.engine.clone();
-        tokio::spawn(async move {
-            let mut lock = engine_clone.lock().await;
-            *lock = Some(Engine::Remote(engine));
-        });
+        // Await the lock directly instead of spawning a detached task. The old
+        // spawn approach returned immediately, so a chat request sent right
+        // after connecting could observe `engine == None` (a race). Awaiting
+        // here guarantees the engine is installed before this call returns.
+        let mut lock = self.engine.lock().await;
+        *lock = Some(Engine::Remote(engine));
         Ok(())
     }
 

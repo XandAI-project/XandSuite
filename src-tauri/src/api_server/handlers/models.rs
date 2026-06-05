@@ -82,7 +82,7 @@ pub async fn load_model(
     drop(srv);
 
     let port = settings.llama_server_port;
-    let _ = state.engine.connect_remote(format!("http://127.0.0.1:{}", port), None, None);
+    let _ = state.engine.connect_remote(format!("http://127.0.0.1:{}", port), None, None).await;
 
     let mut s = state.settings.lock().unwrap();
     s.last_server_model = Some(body.model_path.clone());
@@ -110,6 +110,7 @@ pub async fn connect_remote_server(
     state
         .engine
         .connect_remote(body.url, body.api_key, body.model_id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(serde_json::json!({ "success": true })))
 }
