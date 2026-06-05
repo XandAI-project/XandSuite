@@ -218,6 +218,31 @@ fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
+// ── Python interpreter resolution ────────────────────────────────────────────
+
+/// Return the name of a working Python 3 interpreter on this system.
+/// On Windows `python` is almost always correct; on Linux/macOS `python` may
+/// not exist (only `python3`), so we probe both and cache the winner for the
+/// lifetime of this process.
+fn resolve_python() -> &'static str {
+    use std::sync::OnceLock;
+    static PYTHON: OnceLock<&'static str> = OnceLock::new();
+    PYTHON.get_or_init(|| {
+        for candidate in &["python", "python3"] {
+            if std::process::Command::new(candidate)
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok()
+            {
+                return candidate;
+            }
+        }
+        "python" // fallback — will produce a clear "not found" error downstream
+    })
+}
+
 // ── pip auto-install ──────────────────────────────────────────────────────────
 
 /// Parse a requirements.txt-style string into individual package specifiers.
@@ -502,7 +527,7 @@ async fn install_package_impl(
         id: mcp_id.clone(),
         name: pkg.get("name").and_then(|v| v.as_str()).unwrap_or(&package_id).to_string(),
         description: pkg.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        transport: McpTransport::Stdio { command: "python".to_string(), args },
+        transport: McpTransport::Stdio { command: resolve_python().to_string(), args },
         builtin: false,
         enabled: true,
         icon: pkg.get("icon").and_then(|v| v.as_str()).unwrap_or("Package").to_string(),
@@ -742,7 +767,7 @@ async fn install_custom_package_impl(id: String, state: &AppState) -> Result<(),
         name: meta.name.clone(),
         description: meta.description.clone(),
         transport: McpTransport::Stdio {
-            command: "python".to_string(),
+            command: resolve_python().to_string(),
             args: vec![script_path.to_string_lossy().to_string()],
         },
         builtin: false,
@@ -847,7 +872,7 @@ pub async fn reconnect_installed_packages(state: &AppState) {
                 id: record.mcp_server_id.clone(),
                 name: pkg.get("name").and_then(|v| v.as_str()).unwrap_or(pid).to_string(),
                 description: pkg.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                transport: McpTransport::Stdio { command: "python".to_string(), args },
+                transport: McpTransport::Stdio { command: resolve_python().to_string(), args },
                 builtin: false,
                 enabled: true,
                 icon: pkg.get("icon").and_then(|v| v.as_str()).unwrap_or("Package").to_string(),
@@ -866,7 +891,7 @@ pub async fn reconnect_installed_packages(state: &AppState) {
                 name: meta.name.clone(),
                 description: meta.description.clone(),
                 transport: McpTransport::Stdio {
-                    command: "python".to_string(),
+                    command: resolve_python().to_string(),
                     args: vec![script_path.to_string_lossy().to_string()],
                 },
                 builtin: false,
