@@ -13,6 +13,7 @@ CLI args (set at install time via connector):
 import argparse
 import json
 import os
+import platform
 import re
 from typing import Optional
 
@@ -226,24 +227,106 @@ def extract_pdf_tables(file_path: str, page_number: int = 1) -> str:
 # Generation tools
 # ---------------------------------------------------------------------------
 
+def _find_system_fonts() -> dict[str, str]:
+    """Discover system TTF fonts for regular/bold/italic/bold-italic styles.
+
+    Returns a dict like ``{"": "/path/Regular.ttf", "B": "/path/Bold.ttf", ...}``
+    with only the styles that actually exist on disk.  Empty dict if nothing found.
+    """
+    families: list[dict[str, str]] = []
+    system = platform.system()
+
+    if system == "Windows":
+        fd = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
+        families.append({
+            "": os.path.join(fd, "arial.ttf"),
+            "B": os.path.join(fd, "arialbd.ttf"),
+            "I": os.path.join(fd, "ariali.ttf"),
+            "BI": os.path.join(fd, "arialbi.ttf"),
+        })
+        families.append({
+            "": os.path.join(fd, "segoeui.ttf"),
+            "B": os.path.join(fd, "segoeuib.ttf"),
+            "I": os.path.join(fd, "segoeuii.ttf"),
+            "BI": os.path.join(fd, "segoeuiz.ttf"),
+        })
+    elif system == "Darwin":
+        families.append({
+            "": "/Library/Fonts/Arial.ttf",
+            "B": "/Library/Fonts/Arial Bold.ttf",
+            "I": "/Library/Fonts/Arial Italic.ttf",
+            "BI": "/Library/Fonts/Arial Bold Italic.ttf",
+        })
+        supp = "/System/Library/Fonts/Supplemental"
+        families.append({
+            "": os.path.join(supp, "Arial.ttf"),
+            "B": os.path.join(supp, "Arial Bold.ttf"),
+            "I": os.path.join(supp, "Arial Italic.ttf"),
+            "BI": os.path.join(supp, "Arial Bold Italic.ttf"),
+        })
+    else:
+        for base in [
+            "/usr/share/fonts/truetype/dejavu",
+            "/usr/share/fonts/TTF",
+            "/usr/share/fonts/dejavu",
+        ]:
+            families.append({
+                "": os.path.join(base, "DejaVuSans.ttf"),
+                "B": os.path.join(base, "DejaVuSans-Bold.ttf"),
+                "I": os.path.join(base, "DejaVuSans-Oblique.ttf"),
+                "BI": os.path.join(base, "DejaVuSans-BoldOblique.ttf"),
+            })
+        for base in [
+            "/usr/share/fonts/truetype/liberation",
+            "/usr/share/fonts/liberation-sans",
+        ]:
+            families.append({
+                "": os.path.join(base, "LiberationSans-Regular.ttf"),
+                "B": os.path.join(base, "LiberationSans-Bold.ttf"),
+                "I": os.path.join(base, "LiberationSans-Italic.ttf"),
+                "BI": os.path.join(base, "LiberationSans-BoldItalic.ttf"),
+            })
+
+    for candidate in families:
+        if os.path.isfile(candidate.get("", "")):
+            return {s: p for s, p in candidate.items() if os.path.isfile(p)}
+    return {}
+
+
+_SYSTEM_FONTS: dict[str, str] = _find_system_fonts()
+_UNI_FAMILY = "UniSans"
+
+
 def _new_pdf():
-    """Create a pre-configured FPDF instance."""
+    """Create a pre-configured FPDF instance with Unicode font support."""
     from fpdf import FPDF
 
     class _PDF(FPDF):
+        _font_family_name = "Helvetica"
+
         def header(self):
-            pass  # Custom headers handled per-document
+            pass
 
         def footer(self):
             self.set_y(-12)
-            self.set_font("Helvetica", "I", 8)
+            self.set_font(self._font_family_name, "I", 8)
             self.set_text_color(150, 150, 150)
             self.cell(0, 10, f"Page {self.page_no()}", align="C")
 
     pdf = _PDF()
     pdf.set_auto_page_break(auto=True, margin=18)
     pdf.set_margins(20, 20, 20)
+
+    if _SYSTEM_FONTS:
+        for style, path in _SYSTEM_FONTS.items():
+            pdf.add_font(_UNI_FAMILY, style=style, fname=path)
+        pdf._font_family_name = _UNI_FAMILY
     return pdf
+
+
+def _font(pdf) -> str:
+    """Return the registered font family name for *pdf*."""
+    return getattr(pdf, "_font_family_name", "Helvetica")
 
 
 # ---------------------------------------------------------------------------
@@ -267,7 +350,7 @@ def _write_inline(pdf, text: str, row_h: int = 6):
     Uses write() with font switching so text wraps inside the page margins.
     Appends a newline at the end.
     """
-    fam = pdf.font_family or "Helvetica"
+    fam = _font(pdf)
     sz = pdf.font_size_pt or 11
     # Split on **bold** or *italic* spans
     parts = re.split(r'(\*\*[^*\n]+?\*\*|\*[^*\n]+?\*)', text)
@@ -326,7 +409,7 @@ def _render_markdown(pdf, text: str):
         if line.startswith('### '):
             if in_list:
                 in_list = False
-            pdf.set_font("Helvetica", "B", 12)
+            pdf.set_font(_font(pdf), "B", 12)
             pdf.set_text_color(50, 60, 120)
             pdf.multi_cell(0, 7, _strip_inline_md(line[4:].strip()))
             pdf.set_text_color(30, 30, 30)
@@ -337,7 +420,7 @@ def _render_markdown(pdf, text: str):
         if line.startswith('## '):
             if in_list:
                 in_list = False
-            pdf.set_font("Helvetica", "B", 14)
+            pdf.set_font(_font(pdf), "B", 14)
             pdf.set_text_color(30, 40, 100)
             pdf.multi_cell(0, 8, _strip_inline_md(line[3:].strip()))
             pdf.set_text_color(30, 30, 30)
@@ -348,7 +431,7 @@ def _render_markdown(pdf, text: str):
         if line.startswith('# '):
             if in_list:
                 in_list = False
-            pdf.set_font("Helvetica", "B", 18)
+            pdf.set_font(_font(pdf), "B", 18)
             pdf.set_text_color(20, 20, 80)
             pdf.multi_cell(0, 9, _strip_inline_md(line[2:].strip()))
             pdf.set_text_color(30, 30, 30)
@@ -360,7 +443,7 @@ def _render_markdown(pdf, text: str):
         if m:
             in_list = True
             content = _strip_inline_md(m.group(1))
-            pdf.set_font("Helvetica", "", 11)
+            pdf.set_font(_font(pdf), "", 11)
             pdf.set_text_color(30, 30, 30)
             indent_mm = 8
             bullet_w = 5
@@ -368,7 +451,7 @@ def _render_markdown(pdf, text: str):
             usable_w = pdf.w - text_x - pdf.r_margin
             # Bullet glyph
             pdf.set_x(pdf.l_margin + indent_mm)
-            pdf.cell(bullet_w, row_h, "\u2022")
+            pdf.cell(bullet_w, row_h, "\u2022" if _SYSTEM_FONTS else "-")
             # Text (multi_cell handles long line wrap within usable width)
             pdf.set_x(text_x)
             pdf.multi_cell(usable_w, row_h, content)
@@ -379,7 +462,7 @@ def _render_markdown(pdf, text: str):
         if in_list:
             in_list = False
             pdf.ln(1)
-        pdf.set_font("Helvetica", "", 11)
+        pdf.set_font(_font(pdf), "", 11)
         pdf.set_text_color(30, 30, 30)
         _write_inline(pdf, line, row_h)
 
@@ -402,13 +485,13 @@ def create_pdf_document(
         pdf.add_page()
 
         # Title block
-        pdf.set_font("Helvetica", "B", 22)
+        pdf.set_font(_font(pdf), "B", 22)
         pdf.set_text_color(20, 20, 60)
         pdf.multi_cell(0, 10, title, align="L")
         pdf.ln(2)
 
         if author:
-            pdf.set_font("Helvetica", "I", 10)
+            pdf.set_font(_font(pdf), "I", 10)
             pdf.set_text_color(100, 100, 120)
             pdf.cell(0, 6, f"By {author}")
             pdf.ln(2)
@@ -463,13 +546,13 @@ def create_pdf_report(
 
         # ── Cover block ──────────────────────────────────────────────────────
         pdf.ln(10)
-        pdf.set_font("Helvetica", "B", 26)
+        pdf.set_font(_font(pdf), "B", 26)
         pdf.set_text_color(20, 20, 60)
         pdf.multi_cell(0, 12, title, align="L")
         pdf.ln(2)
 
         if author:
-            pdf.set_font("Helvetica", "I", 11)
+            pdf.set_font(_font(pdf), "I", 11)
             pdf.set_text_color(100, 100, 120)
             pdf.cell(0, 7, f"By {author}")
             pdf.ln(2)
@@ -487,7 +570,7 @@ def create_pdf_report(
 
             # Section heading
             if heading:
-                pdf.set_font("Helvetica", "B", 14)
+                pdf.set_font(_font(pdf), "B", 14)
                 pdf.set_text_color(20, 20, 60)
                 pdf.set_fill_color(240, 242, 250)
                 pdf.cell(0, 8, heading, fill=True, ln=True)
@@ -540,12 +623,12 @@ def _render_table(pdf, table_data: list):
         if is_header:
             pdf.set_fill_color(60, 80, 160)
             pdf.set_text_color(255, 255, 255)
-            pdf.set_font("Helvetica", "B", 9)
+            pdf.set_font(_font(pdf), "B", 9)
         else:
             fill = ri % 2 == 0
             pdf.set_fill_color(245, 246, 252) if fill else pdf.set_fill_color(255, 255, 255)
             pdf.set_text_color(30, 30, 30)
-            pdf.set_font("Helvetica", "", 9)
+            pdf.set_font(_font(pdf), "", 9)
 
         # Pad row to n_cols
         padded = list(row) + [""] * (n_cols - len(row))
