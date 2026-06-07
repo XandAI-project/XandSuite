@@ -109,6 +109,27 @@ mcp = FastMCP("xandsuite-latex-pdf")
 # Display is listed first so the alternation prefers $$ over $.
 _MATH_RE = re.compile(r"\$\$[\s\S]+?\$\$|\$[^$\n]+?\$")
 
+# Regex for fixing double-escaped LaTeX commands from LLMs.
+# In valid LaTeX, \\ (linebreak) is never immediately followed by a letter —
+# it is always followed by whitespace, [, *, or end-of-line.  So the pattern
+# \\<letter> in a Python string reliably signals the LLM doubled its
+# backslashes during JSON encoding (e.g. JSON \\\\frac → Python \\frac
+# instead of JSON \\frac → Python \frac).
+_DOUBLE_ESC_RE = re.compile(r"\\\\(?=[a-zA-Z])")
+
+
+def _fix_double_escapes(text: str) -> str:
+    """Collapse \\\\cmd → \\cmd for LaTeX commands that LLMs double-escape.
+
+    Also collapse four consecutive backslashes (double-escaped linebreaks)
+    into two, since ``\\\\\\\\`` in valid LaTeX is essentially never intended.
+    """
+    if "\\\\" not in text:
+        return text
+    result = _DOUBLE_ESC_RE.sub("\\\\", text)
+    result = result.replace("\\\\\\\\", "\\\\")
+    return result
+
 
 # Preferred order when `--latex-engine auto` is used: Tectonic first (single-
 # binary, auto-downloads packages), then the classic TeX Live / MiKTeX engines.
@@ -1079,6 +1100,8 @@ def compile_latex(source: str, filename: str) -> str:
     if not source or not source.strip():
         return json.dumps({"error": "source is required and must not be empty."})
 
+    source = _fix_double_escapes(source)
+
     engine_path, tried, install_err = _resolve_or_install_engine(ENGINE_NAME)
     if engine_path is None:
         return json.dumps(
@@ -1112,7 +1135,7 @@ def create_latex_pdf(
             ensure_ascii=False,
         )
 
-    body_latex = _markdown_to_latex(content or "")
+    body_latex = _markdown_to_latex(_fix_double_escapes(content or ""))
     source = _build_document(title=title or "", author=author or "", body_latex=body_latex)
     result = _run_latex(source, filename, engine_path, TIMEOUT)
     if result.get("status") == "created":
@@ -1153,7 +1176,7 @@ def render_equation(
     # always wrap ourselves. Without this the model pasting `"$x^2$"` yields
     # nested `$$ $x^2$ $$` which LaTeX rejects with "Display math should end
     # with $$".
-    eq_raw = _strip_math_delimiters(equation)
+    eq_raw = _strip_math_delimiters(_fix_double_escapes(equation))
     math_body = (
         f"\\[ {eq_raw} \\]" if display else f"$ {eq_raw} $"
     )
@@ -1209,11 +1232,11 @@ def create_math_document(
         if heading:
             body_parts.append(r"\section{" + _escape_latex(heading) + "}")
         if body_md:
-            body_parts.append(_markdown_to_latex(body_md))
+            body_parts.append(_markdown_to_latex(_fix_double_escapes(body_md)))
 
         if isinstance(equations, list):
             for eq in equations:
-                eq_text = _strip_math_delimiters(str(eq))
+                eq_text = _strip_math_delimiters(_fix_double_escapes(str(eq)))
                 if not eq_text:
                     continue
                 # When the author already handed us a full multi-line math

@@ -319,4 +319,4 @@ def get_rate_change(base: str, target: str, days_ago: int = 7) -> str:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    mcp.run()
+    mcp.run(transport="stdio")
