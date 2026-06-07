@@ -338,6 +338,19 @@ impl SkillsExecutor {
             return engine.chat_stream(messages, config, token_tx).await;
         }
 
+        // Tool calls with complex arguments (multi-section LaTeX documents,
+        // large JSON payloads) need more generation room than a plain text
+        // reply.  Ensure at least 4096 response tokens so tool-call JSON
+        // isn't truncated mid-string.
+        const MIN_TOOL_RESPONSE_TOKENS: u32 = 4096;
+        let config = &{
+            let mut c = config.clone();
+            if c.max_tokens < MIN_TOOL_RESPONSE_TOKENS {
+                c.max_tokens = MIN_TOOL_RESPONSE_TOKENS;
+            }
+            c
+        };
+
         // Pull n_ctx from the live llama-server settings so budget-trimming
         // tracks the actual context window. Fall back to 4096 when the state
         // is unreachable (unit tests, detached executor).
@@ -826,17 +839,33 @@ impl SkillsExecutor {
                     .map(|v| v.join(", "))
                     .unwrap_or_else(|| "(see tool schema)".to_string());
 
-                let corrective = format!(
-                    "Your previous call to `{tool}` had invalid arguments: {err}.\n\
-                     You MUST emit a single valid JSON object that includes EVERY required \
-                     field: {fields}. An empty `{{}}` is never acceptable. \
-                     Call `{tool}` again right now with correctly-filled arguments. \
-                     Do NOT write the content inline as assistant text — it belongs inside the \
-                     tool-call arguments.",
-                    tool = bad_name,
-                    err = err,
-                    fields = required_list,
-                );
+                let is_truncated = err.contains("EOF while parsing")
+                    || err.contains("unexpected end of");
+                let corrective = if is_truncated {
+                    format!(
+                        "Your previous call to `{tool}` was cut off — the JSON arguments \
+                         were truncated before completion ({err}).\n\
+                         SHORTEN your arguments: use fewer sections, shorter body text, and \
+                         fewer equations per section. Keep total argument JSON well under \
+                         3000 characters. Required fields: {fields}. \
+                         Call `{tool}` again NOW with shorter, complete arguments.",
+                        tool = bad_name,
+                        err = err,
+                        fields = required_list,
+                    )
+                } else {
+                    format!(
+                        "Your previous call to `{tool}` had invalid arguments: {err}.\n\
+                         You MUST emit a single valid JSON object that includes EVERY required \
+                         field: {fields}. An empty `{{}}` is never acceptable. \
+                         Call `{tool}` again right now with correctly-filled arguments. \
+                         Do NOT write the content inline as assistant text — it belongs inside the \
+                         tool-call arguments.",
+                        tool = bad_name,
+                        err = err,
+                        fields = required_list,
+                    )
+                };
                 messages.push(("user".to_string(), corrective));
 
                 // Pin the retry to the specific tool so the model can't dodge
