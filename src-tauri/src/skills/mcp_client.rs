@@ -246,17 +246,38 @@ impl McpClient {
                 Ok(resp.result.unwrap_or(Value::Null))
             }
             Transport::Http { client, url, auth } => {
-                let mut builder = client.post(url).json(&req);
+                let mut builder = client.post(url.as_str()).json(&req);
                 if let Some(token) = auth {
                     builder = builder.bearer_auth(token);
                 }
-                let response = builder.send().await?;
+                let response = builder.send().await.map_err(|e| {
+                    anyhow::anyhow!(
+                        "HTTP MCP request to '{}' failed (method '{}'): {}",
+                        url, req.method, e
+                    )
+                })?;
                 if !response.status().is_success() {
-                    bail!("HTTP MCP error: {}", response.status());
+                    let status = response.status();
+                    let body = response
+                        .text()
+                        .await
+                        .unwrap_or_else(|_| "(could not read response body)".into());
+                    let body_preview = if body.len() > 500 {
+                        format!("{}…", &body[..500])
+                    } else {
+                        body
+                    };
+                    bail!(
+                        "HTTP MCP error from '{}' (method '{}'): {} — {}",
+                        url, req.method, status, body_preview
+                    );
                 }
                 let resp: JsonRpcResponse = response.json().await?;
                 if let Some(err) = resp.error {
-                    bail!("MCP error {}: {}", err.code, err.message);
+                    bail!(
+                        "MCP error from '{}' (method '{}'): code {}: {}",
+                        url, req.method, err.code, err.message
+                    );
                 }
                 Ok(resp.result.unwrap_or(Value::Null))
             }

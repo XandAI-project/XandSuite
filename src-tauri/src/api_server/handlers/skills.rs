@@ -56,11 +56,25 @@ pub async fn call_tool_direct(
     Json(body): Json<CallToolBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let conv_id = body.conv_id.unwrap_or_else(|| "direct".to_string());
+    let tool_name = body.tool_name.clone();
     let result = state
         .skills
         .call_tool(&body.tool_name, &conv_id, body.arguments)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| {
+            log::error!(
+                "[skills/tools/call] Tool '{}' failed (conv={}): {}",
+                tool_name, conv_id, e
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({
+                    "error": e.to_string(),
+                    "tool_name": tool_name,
+                })
+                .to_string(),
+            )
+        })?;
     Ok(Json(serde_json::json!({ "result": result })))
 }
 
