@@ -29,6 +29,28 @@ impl FlowExecutor {
         Self { engine, app_handle: Some(app_handle) }
     }
 
+    /// Workspace directory for `CodeExec` flow nodes. Uses the same app data
+    /// directory as the agent runtime (`state.data_dir`, resolved from Tauri's
+    /// `app_data_dir()`) rather than the raw `dirs::data_dir()` root — the
+    /// latter is a different, non-namespaced directory (e.g. plain
+    /// `%APPDATA%`/`~/.local/share`, not the app-specific
+    /// `.../com.xandnet.xandsuite` folder), so flow shell commands were
+    /// previously running in an orphan directory that no other part of the
+    /// app ever reads or cleans up.
+    fn flow_workspace_dir(&self) -> std::path::PathBuf {
+        if let Some(app) = &self.app_handle {
+            use tauri::Manager;
+            if let Some(state) = app.try_state::<crate::state::AppState>() {
+                return state.data_dir.join("flow_workspace");
+            }
+        }
+        // Fallback for contexts without a Tauri AppState (e.g. unit tests).
+        dirs::data_dir()
+            .unwrap_or_default()
+            .join("XandSuite")
+            .join("flow_workspace")
+    }
+
     fn emit_progress(&self, node_id: &str, node_label: &str, step: usize, total: usize, status: &str) {
         if let Some(app) = &self.app_handle {
             let _ = tauri::Emitter::emit(app, "flow_progress", serde_json::json!({
@@ -240,10 +262,7 @@ impl FlowExecutor {
                 let cmd_template = data["command"].as_str().unwrap_or("");
                 let command = render_template(cmd_template, ctx);
                 let timeout = data["timeout_seconds"].as_u64().unwrap_or(30);
-                let workspace = dirs::data_dir()
-                    .unwrap_or_default()
-                    .join("XandSuite")
-                    .join("flow_workspace");
+                let workspace = self.flow_workspace_dir();
                 let tool = crate::agent::tools::CodeExecTool::new(workspace);
                 tool.execute(&command, timeout).await
             }

@@ -68,9 +68,17 @@ def run_python(code: str, timeout: int = _DEFAULT_TIMEOUT) -> str:
             [sys.executable, tmp_path],
             capture_output=True,
             text=True,
+            # Without an explicit encoding, `text=True` decodes the child's
+            # output using the OS locale's preferred encoding — cp1252 (or
+            # similar) on most non-English Windows installs, not UTF-8. Any
+            # non-ASCII stdout/stderr then came back mangled or raised
+            # UnicodeDecodeError. `PYTHONUTF8=1` also makes the child process
+            # itself emit UTF-8, matching the Rust code runner's approach.
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
             cwd=str(_WORKSPACE),
-            env={**os.environ, "PYTHONPATH": ""},
+            env={**os.environ, "PYTHONPATH": "", "PYTHONUTF8": "1"},
         )
         return json.dumps({
             "stdout": result.stdout[:8000],
@@ -107,6 +115,10 @@ def run_shell(command: str, timeout: int = _DEFAULT_TIMEOUT) -> str:
             shell=True,
             capture_output=True,
             text=True,
+            # See run_python above — avoid decoding shell output with the
+            # OS locale's default (non-UTF-8) codepage on Windows.
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
             cwd=str(_WORKSPACE),
         )

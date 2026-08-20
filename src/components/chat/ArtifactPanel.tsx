@@ -1,6 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
@@ -445,7 +444,7 @@ function ArtifactContent({ artifact, iframeRef }: ArtifactContentProps) {
 }
 
 export function ArtifactPanel() {
-  const { artifacts, activeArtifactId, closePanel, openArtifact, updateArtifact, deleteArtifact, dismissArtifact, fetchArtifacts } =
+  const { artifacts, activeArtifactId, closePanel, openArtifact, updateArtifact, deleteArtifact, dismissArtifact, fetchArtifacts, aiEdited } =
     useArtifactStore();
 
   const [copied, setCopied] = useState(false);
@@ -453,7 +452,6 @@ export function ArtifactPanel() {
   const [editTitle, setEditTitle] = useState("");
   const [editContent, setEditContent] = useState("");
   const [exporting, setExporting] = useState(false);
-  const [aiEdited, setAiEdited] = useState(false);
   const [undoing, setUndoing] = useState(false);
 
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
@@ -477,17 +475,6 @@ export function ArtifactPanel() {
     window.addEventListener("message", handleExportMessage);
     return () => window.removeEventListener("message", handleExportMessage);
   }, [handleExportMessage]);
-
-  useEffect(() => {
-    const unlisten = listen("artifact_updated", (event: any) => {
-      if (event.payload?.source === "artifact_editor") {
-        setAiEdited(true);
-        const timer = setTimeout(() => setAiEdited(false), 3000);
-        return () => clearTimeout(timer);
-      }
-    });
-    return () => { unlisten.then((fn) => fn()); };
-  }, []);
 
   const handleUndoAiEdit = async () => {
     if (!active || undoing) return;

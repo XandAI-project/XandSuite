@@ -91,7 +91,8 @@ impl Embedder {
         let s = self.settings.lock().unwrap();
         let url = if s.default_engine_mode == "remote" {
             s.remote_server_url
-                .clone()
+                .as_deref()
+                .map(crate::engine::remote::normalize_server_url)
                 .unwrap_or_else(|| format!("http://127.0.0.1:{}", s.llama_server_port))
         } else {
             format!("http://127.0.0.1:{}", s.llama_server_port)

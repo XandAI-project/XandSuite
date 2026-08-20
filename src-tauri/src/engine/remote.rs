@@ -120,7 +120,15 @@ pub struct StreamWithToolsResult {
 /// - Trims surrounding whitespace.
 /// - Prepends `http://` when no scheme is present (e.g. `192.168.0.2:8080`).
 /// - Strips any trailing slashes so endpoint paths concatenate cleanly.
+/// - Rewrites wildcard bind addresses to loopback (see
+///   [`rewrite_unspecified_host`]).
 pub fn normalize_server_url(raw: &str) -> String {
+    rewrite_unspecified_host(&with_http_scheme(raw))
+}
+
+/// Trim `raw`, give it an `http://` scheme when it has none, and drop trailing
+/// slashes.
+fn with_http_scheme(raw: &str) -> String {
     let trimmed = raw.trim();
     let with_scheme = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
         trimmed.to_string()
@@ -128,6 +136,60 @@ pub fn normalize_server_url(raw: &str) -> String {
         format!("http://{}", trimmed)
     };
     with_scheme.trim_end_matches('/').to_string()
+}
+
+/// Replace an unspecified (wildcard) host with the loopback address.
+///
+/// llama-server prints `http://0.0.0.0:8080` when it binds to every interface,
+/// and users paste that line verbatim into the Server URL field. `0.0.0.0` and
+/// `::` are bind-only addresses: as a connect target they fail outright on
+/// Windows and mean "loopback" only by accident on Linux. Rewriting them keeps
+/// the same behaviour on both platforms.
+fn rewrite_unspecified_host(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let authority_end = rest
+        .find(['/', '?', '#'])
+        .unwrap_or(rest.len());
+    let (authority, path) = rest.split_at(authority_end);
+
+    // Keep any userinfo (`user:pass@`) untouched — only the host is rewritten.
+    let (userinfo, hostport) = match authority.rsplit_once('@') {
+        Some((user, host)) => (format!("{}@", user), host),
+        None => (String::new(), authority),
+    };
+
+    let (host, port) = if let Some(stripped) = hostport.strip_prefix('[') {
+        // IPv6 literal: `[::]:8080`
+        match stripped.split_once(']') {
+            Some((h, tail)) => (format!("[{}]", h), tail.to_string()),
+            None => (hostport.to_string(), String::new()),
+        }
+    } else {
+        match hostport.split_once(':') {
+            Some((h, p)) => (h.to_string(), format!(":{}", p)),
+            None => (hostport.to_string(), String::new()),
+        }
+    };
+
+    let replacement = match host.as_str() {
+        "0.0.0.0" => Some("127.0.0.1"),
+        "[::]" | "[::0]" | "[0:0:0:0:0:0:0:0]" => Some("[::1]"),
+        _ => None,
+    };
+
+    match replacement {
+        Some(loopback) => format!("{}://{}{}{}{}", scheme, userinfo, loopback, port, path),
+        None => url.to_string(),
+    }
+}
+
+/// True when `raw` points at a wildcard bind address, which can only ever reach
+/// a server on the local machine.
+pub fn is_unspecified_host(raw: &str) -> bool {
+    let scheme_only = with_http_scheme(raw);
+    rewrite_unspecified_host(&scheme_only) != scheme_only
 }
 
 #[derive(Clone)]
@@ -161,6 +223,11 @@ impl RemoteEngine {
             model_name: model_name.unwrap_or_else(|| "local-model".to_string()),
             enable_thinking: true,
         }
+    }
+
+    /// The normalized base URL this engine talks to.
+    pub fn server_url(&self) -> &str {
+        &self.server_url
     }
 
     pub fn with_thinking(mut self, enable: bool) -> Self {
@@ -834,13 +901,54 @@ impl RemoteEngine {
         Ok(json)
     }
 
+    /// Probe the server for reachability.
+    ///
+    /// `Ok(true)` means an OpenAI-compatible (or llama.cpp) server answered.
+    /// A 401/403 counts as reachable — the server is there, only the API key is
+    /// wrong — and so does 503, which llama-server returns while a model is
+    /// still loading. `Err` carries the transport failure so the caller can tell
+    /// "wrong URL / server down" apart from "server up but unexpected reply".
     pub async fn test_connection(&self) -> Result<bool> {
-        let url = format!("{}/v1/models", self.server_url.trim_end_matches('/'));
-        let mut req = self.client.get(&url);
-        if let Some(key) = &self.api_key {
-            req = req.bearer_auth(key);
+        let base = self.server_url.trim_end_matches('/');
+        // `/health` and `/props` cover llama-server builds without the OpenAI
+        // model listing, and vLLM/Ollama-style servers behind a proxy.
+        const PROBE_PATHS: [&str; 3] = ["/v1/models", "/health", "/props"];
+
+        let mut last_status: Option<u16> = None;
+        for path in PROBE_PATHS {
+            let mut req = self.client.get(format!("{}{}", base, path));
+            if let Some(key) = &self.api_key {
+                req = req.bearer_auth(key);
+            }
+            match req.send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_success() || matches!(status.as_u16(), 401 | 403 | 503) {
+                        return Ok(true);
+                    }
+                    last_status = Some(status.as_u16());
+                }
+                Err(e) => {
+                    // A transport error on one path fails on all of them, so
+                    // report it immediately instead of probing the rest.
+                    return Err(anyhow::anyhow!(
+                        "Cannot reach {} — {}",
+                        base,
+                        e.without_url()
+                    ));
+                }
+            }
         }
-        Ok(req.send().await?.status().is_success())
+
+        match last_status {
+            Some(code) => Err(anyhow::anyhow!(
+                "{} answered with HTTP {} on /v1/models, /health and /props — \
+                 it does not look like an OpenAI-compatible LLM server",
+                base,
+                code
+            )),
+            None => Ok(false),
+        }
     }
 
     pub async fn list_models(&self) -> Result<Vec<String>> {
@@ -1083,4 +1191,44 @@ fn extract_pinned_tool_name(choice: &JsonValue) -> Option<String> {
         .and_then(|f| f.get("name"))
         .and_then(|n| n.as_str())
         .map(|s| s.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_unspecified_host, normalize_server_url};
+
+    #[test]
+    fn adds_scheme_and_trims() {
+        assert_eq!(normalize_server_url("  192.168.0.2:8080/ "), "http://192.168.0.2:8080");
+        assert_eq!(normalize_server_url("https://api.example.com/"), "https://api.example.com");
+    }
+
+    #[test]
+    fn rewrites_wildcard_hosts_to_loopback() {
+        assert_eq!(normalize_server_url("0.0.0.0:8080"), "http://127.0.0.1:8080");
+        assert_eq!(normalize_server_url("http://0.0.0.0:8080"), "http://127.0.0.1:8080");
+        assert_eq!(normalize_server_url("http://0.0.0.0"), "http://127.0.0.1");
+        assert_eq!(normalize_server_url("http://[::]:8080"), "http://[::1]:8080");
+    }
+
+    #[test]
+    fn keeps_paths_userinfo_and_real_hosts() {
+        assert_eq!(
+            normalize_server_url("http://0.0.0.0:8080/llm"),
+            "http://127.0.0.1:8080/llm"
+        );
+        assert_eq!(
+            normalize_server_url("http://user:pw@0.0.0.0:8080"),
+            "http://user:pw@127.0.0.1:8080"
+        );
+        assert_eq!(normalize_server_url("http://10.0.0.0:8080"), "http://10.0.0.0:8080");
+        assert_eq!(normalize_server_url("http://localhost:8080"), "http://localhost:8080");
+    }
+
+    #[test]
+    fn detects_wildcard_hosts() {
+        assert!(is_unspecified_host("0.0.0.0:8080"));
+        assert!(is_unspecified_host("http://[::]:8080"));
+        assert!(!is_unspecified_host("192.168.0.2:8080"));
+    }
 }

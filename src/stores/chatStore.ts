@@ -38,6 +38,24 @@ interface ChatStore {
   clearError: () => void;
 }
 
+// Module-scoped cleanup for the currently active stream's event listeners.
+// `sendMessage` registers three listeners (`chat_token`, `chat_thinking`,
+// `chat_thinking_clear`) that previously lived only in local closures, so
+// nothing outside that closure could remove them. `stopGeneration` cleared
+// `isStreaming` without unlistening, which let a cancelled stream's handlers
+// keep appending to `streamingContent` and let a new `sendMessage` register a
+// second set of listeners for the same conversation — producing duplicated
+// tokens. Composing all three into one module-level handle lets both the
+// `done` path and `stopGeneration` tear them down from anywhere.
+let activeStreamCleanup: (() => void) | null = null;
+
+// Monotonic counter guarding `openConversation` against out-of-order
+// responses. Navigating quickly between conversations (e.g. sidebar clicks)
+// can fire a second `openConversation` before the first's `get_conversation`
+// invoke resolves; without this, the first response can land after the
+// second and clobber `activeConversation` with the wrong conversation.
+let openConversationRequestSeq = 0;
+
 export const useChatStore = create<ChatStore>((set, get) => ({
   conversations: [],
   activeConversation: null,
@@ -59,9 +77,15 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   },
 
   openConversation: async (id: string) => {
+    const requestId = ++openConversationRequestSeq;
     set({ isLoading: true, error: null });
     try {
       const conv = await invoke<Conversation>("get_conversation", { conversationId: id });
+
+      // Drop this response if a newer openConversation call has since been
+      // made — applying it now would overwrite whatever the user navigated
+      // to with this stale, no-longer-relevant conversation.
+      if (requestId !== openConversationRequestSeq) return;
 
       // If we're in the middle of streaming for this exact conversation, the
       // assistant message exists only in memory (not in DB yet).  Re-append it
@@ -83,6 +107,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         set({ activeConversation: conv, isLoading: false });
       }
     } catch (e) {
+      if (requestId !== openConversationRequestSeq) return;
       set({ error: String(e), isLoading: false });
     }
   },
@@ -135,6 +160,16 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   sendMessage: async (content: string, useRag = false, ragCollectionId?: string, useSkills = false, attachments?: string[]) => {
     const conv = get().activeConversation;
     if (!conv) return;
+    // Guard against concurrent sends (e.g. voice input calling sendMessage
+    // directly, bypassing the UI's disabled={isStreaming}). Without this a
+    // second call registers a second set of chat_token listeners for the
+    // same conversation, and both append tokens to streamingContent.
+    if (get().isStreaming) return;
+    // Defensive: tear down any stream listeners left over from a previous
+    // turn that didn't clean up (e.g. stopGeneration was called but the
+    // backend never sent a final `done` event).
+    activeStreamCleanup?.();
+    activeStreamCleanup = null;
 
     // Count non-system messages before this send so we know if it's the first exchange
     const prevUserMsgCount = conv.messages.filter((m) => m.role === "user").length;
@@ -232,6 +267,19 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     let unlistenThink: (() => void) | undefined;
     let unlistenThinkClear: (() => void) | undefined;
 
+    // Composed teardown for this turn's listeners. Registered into the
+    // module-scoped `activeStreamCleanup` as soon as all three unlisten
+    // functions resolve, so `stopGeneration` (or the next `sendMessage`)
+    // can remove them even though they live in this closure.
+    const cleanupListeners = () => {
+      unlistenToken?.();
+      unlistenThink?.();
+      unlistenThinkClear?.();
+      if (activeStreamCleanup === cleanupListeners) {
+        activeStreamCleanup = null;
+      }
+    };
+
     // Timing / throughput tracking
     let firstTokenAt: number | null = null;
     let tokenCount = 0;
@@ -319,9 +367,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           }
         }
 
-        unlistenToken?.();
-        unlistenThink?.();
-        unlistenThinkClear?.();
+        cleanupListeners();
 
         // Auto-title: rename the conversation on the first exchange.
         if (prevUserMsgCount === 0 && conv.title === "New chat") {
@@ -349,6 +395,11 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         }));
       }
     });
+
+    // All three listeners are attached — publish the composed teardown so
+    // stopGeneration (or a defensive guard in the next sendMessage call) can
+    // remove them from outside this closure.
+    activeStreamCleanup = cleanupListeners;
 
     try {
       const assistantMsgId = await invoke<string>("send_message", {
@@ -385,9 +436,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         streamingConversationId: null,
         error: String(e),
       }));
-      unlistenToken?.();
-      unlistenThink?.();
-      unlistenThinkClear?.();
+      cleanupListeners();
     }
   },
 
@@ -445,10 +494,17 @@ export const useChatStore = create<ChatStore>((set, get) => ({
 
   stopGeneration: async () => {
     await invoke("stop_generation");
+    // Tear down this turn's chat_token/chat_thinking listeners immediately.
+    // Without this, a late token or a late `done` event from the aborted
+    // stream could still append to streamingContent, and — worse — the
+    // listeners would remain attached when the user sends a new message,
+    // causing duplicated tokens from two overlapping listener sets.
+    activeStreamCleanup?.();
+    activeStreamCleanup = null;
     // Immediately unblock the UI — don't wait for the backend [DONE] event.
-    // The backend will still send [DONE] eventually; when it arrives the
-    // done-handler will see no "streaming" message and reload from DB so
-    // any partial content that was persisted shows up correctly.
+    // The backend will still send [DONE] eventually, but the listeners that
+    // would have handled it are already gone; any partial content that was
+    // persisted server-side will show up on the next openConversation/refresh.
     set((s) => ({
       activeConversation: s.activeConversation
         ? {
@@ -462,5 +518,8 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       streamingThinking: "",
       streamingConversationId: null,
     }));
+    // Discard any tool steps collected so far for the aborted turn so they
+    // don't leak into the next message's tool-call display.
+    useSkillsStore.getState().clearToolSteps();
   },
 }));

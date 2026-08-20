@@ -7,6 +7,13 @@ interface DownloadState {
   [key: string]: DownloadProgress;
 }
 
+/** Outcome of a remote-server connection attempt. `error` holds the backend's
+ *  reason (unreachable host, non-LLM endpoint, …) when there is one. */
+export interface ConnectRemoteResult {
+  ok: boolean;
+  error?: string;
+}
+
 interface ModelStore {
   models: HfModel[];
   downloadedModels: { model_id: string; filename: string; path: string; size_bytes: number }[];
@@ -21,7 +28,7 @@ interface ModelStore {
   downloadModel: (modelId: string, filename: string, url: string) => Promise<void>;
   deleteModel: (modelId: string, filename: string) => Promise<void>;
   loadModel: (modelPath: string) => Promise<void>;
-  connectRemote: (url: string, apiKey?: string, modelName?: string) => Promise<boolean>;
+  connectRemote: (url: string, apiKey?: string, modelName?: string) => Promise<ConnectRemoteResult>;
   checkEngineStatus: () => Promise<void>;
   listenToDownloads: () => Promise<() => void>;
 }
@@ -96,16 +103,24 @@ export const useModelStore = create<ModelStore>((set, get) => ({
 
   connectRemote: async (url: string, apiKey?: string, modelName?: string) => {
     try {
-      const success = await invoke<boolean>("connect_remote_server", {
-        serverUrl: url,
-        apiKey: apiKey || null,
-        modelName: modelName || null,
-      });
-      if (success) set({ isEngineLoaded: true });
-      return success;
+      // Tauri returns a bare boolean; the HTTP route returns
+      // { success, reachable, error }.
+      const res = await invoke<boolean | { reachable?: boolean; success?: boolean; error?: string | null }>(
+        "connect_remote_server",
+        {
+          serverUrl: url,
+          apiKey: apiKey || null,
+          modelName: modelName || null,
+        }
+      );
+      const ok = typeof res === "boolean" ? res : Boolean(res?.reachable ?? res?.success);
+      const error = typeof res === "boolean" ? undefined : res?.error ?? undefined;
+      set({ isEngineLoaded: ok, error: error ?? null });
+      return { ok, error };
     } catch (e) {
-      set({ error: String(e) });
-      return false;
+      const error = String(e);
+      set({ error, isEngineLoaded: false });
+      return { ok: false, error };
     }
   },
 

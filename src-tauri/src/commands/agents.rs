@@ -294,10 +294,15 @@ pub async fn list_task_files(task_id: String) -> Result<Vec<serde_json::Value>, 
 #[tauri::command]
 pub async fn read_task_file(task_id: String, filename: String) -> Result<String, String> {
     let path = task_workspace_dir(&task_id).join(&filename);
-    // Guard against path traversal
+    // Guard against path traversal. Canonicalize BOTH sides — on Windows,
+    // `canonicalize()` returns an extended-length `\\?\` path, so comparing
+    // it against the non-canonicalized `workspace` below would make
+    // `starts_with` fail for every legitimate file, not just traversal
+    // attempts. Mirror the working pattern in coding/tools.rs.
     let workspace = task_workspace_dir(&task_id);
     let canonical = path.canonicalize().unwrap_or(path.clone());
-    if !canonical.starts_with(&workspace) {
+    let canonical_workspace = workspace.canonicalize().unwrap_or(workspace.clone());
+    if !canonical.starts_with(&canonical_workspace) {
         return Err("Path traversal not allowed".to_string());
     }
     tokio::fs::read_to_string(&path)

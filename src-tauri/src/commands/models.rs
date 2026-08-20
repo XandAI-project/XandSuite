@@ -205,14 +205,52 @@ pub async fn connect_remote_server(
     model_name: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<bool, String> {
-    let engine = crate::engine::remote::RemoteEngine::new(
-        server_url.clone(), api_key.clone(), model_name.clone(),
-    );
-    let is_alive = engine.test_connection().await.map_err(|e| e.to_string())?;
-    if is_alive {
-        state.engine.connect_remote(server_url, api_key, model_name).await.map_err(|e| e.to_string())?;
+    let (reachable, error) =
+        connect_remote_inner(&state, server_url, api_key, model_name).await;
+    match error {
+        // The probe failed for a concrete reason — surface it to the caller
+        // instead of a bare `false`, which the UI could only report as a
+        // generic "could not reach server".
+        Some(msg) => Err(msg),
+        None => Ok(reachable),
     }
-    Ok(is_alive)
+}
+
+/// Probe a remote OpenAI-compatible server and install it as the active engine
+/// when it answers. Returns `(reachable, error_message)`.
+///
+/// Shared by the Tauri command and the HTTP handler so both apply the same URL
+/// normalization and health check.
+pub async fn connect_remote_inner(
+    state: &AppState,
+    server_url: String,
+    api_key: Option<String>,
+    model_name: Option<String>,
+) -> (bool, Option<String>) {
+    let url = crate::engine::remote::normalize_server_url(&server_url);
+    if crate::engine::remote::is_unspecified_host(&server_url) {
+        log::warn!(
+            "Remote server URL '{}' is a wildcard bind address; connecting to {} instead",
+            server_url.trim(),
+            url
+        );
+    }
+
+    let probe = crate::engine::remote::RemoteEngine::new(
+        url.clone(),
+        api_key.clone(),
+        model_name.clone(),
+    );
+    match probe.test_connection().await {
+        Ok(true) => {
+            if let Err(e) = state.engine.connect_remote(url, api_key, model_name).await {
+                return (false, Some(e.to_string()));
+            }
+            (true, None)
+        }
+        Ok(false) => (false, None),
+        Err(e) => (false, Some(e.to_string())),
+    }
 }
 
 #[tauri::command]

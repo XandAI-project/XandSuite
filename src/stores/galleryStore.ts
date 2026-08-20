@@ -76,11 +76,20 @@ export const useGalleryStore = create<GalleryStore>((set, get) => ({
       const fetched = await invoke<GalleryImage[]>("list_gallery_images", {
         conversationId,
       });
-      set((s) => ({
-        images: mergeImages(s.images, fetched),
-        activeConversationId: conversationId,
-        isInitialized: true,
-      }));
+      set((s) => {
+        // Guard against a cross-conversation race: if the user switched to a
+        // different conversation (or to the "all" scope) while this fetch was
+        // in flight, `activeConversationId` no longer matches the id we
+        // requested. Applying this response anyway would silently repaint the
+        // gallery with the wrong conversation's images and stamp
+        // `activeConversationId` back to the stale id.
+        if (s.activeConversationId !== conversationId) return s;
+        return {
+          images: mergeImages(s.images, fetched),
+          activeConversationId: conversationId,
+          isInitialized: true,
+        };
+      });
     } catch (e) {
       console.error("Failed to fetch gallery images:", e);
     } finally {
@@ -94,7 +103,13 @@ export const useGalleryStore = create<GalleryStore>((set, get) => ({
     _inFlight.add(key);
     try {
       const fetched = await invoke<GalleryImage[]>("list_all_gallery_images");
-      set((s) => ({ images: mergeImages(s.images, fetched), isInitialized: true }));
+      set((s) => {
+        // Same staleness guard as fetchImages: if the scope switched back to
+        // "conversation" while this request was in flight, don't clobber the
+        // per-conversation images that may have loaded in the meantime.
+        if (s.scope !== "all") return s;
+        return { images: mergeImages(s.images, fetched), isInitialized: true };
+      });
     } catch (e) {
       console.error("Failed to fetch all gallery images:", e);
     } finally {

@@ -53,10 +53,14 @@ pub async fn start_local_server(
         s.last_server_model = Some(body.model_path.clone());
         let json = serde_json::to_string(&*s).unwrap_or_default();
         let db = state.db.lock().unwrap();
-        let _ = db.conn.execute(
+        // See the equivalent call in models.rs::load_model — this must not fail
+        // the request (the server already started) but should not be silent.
+        if let Err(e) = db.conn.execute(
             "INSERT OR REPLACE INTO settings (key, value) VALUES ('app_settings', ?1)",
             rusqlite::params![json],
-        );
+        ) {
+            log::error!("[api_server] Failed to persist settings after start_local_server: {}", e);
+        }
     }
 
     Ok(Json(serde_json::json!({ "success": true })))

@@ -57,6 +57,24 @@ impl GraphRagManager {
             );
         }
 
+        // Unlike llama-server/whisper, this binary is manually placed by the
+        // user (downloaded from GitHub releases, not auto-extracted by this
+        // app), so it doesn't go through the download path's chmod step. A
+        // zip/tarball extracted with a tool that doesn't preserve the exec
+        // bit — or a plain file copy — leaves it non-executable on Linux/macOS,
+        // so `spawn()` below fails with a permission-denied error every time.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = std::fs::metadata(&bin) {
+                let mut perms = meta.permissions();
+                if perms.mode() & 0o111 == 0 {
+                    perms.set_mode(0o755);
+                    let _ = std::fs::set_permissions(&bin, perms);
+                }
+            }
+        }
+
         let mut cmd = Command::new(&bin);
         cmd.hide_window();
         let child = cmd

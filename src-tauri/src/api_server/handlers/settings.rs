@@ -18,8 +18,9 @@ pub async fn get_settings(
 
 pub async fn save_settings(
     State(state): State<Arc<AppState>>,
-    Json(new_settings): Json<AppSettings>,
+    Json(mut new_settings): Json<AppSettings>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    crate::commands::settings::normalize_settings(&mut new_settings);
     let json = serde_json::to_string(&new_settings)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 

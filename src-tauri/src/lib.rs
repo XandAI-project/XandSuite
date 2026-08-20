@@ -14,6 +14,7 @@ mod graph_rag;
 mod hf;
 mod jobs;
 mod models;
+mod paths;
 mod process_ext;
 mod rag;
 mod server;
@@ -215,13 +216,7 @@ pub fn run() {
 
             // Initialize SkillsManager
             let workspace_dir = data_dir.join("agent_workspace");
-            let tools_dir = {
-                let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
-                std::path::PathBuf::from(&manifest)
-                    .parent()
-                    .unwrap_or(&std::path::PathBuf::from("."))
-                    .join("tools")
-            };
+            let tools_dir = crate::paths::resolve_tools_dir();
             let skills = Arc::new(SkillsManager::new(tools_dir, workspace_dir.clone()));
 
             // Spawn background task to connect builtin + user MCP servers.

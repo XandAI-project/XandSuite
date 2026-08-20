@@ -395,13 +395,27 @@ impl SkillsExecutor {
         // the end so chat.rs saves them and MessageBubble renders a card.
         let mut generated_pdfs: Vec<GeneratedPdf> = Vec::new();
 
-        // Helper: emit app_log event from the executor
+        // Helper: emit app_log event from the executor. Also forwards to
+        // event_tx so HTTP/SSE (mobile/API) clients see the same executor
+        // diagnostics the desktop Logs tab does — previously this only
+        // called `app.emit`, so the entire tool-call loop's logging
+        // (turn cancellation, tool errors, retries, etc.) was invisible
+        // outside the desktop app.
         let log_event = |level: &str, msg: String| {
+            let ts = chrono::Utc::now().to_rfc3339();
             let _ = app.emit("app_log", json!({
                 "level": level,
                 "message": msg,
-                "ts": chrono::Utc::now().to_rfc3339(),
+                "ts": ts,
             }));
+            use tauri::Manager;
+            if let Some(st) = app.try_state::<crate::state::AppState>() {
+                let _ = st.event_tx.send(crate::api_server::events::ApiEvent::AppLog {
+                    level: level.to_string(),
+                    message: msg,
+                    ts,
+                });
+            }
         };
 
         // When a tool call failed validation on the previous turn, this carries
@@ -1006,6 +1020,20 @@ impl SkillsExecutor {
                     state.tool_active.store(false, Ordering::Relaxed);
                 }
 
+                // ── Check cancellation after potentially long tool call ──
+                // Checked here, before any of the tool's side-effect bookkeeping
+                // below (artifact_updated emit, gallery saves, PDF/media tracking,
+                // chat_tool_result emit). The tool itself already ran and cannot be
+                // undone, but once the user has asked to stop there is no reason to
+                // keep publishing its result downstream.
+                if cancelled.load(Ordering::Relaxed) {
+                    log_event("info", format!(
+                        "[executor] Tool '{}' completed but generation was cancelled — stopping", fn_name
+                    ));
+                    let _ = token_tx.send("[DONE]".to_string()).await;
+                    return Ok(());
+                }
+
                 // ── Emit artifact_updated for artifact_editor mutations ──
                 if fn_name.starts_with(&format!("{}__", ARTIFACT_EDITOR_SERVER_ID))
                     && *fn_name != format!("{}__view", ARTIFACT_EDITOR_SERVER_ID)
@@ -1018,15 +1046,6 @@ impl SkillsExecutor {
                             }));
                         }
                     }
-                }
-
-                // ── Check cancellation after potentially long tool call ──
-                if cancelled.load(Ordering::Relaxed) {
-                    log_event("info", format!(
-                        "[executor] Tool '{}' completed but generation was cancelled — stopping", fn_name
-                    ));
-                    let _ = token_tx.send("[DONE]".to_string()).await;
-                    return Ok(());
                 }
 
                 // ── Auto-save generation results to gallery ─────────────

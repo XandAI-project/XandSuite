@@ -26,15 +26,26 @@ const PKG_SERVER_PREFIX: &str = "pkg__";
 // ── Logging helpers ───────────────────────────────────────────────────────────
 
 /// Emit a structured log entry to the frontend Logs tab via the `app_log` event.
+/// Also forwarded to `event_tx` so HTTP/SSE clients see package install/uninstall
+/// progress and errors, not just the desktop Logs tab.
 fn emit_log(app: &tauri::AppHandle, level: &str, message: &str) {
+    let ts = chrono::Utc::now().to_rfc3339();
     let _ = app.emit(
         "app_log",
         json!({
             "level": level,
             "message": message,
-            "ts": chrono::Utc::now().to_rfc3339(),
+            "ts": ts,
         }),
     );
+    use tauri::Manager;
+    if let Some(st) = app.try_state::<crate::state::AppState>() {
+        let _ = st.event_tx.send(crate::api_server::events::ApiEvent::AppLog {
+            level: level.to_string(),
+            message: message.to_string(),
+            ts,
+        });
+    }
     // Mirror to the native Rust log as well so it appears in the terminal.
     match level {
         "error" => log::error!("{}", message),
@@ -50,7 +61,15 @@ fn emit_log(app: &tauri::AppHandle, level: &str, message: &str) {
 /// the skills panel and the LLM tool context all reflect the change without an
 /// app restart.
 fn emit_skills_updated(app: &tauri::AppHandle) {
-    let _ = app.emit("skills_updated", json!({ "ts": chrono::Utc::now().to_rfc3339() }));
+    let ts = chrono::Utc::now().to_rfc3339();
+    let _ = app.emit("skills_updated", json!({ "ts": ts }));
+    // Forward to HTTP/SSE clients — without this, a mobile/API client's tool
+    // list silently goes stale after any package install/uninstall since it
+    // has no way to know to re-fetch `/skills/tools`.
+    use tauri::Manager;
+    if let Some(st) = app.try_state::<crate::state::AppState>() {
+        let _ = st.event_tx.send(crate::api_server::events::ApiEvent::SkillsUpdated { ts });
+    }
 }
 
 /// Format the full anyhow error chain so no cause is hidden.
@@ -144,34 +163,7 @@ struct StoredCustomPackage {
 
 // ── Path helpers ──────────────────────────────────────────────────────────────
 
-fn resolve_tools_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("XANDSUITE_TOOLS_DIR") {
-        return PathBuf::from(dir);
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        let exe_dir = exe.parent().unwrap_or(&exe);
-
-        // Bundled install: tools/ sits next to the binary
-        let candidate = exe_dir.join("tools");
-        if candidate.exists() {
-            return candidate;
-        }
-
-        // Some Tauri bundles place resources one level up (e.g. macOS .app)
-        if let Some(parent) = exe_dir.parent() {
-            let candidate = parent.join("resources").join("tools");
-            if candidate.exists() {
-                return candidate;
-            }
-        }
-    }
-    // Dev mode: CARGO_MANIFEST_DIR is src-tauri/, tools/ is one level up
-    let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(manifest)
-        .parent()
-        .unwrap_or(&PathBuf::from("."))
-        .join("tools")
-}
+use crate::paths::resolve_tools_dir;
 
 fn packages_dir() -> PathBuf {
     resolve_tools_dir().join("packages")
@@ -233,7 +225,11 @@ fn now_rfc3339() -> String {
 /// On Windows `python` is almost always correct; on Linux/macOS `python` may
 /// not exist (only `python3`), so we probe both and cache the winner for the
 /// lifetime of this process.
-fn resolve_python() -> &'static str {
+///
+/// `pub(crate)` so `skills_init.rs` can reuse it for builtin MCP servers,
+/// which otherwise hardcode `"python"` in `tools/registry.json` and fail to
+/// spawn entirely on Linux distros that only ship `python3`.
+pub(crate) fn resolve_python() -> &'static str {
     use std::sync::OnceLock;
     static PYTHON: OnceLock<&'static str> = OnceLock::new();
     PYTHON.get_or_init(|| {
@@ -561,11 +557,24 @@ async fn install_package_impl(
     installed.retain(|i| i.mcp_server_id != mcp_id);
     installed.push(InstalledPackage {
         package_id: package_id.clone(),
-        mcp_server_id: mcp_id,
+        mcp_server_id: mcp_id.clone(),
         config,
         installed_at: now_rfc3339(),
     });
-    save_installed(&state, &installed)?;
+    if let Err(e) = save_installed(&state, &installed) {
+        // The MCP server is already connected but the install record failed
+        // to persist. Without rolling back, `skills.servers` and the on-disk
+        // `installed.json` would disagree: the tool stays live and callable
+        // but disappears from the Packages UI and survives no restart —
+        // leaving no way to uninstall it short of a manual DB/file edit.
+        state.skills.disconnect_server(&mcp_id).await;
+        let msg = format!(
+            "[packages] Failed to persist install record for '{}', rolled back connection: {}",
+            package_id, e
+        );
+        emit_log(&state.app_handle, "error", &msg);
+        return Err(msg);
+    }
 
     emit_skills_updated(&state.app_handle);
     emit_log(&state.app_handle, "info", &format!("[packages] '{}' installed successfully", package_id));
@@ -806,11 +815,21 @@ async fn install_custom_package_impl(id: String, state: &AppState) -> Result<(),
     installed.retain(|i| i.mcp_server_id != mcp_id);
     installed.push(InstalledPackage {
         package_id: id.clone(),
-        mcp_server_id: mcp_id,
+        mcp_server_id: mcp_id.clone(),
         config: HashMap::new(),
         installed_at: now_rfc3339(),
     });
-    save_installed(&state, &installed)?;
+    if let Err(e) = save_installed(&state, &installed) {
+        // Same rollback as the official-package path: don't leave a
+        // connected MCP server with no install record behind.
+        state.skills.disconnect_server(&mcp_id).await;
+        let msg = format!(
+            "[packages] Failed to persist install record for custom '{}', rolled back connection: {}",
+            id, e
+        );
+        emit_log(&state.app_handle, "error", &msg);
+        return Err(msg);
+    }
 
     emit_skills_updated(&state.app_handle);
     emit_log(&state.app_handle, "info", &format!("[packages] custom '{}' installed successfully", id));

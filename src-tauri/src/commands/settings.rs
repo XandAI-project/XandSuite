@@ -10,13 +10,25 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<AppSettings, String> {
 }
 
 #[tauri::command]
-pub fn save_settings(settings: AppSettings, state: State<'_, AppState>) -> Result<(), String> {
+pub fn save_settings(mut settings: AppSettings, state: State<'_, AppState>) -> Result<(), String> {
+    normalize_settings(&mut settings);
     let json = serde_json::to_string(&settings).map_err(|e| e.to_string())?;
     let db = state.db.lock().unwrap();
     db.set_setting("app_settings", &json).map_err(|e| e.to_string())?;
     drop(db);
     *state.settings.lock().unwrap() = settings;
     Ok(())
+}
+
+/// Clean up user-entered values before they are persisted, so every consumer
+/// (engine, RAG embeddings, startup auto-connect) reads the same canonical form.
+pub fn normalize_settings(settings: &mut AppSettings) {
+    settings.remote_server_url = settings
+        .remote_server_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .map(crate::engine::remote::normalize_server_url);
 }
 
 #[tauri::command]

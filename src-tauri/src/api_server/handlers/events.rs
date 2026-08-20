@@ -40,6 +40,7 @@ pub async fn sse_events(
                             ApiEvent::ChatToolResult { conversation_id, .. } => Some(conversation_id.clone()),
                             ApiEvent::ArtifactUpdated { conversation_id, .. } => Some(conversation_id.clone()),
                             ApiEvent::GalleryUpdated { conversation_id } => Some(conversation_id.clone()),
+                            ApiEvent::ChatThinkingClear { conversation_id } => Some(conversation_id.clone()),
                             _ => None,
                         };
                         if let Some(ecid) = event_conv {

@@ -54,6 +54,19 @@ pub enum ApiEvent {
         running: bool,
         model: Option<String>,
     },
+    /// Emitted whenever the set of connected MCP servers changes (a package
+    /// was installed, uninstalled, or reconfigured), so HTTP/SSE clients can
+    /// re-fetch `/skills/servers` and `/skills/tools` just like the desktop
+    /// skills store does on the Tauri `skills_updated` event.
+    SkillsUpdated {
+        ts: String,
+    },
+    /// Emitted when the backend discards accumulated `chat_thinking` content
+    /// because it was promoted to the visible response body. Mirrors the
+    /// desktop `chat_thinking_clear` Tauri event.
+    ChatThinkingClear {
+        conversation_id: String,
+    },
 }
 
 /// Convert a Tauri event name + JSON payload to an ApiEvent if possible.
@@ -103,6 +116,12 @@ pub fn from_tauri_event(event_name: &str, payload: &Value) -> Option<ApiEvent> {
             task_id: payload["task_id"].as_str().unwrap_or("").to_string(),
             event_type: payload["event_type"].as_str().unwrap_or("").to_string(),
             payload: payload["payload"].clone(),
+        }),
+        "skills_updated" => Some(ApiEvent::SkillsUpdated {
+            ts: payload["ts"].as_str().unwrap_or("").to_string(),
+        }),
+        "chat_thinking_clear" => Some(ApiEvent::ChatThinkingClear {
+            conversation_id: payload["conversation_id"].as_str().unwrap_or("").to_string(),
         }),
         _ => None,
     }

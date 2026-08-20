@@ -21,7 +21,8 @@ Auto-install:
   cached binary instantly. Disable with `--no-auto-install`.
 
 CLI args (set at install time via the connector):
-  --output-dir         Directory where generated PDFs are saved. Default ~/Desktop.
+  --output-dir         Directory where generated PDFs are saved. Defaults to
+                       ~/Desktop or ~/Documents if present, else ~/XandSuite/output.
   --latex-engine       LaTeX engine to use:
                          auto      -> probe tectonic, pdflatex, xelatex, lualatex
                                       on PATH, then the cached download
@@ -47,6 +48,25 @@ import urllib.request
 import zipfile
 from typing import Optional
 
+
+def _default_output_dir() -> str:
+    """Pick a sane, always-writable default output directory.
+
+    ``~/Desktop`` doesn't exist on headless Linux servers, minimal window
+    managers, or many container images, which used to make the very first
+    PDF generation fail with a bare ``FileNotFoundError``. Fall back through
+    common alternatives before creating an app-owned directory that is
+    guaranteed to exist.
+    """
+    home = os.path.expanduser("~")
+    for candidate in (os.path.join(home, "Desktop"), os.path.join(home, "Documents")):
+        if os.path.isdir(candidate):
+            return candidate
+    fallback = os.path.join(home, "XandSuite", "output")
+    os.makedirs(fallback, exist_ok=True)
+    return fallback
+
+
 # ---------------------------------------------------------------------------
 # CLI args — parsed before FastMCP takes over sys.argv
 # ---------------------------------------------------------------------------
@@ -54,7 +74,7 @@ from typing import Optional
 parser = argparse.ArgumentParser(add_help=False)
 parser.add_argument(
     "--output-dir",
-    default=os.path.expanduser("~/Desktop"),
+    default=_default_output_dir(),
     help="Directory for generated PDF output files.",
 )
 parser.add_argument(

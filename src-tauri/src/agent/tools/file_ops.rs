@@ -1,24 +1,48 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub struct FileOpsTool {
     workspace_dir: PathBuf,
+    /// Canonicalized once at construction so every traversal check compares
+    /// against a consistent form (resolves the `\\?\` extended-length prefix
+    /// `canonicalize()` adds on Windows).
+    canonical_workspace: PathBuf,
 }
 
 impl FileOpsTool {
     pub fn new(workspace_dir: PathBuf) -> Self {
-        Self { workspace_dir }
+        let canonical_workspace = workspace_dir
+            .canonicalize()
+            .unwrap_or_else(|_| workspace_dir.clone());
+        Self { workspace_dir, canonical_workspace }
     }
 
     fn safe_path(&self, relative_path: &str) -> Result<PathBuf> {
         let joined = self.workspace_dir.join(relative_path);
-        let canonical = joined
-            .canonicalize()
-            .unwrap_or(joined.clone());
+
+        // `joined` may not exist yet (e.g. write_file into a brand-new
+        // subdirectory), so canonicalize() on it would fail outright. Walk up
+        // to the nearest existing ancestor, canonicalize that, then re-attach
+        // the not-yet-created suffix. Comparing a canonical target against a
+        // canonical workspace root (instead of the raw `workspace_dir`) keeps
+        // this correct on Windows, where only the resolved side would
+        // otherwise carry the `\\?\` prefix and never match.
+        let mut check: &Path = joined.as_path();
+        let canonical_target = loop {
+            if check.exists() {
+                let canon = check.canonicalize().unwrap_or_else(|_| check.to_path_buf());
+                let suffix = joined.strip_prefix(check).unwrap_or(Path::new(""));
+                break canon.join(suffix);
+            }
+            match check.parent() {
+                Some(p) if p != check => check = p,
+                _ => break joined.clone(),
+            }
+        };
 
         // Prevent path traversal outside workspace
-        if !canonical.starts_with(&self.workspace_dir) {
+        if !canonical_target.starts_with(&self.canonical_workspace) {
             anyhow::bail!("Path traversal detected: {}", relative_path);
         }
         Ok(joined)

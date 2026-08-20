@@ -72,11 +72,14 @@ pub async fn add_mcp_server(
     persist_servers_config(&state, Some(cfg.clone()), None).await?;
 
     // Connect
-    state
-        .skills
-        .connect_server(cfg)
-        .await
-        .map_err(|e| e.to_string())?;
+    if let Err(e) = state.skills.connect_server(cfg).await {
+        // Roll back the DB record we just wrote — otherwise the server list
+        // would show a "connected" entry on next launch that immediately
+        // fails to reconnect, with no way to remove it from the UI (removal
+        // itself calls disconnect_server on a server that was never added).
+        let _ = persist_servers_config(&state, None, Some(&request.id)).await;
+        return Err(e.to_string());
+    }
 
     let statuses = state.skills.server_statuses().await;
     let status = statuses

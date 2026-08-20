@@ -570,6 +570,85 @@ pub fn truncate_conversation(
     Ok(())
 }
 
+/// Connect the inference engine when nothing is loaded yet, based on the
+/// configured engine mode.
+///
+/// Remote mode used to rely purely on the startup auto-connect and on the user
+/// pressing Save in Settings. Whenever neither had happened — app launched
+/// before a URL was configured, the health check failed because the LLM server
+/// came up later, or the engine was unloaded — the request died deep in the
+/// pipeline with the unhelpful "No model loaded" inference error. Reconnecting
+/// here turns that into either a working chat or a concrete configuration
+/// message.
+async fn ensure_engine_ready(state: &AppState) -> Result<(), String> {
+    let (mode, remote_url, remote_key, settings) = {
+        let s = state.settings.lock().unwrap();
+        (
+            s.default_engine_mode.clone(),
+            s.remote_server_url.clone(),
+            s.remote_api_key.clone(),
+            s.clone(),
+        )
+    };
+
+    if mode == "remote" {
+        let url = remote_url
+            .map(|u| u.trim().to_string())
+            .filter(|u| !u.is_empty())
+            .ok_or_else(|| {
+                "Remote engine mode is selected but no Server URL is set. \
+                 Open Settings → Remote and enter your LLM server address."
+                    .to_string()
+            })?;
+        let target = crate::engine::remote::normalize_server_url(&url);
+        return connect_engine_if_needed(state, target, remote_key).await;
+    }
+
+    // Local mode: restart the internal server if it was idle-stopped.
+    let is_running = state.server.lock().await.is_running();
+    if !is_running {
+        if let Some(model_path) = settings.last_server_model.clone() {
+            log::info!("Auto-restarting llama-server (was idle-stopped)");
+            let data_dir = state.data_dir.clone();
+            let mut srv = state.server.lock().await;
+            if let Err(e) = srv.start(&model_path, &settings, &data_dir).await {
+                log::error!("Failed to auto-restart llama-server: {}", e);
+            }
+        }
+    }
+
+    if state.server.lock().await.is_running() {
+        let target = format!("http://127.0.0.1:{}", settings.llama_server_port);
+        return connect_engine_if_needed(state, target, None).await;
+    }
+
+    Ok(())
+}
+
+/// Point the engine at `target` unless it already is. Also covers the
+/// engine-mode switch case: after moving between local and remote the engine
+/// could still hold the previous server's URL and silently keep sending
+/// requests there.
+async fn connect_engine_if_needed(
+    state: &AppState,
+    target: String,
+    api_key: Option<String>,
+) -> Result<(), String> {
+    match state.engine.remote_url().await {
+        Some(current) if current == target => return Ok(()),
+        Some(current) => log::info!("Engine target changed ({} → {}); reconnecting", current, target),
+        // An in-process local model is loaded — leave it alone.
+        None if state.engine.is_loaded().await => return Ok(()),
+        None => log::info!("Connecting engine to {}", target),
+    }
+
+    state
+        .engine
+        .connect_remote(target, api_key, None)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Inner implementation — accepts `&AppState` so it can be called from both the
 /// Tauri command (which passes `&*state`) and the HTTP handler (which passes `&*arc`).
 pub async fn send_message_inner(
@@ -1343,30 +1422,8 @@ pub async fn send_message_inner(
         }
     }
 
-    // Auto-restart the internal server if it was idle-stopped
-    {
-        let settings = state.settings.lock().unwrap().clone();
-        if settings.default_engine_mode == "local" {
-            let is_running = state.server.lock().await.is_running();
-            if !is_running {
-                if let Some(ref model_path) = settings.last_server_model {
-                    log::info!("Auto-restarting llama-server (was idle-stopped)");
-                    let port = settings.llama_server_port;
-                    let data_dir = state.data_dir.clone();
-                    let mp = model_path.clone();
-                    {
-                        let mut srv = state.server.lock().await;
-                        if let Err(e) = srv.start(&mp, &settings, &data_dir).await {
-                            log::error!("Failed to auto-restart llama-server: {}", e);
-                        }
-                    }
-                    let _ = state.engine.connect_remote(
-                        format!("http://127.0.0.1:{}", port), None, None
-                    ).await;
-                }
-            }
-        }
-    }
+    // Make sure an engine is actually available before streaming.
+    ensure_engine_ready(state).await?;
 
     // Stream response (async)
     let (token_tx, mut token_rx) = mpsc::channel::<String>(512);
@@ -1396,6 +1453,39 @@ pub async fn send_message_inner(
     let app_clone = app.clone();
     let conv_id_clone = conv_id.clone();
     let cancelled_clone = Arc::clone(&state.generation_cancelled);
+
+    // Reset any leftover cancellation flag from a previous aborted request
+    // BEFORE spawning the generation task. Previously this reset happened
+    // after the spawn below, leaving a window where a `stop_generation` call
+    // that arrived between spawn and reset would be silently wiped — the
+    // recv loop's cancellation check would then see `false` even though the
+    // user had already asked to stop.
+    state.generation_cancelled.store(false, std::sync::atomic::Ordering::Relaxed);
+
+    // Bridges an `app_log` error to both the desktop Tauri event and the
+    // HTTP/SSE event_tx channel. The three call sites below previously only
+    // called `app_clone.emit`, so an inference/executor failure was invisible
+    // to HTTP/mobile API clients even though the desktop UI saw it.
+    let emit_spawn_error_log = {
+        let app_ref = app_clone.clone();
+        move |message: String| {
+            let ts = chrono::Utc::now().to_rfc3339();
+            let _ = app_ref.emit("app_log", serde_json::json!({
+                "level": "error",
+                "message": message,
+                "ts": ts,
+            }));
+            use tauri::Manager;
+            if let Some(st) = app_ref.try_state::<crate::state::AppState>() {
+                let _ = st.event_tx.send(crate::api_server::events::ApiEvent::AppLog {
+                    level: "error".to_string(),
+                    message,
+                    ts,
+                });
+            }
+        }
+    };
+
     tauri::async_runtime::spawn(async move {
         if has_tools {
             // Use the agentic executor (handles tool_calls loop internally)
@@ -1409,7 +1499,7 @@ pub async fn send_message_inner(
             if browser_agent_active || browser_agent_autostart {
                 executor = executor.with_browser_agent(browser_agent_active);
             }
-            if let Some(remote) = engine.get_remote() {
+            if let Some(remote) = engine.get_remote().await {
                 // Keep a clone so we can send an error sentinel if run() fails.
                 // token_tx is consumed by run(), so the clone is the only way
                 // to reach the receiver after a stream error.
@@ -1419,11 +1509,7 @@ pub async fn send_message_inner(
                     .await
                 {
                     log::error!("Skills executor error: {}", e);
-                    let _ = app_clone.emit("app_log", serde_json::json!({
-                        "level": "error",
-                        "message": format!("Skills executor error: {}", e),
-                        "ts": chrono::Utc::now().to_rfc3339(),
-                    }));
+                    emit_spawn_error_log(format!("Skills executor error: {}", e));
                     // Signal the consumer that generation failed so it discards
                     // any partial tokens instead of saving them as a real response.
                     let _ = error_tx.send(format!("[ERROR:{}]", e)).await;
@@ -1433,11 +1519,7 @@ pub async fn send_message_inner(
                 let error_tx = token_tx.clone();
                 if let Err(e) = engine.chat_stream(messages, config, token_tx).await {
                     log::error!("Inference error: {}", e);
-                    let _ = app_clone.emit("app_log", serde_json::json!({
-                        "level": "error",
-                        "message": format!("Inference error: {}", e),
-                        "ts": chrono::Utc::now().to_rfc3339(),
-                    }));
+                    emit_spawn_error_log(format!("Inference error: {}", e));
                     let _ = error_tx.send(format!("[ERROR:{}]", e)).await;
                 }
             }
@@ -1446,18 +1528,11 @@ pub async fn send_message_inner(
             let error_tx = token_tx.clone();
             if let Err(e) = engine.chat_stream(messages, config, token_tx).await {
                 log::error!("Inference error: {}", e);
-                let _ = app_clone.emit("app_log", serde_json::json!({
-                    "level": "error",
-                    "message": format!("Inference error: {}", e),
-                    "ts": chrono::Utc::now().to_rfc3339(),
-                }));
+                emit_spawn_error_log(format!("Inference error: {}", e));
                 let _ = error_tx.send(format!("[ERROR:{}]", e)).await;
             }
         }
     });
-
-    // Reset any leftover cancellation flag from a previous aborted request.
-    state.generation_cancelled.store(false, std::sync::atomic::Ordering::Relaxed);
 
     let thinking_prefix = crate::engine::remote::THINKING_PREFIX;
     let mut full_response = String::new();
@@ -1536,6 +1611,20 @@ pub async fn send_message_inner(
             "token": "",
             "done": true,
         }));
+        // Forward the stream-terminating `done` to HTTP/SSE clients too — without
+        // this, a hard stream error only reaches the desktop UI via the Tauri
+        // event above, and mobile/API clients listening on event_tx never see
+        // the stream end and hang waiting for `done: true`.
+        {
+            use tauri::Manager;
+            if let Some(st) = app.try_state::<crate::state::AppState>() {
+                let _ = st.event_tx.send(crate::api_server::events::ApiEvent::ChatToken {
+                    conversation_id: conv_id.clone(),
+                    token: String::new(),
+                    done: true,
+                });
+            }
+        }
         // Surface a brief error note in the chat so the user knows to retry.
         let err_note = format!(
             "_Generation failed: the LLM server closed the stream unexpectedly. \
@@ -1563,6 +1652,15 @@ pub async fn send_message_inner(
             "token": "",
             "done": true,
         }));
+        // Same HTTP/SSE parity gap as the hard-stream-error path above.
+        use tauri::Manager;
+        if let Some(st) = app.try_state::<crate::state::AppState>() {
+            let _ = st.event_tx.send(crate::api_server::events::ApiEvent::ChatToken {
+                conversation_id: conv_id.clone(),
+                token: String::new(),
+                done: true,
+            });
+        }
     }
 
     // ── Thinking-only response recovery ──────────────────────────────────────
@@ -1599,6 +1697,14 @@ pub async fn send_message_inner(
         let _ = app.emit("chat_thinking_clear", serde_json::json!({
             "conversation_id": conv_id,
         }));
+        {
+            use tauri::Manager;
+            if let Some(st) = app.try_state::<crate::state::AppState>() {
+                let _ = st.event_tx.send(crate::api_server::events::ApiEvent::ChatThinkingClear {
+                    conversation_id: conv_id.clone(),
+                });
+            }
+        }
     }
 
     // Reset idle timer — model is warm, keep it loaded
@@ -1668,7 +1774,10 @@ pub async fn send_message_inner(
     // ── Background memory extraction ─────────────────────────────────────────
     // Spawn a background task to extract key facts from the exchange and ingest
     // them into the internal memory collection.  Does NOT block the response.
-    if conversation_alive && memory_enabled && !full_response.is_empty() {
+    // Skipped on cancellation — extracting "facts" from a truncated response
+    // wastes an extra LLM call and risks ingesting an incomplete/incorrect
+    // fact into long-term memory.
+    if conversation_alive && memory_enabled && !full_response.is_empty() && !was_cancelled {
         let rag_arc = state.rag.clone();
         let embedder_arc = state.embedder.clone();
         let user_msg_clone = content.clone();
@@ -1733,7 +1842,13 @@ pub async fn send_message_inner(
 
     // ── Parse and persist artifacts ───────────────────────────────────────────
     // Done *before* emitting done:true so the frontend re-fetch always sees them.
-    if conversation_alive {
+    // Skipped when the user cancelled generation: `full_response` is a
+    // mid-stream truncation at that point, so any `<artifact>` block it
+    // contains is almost certainly incomplete. Note the assistant message
+    // itself is still persisted above (whether or not it was cancelled) —
+    // that partial-save is intentional so "Stop" leaves visible progress
+    // instead of discarding the reply outright.
+    if conversation_alive && !was_cancelled {
         emit_log("info", format!(
             "[artifacts] Response complete ({} chars, {} thinking chars). Scanning for artifact tags…",
             full_response.len(), full_thinking.len()

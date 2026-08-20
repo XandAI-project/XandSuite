@@ -4,6 +4,7 @@
 use anyhow::Result;
 use std::path::PathBuf;
 
+use crate::paths::resolve_tools_dir;
 use crate::skills::{McpServerConfig, McpTransport, SkillsManager};
 
 pub async fn connect_builtin_servers(
@@ -47,7 +48,20 @@ pub async fn connect_builtin_servers(
                     McpTransport::Http { url, auth: None }
                 }
                 _ => {
-                    let command = entry.get("command").and_then(|v| v.as_str()).unwrap_or("python").to_string();
+                    // registry.json hardcodes "python" for every builtin server.
+                    // On Linux/macOS that binary frequently doesn't exist (only
+                    // `python3` is installed), which silently broke every
+                    // built-in tool (web search, calculator, file ops, code
+                    // runner). Substitute the probed interpreter whenever the
+                    // registry says the plain "python" default; an explicit,
+                    // non-default command (e.g. a future non-Python server)
+                    // is left untouched.
+                    let raw_command = entry.get("command").and_then(|v| v.as_str()).unwrap_or("python");
+                    let command = if raw_command == "python" {
+                        crate::commands::packages::resolve_python().to_string()
+                    } else {
+                        raw_command.to_string()
+                    };
                     let args: Vec<String> = entry
                         .get("args")
                         .and_then(|v| v.as_array())
@@ -79,24 +93,4 @@ pub async fn connect_builtin_servers(
     }
 
     Ok(())
-}
-
-fn resolve_tools_dir() -> PathBuf {
-    // 1. Check env var (set by dev scripts or CI)
-    if let Ok(dir) = std::env::var("XANDSUITE_TOOLS_DIR") {
-        return PathBuf::from(dir);
-    }
-
-    // 2. Next to the binary (production bundle)
-    if let Ok(exe) = std::env::current_exe() {
-        let candidate = exe.parent().unwrap_or(&exe).join("tools");
-        if candidate.exists() {
-            return candidate;
-        }
-    }
-
-    // 3. Cargo workspace root (development)
-    let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
-    let dev = PathBuf::from(manifest).parent().unwrap_or(&PathBuf::from(".")).join("tools");
-    dev
 }

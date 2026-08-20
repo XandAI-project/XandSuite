@@ -20,6 +20,7 @@ import {
   XCircle,
   ListTodo,
 } from "lucide-react";
+import { useShallow } from "zustand/react/shallow";
 import { useCodingStore } from "@/stores/codingStore";
 import type { LiveCodingEvent } from "@/stores/codingStore";
 import type { CodingMode, CodingMessage } from "@/lib/tauri";
@@ -325,6 +326,11 @@ function LiveFeed({ events }: { events: LiveCodingEvent[] }) {
 // ── Main chat panel ───────────────────────────────────────────────────────────
 
 export function CodingChat() {
+  // Select only the fields this component reads (with useShallow). The store
+  // also holds fileTree/openFileContent/terminalOutput/currentPlan etc.,
+  // which update independently (e.g. on every file-explorer action) — a bare
+  // `useCodingStore()` call would re-render this whole chat panel on every
+  // one of those unrelated changes.
   const {
     mode,
     setMode,
@@ -337,7 +343,21 @@ export function CodingChat() {
     clearError,
     activeSession,
     createSession,
-  } = useCodingStore();
+  } = useCodingStore(
+    useShallow((s) => ({
+      mode: s.mode,
+      setMode: s.setMode,
+      messages: s.messages,
+      liveEvents: s.liveEvents,
+      isRunning: s.isRunning,
+      sendMessage: s.sendMessage,
+      cancelRun: s.cancelRun,
+      error: s.error,
+      clearError: s.clearError,
+      activeSession: s.activeSession,
+      createSession: s.createSession,
+    }))
+  );
 
   const [input, setInput] = useState("");
   const scrollRef = useRef<HTMLDivElement>(null);

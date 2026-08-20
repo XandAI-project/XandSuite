@@ -68,11 +68,22 @@ export function BrowserAgentTab() {
   }, [activeConversation?.id, setConversationId]);
 
   useEffect(() => {
+    let cancelled = false;
     let detach: (() => void) | undefined;
     (async () => {
-      detach = await attachListeners();
+      const fn = await attachListeners();
+      if (cancelled) {
+        // The effect was cleaned up before attachListeners() resolved (e.g.
+        // fast tab switch/unmount). `detach` was never assigned in time for
+        // the cleanup below to call it, so the six listeners it registers
+        // would otherwise leak for the lifetime of the app. Detach immediately.
+        fn();
+      } else {
+        detach = fn;
+      }
     })();
     return () => {
+      cancelled = true;
       if (detach) detach();
     };
   }, [attachListeners]);

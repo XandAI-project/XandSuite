@@ -88,18 +88,29 @@ pub async fn load_model(
     s.last_server_model = Some(body.model_path.clone());
     let json = serde_json::to_string(&*s).unwrap_or_default();
     let db = state.db.lock().unwrap();
-    let _ = db.conn.execute(
+    // The model is already loaded at this point, so a persist failure here
+    // must not fail the request — but it must not be silent either, since it
+    // means `last_server_model` will drift from disk and the wrong model (or
+    // none) will be reloaded on next launch.
+    if let Err(e) = db.conn.execute(
         "INSERT OR REPLACE INTO settings (key, value) VALUES ('app_settings', ?1)",
         rusqlite::params![json],
-    );
+    ) {
+        log::error!("[api_server] Failed to persist settings after load_model: {}", e);
+    }
 
     Ok(Json(serde_json::json!({ "success": true })))
 }
 
+/// Aliases accept the camelCase field names the web-mode transport sends
+/// (`serverUrl`, `apiKey`, `modelName`) as well as the snake_case ones.
 #[derive(Deserialize)]
 pub struct ConnectRemoteBody {
+    #[serde(alias = "serverUrl", alias = "server_url")]
     pub url: String,
+    #[serde(default, alias = "apiKey")]
     pub api_key: Option<String>,
+    #[serde(default, alias = "modelName", alias = "model_name")]
     pub model_id: Option<String>,
 }
 
@@ -107,18 +118,24 @@ pub async fn connect_remote_server(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ConnectRemoteBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    state
-        .engine
-        .connect_remote(body.url, body.api_key, body.model_id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(Json(serde_json::json!({ "success": true })))
+    let (reachable, error) = crate::commands::models::connect_remote_inner(
+        &state,
+        body.url,
+        body.api_key,
+        body.model_id,
+    )
+    .await;
+    Ok(Json(serde_json::json!({
+        "success": reachable,
+        "reachable": reachable,
+        "error": error,
+    })))
 }
 
 pub async fn is_engine_loaded(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let loaded = state.engine.get_remote().is_some();
+    let loaded = state.engine.is_loaded().await;
     Ok(Json(serde_json::json!({ "loaded": loaded })))
 }
 

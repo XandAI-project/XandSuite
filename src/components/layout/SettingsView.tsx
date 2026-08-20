@@ -15,6 +15,7 @@ import { useServerStore } from "@/stores/serverStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { useModelStore } from "@/stores/modelStore";
 import { cn } from "@/lib/utils";
+import { isWildcardHost, normalizeServerUrl } from "@/lib/serverUrl";
 import type { AppSettings } from "@/lib/tauri";
 
 export function SettingsView() {
@@ -103,11 +104,17 @@ export function SettingsView() {
       if (settings.default_engine_mode === "remote") {
         const url = settings.remote_server_url?.trim();
         if (url) {
-          const ok = await connectRemote(url, settings.remote_api_key ?? undefined);
+          const target = normalizeServerUrl(url);
+          const { ok, error } = await connectRemote(url, settings.remote_api_key ?? undefined);
           setRemoteStatus(
             ok
-              ? { ok: true, msg: `Connected to remote server at ${url}` }
-              : { ok: false, msg: `Could not reach remote server at ${url}. Check the URL and that the server is running.` }
+              ? { ok: true, msg: `Connected to remote server at ${target}` }
+              : {
+                  ok: false,
+                  msg:
+                    error ??
+                    `Could not reach remote server at ${target}. Check the URL and that the server is running.`,
+                }
           );
         } else {
           setRemoteStatus({ ok: false, msg: "Remote mode is selected but no Server URL is set (Remote tab)." });
@@ -588,6 +595,16 @@ export function SettingsView() {
                 value={settings.remote_server_url || ""}
                 onChange={(e) => update("remote_server_url", e.target.value || null)}
               />
+              {isWildcardHost(settings.remote_server_url || "") && (
+                <p className="text-xs text-amber-400 mt-1.5">
+                  {settings.remote_server_url?.includes("[")
+                    ? "[::] is a bind address"
+                    : "0.0.0.0 is a bind address"}
+                  , not a destination — it is the address the LLM server listens on.
+                  XandSuite will connect to {normalizeServerUrl(settings.remote_server_url || "")} instead.
+                  If the server runs on another machine, enter that machine's IP (e.g. http://192.168.0.2:8080).
+                </p>
+              )}
             </Field>
             <Field label="API Key">
               <Input

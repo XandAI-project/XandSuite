@@ -349,14 +349,34 @@ fn extract_targz(data: &[u8], dest_dir: &Path) -> Result<()> {
     for entry in archive.entries().context("Failed to read tar archive")? {
         let mut entry = entry?;
         let raw_path = entry.path()?.to_string_lossy().to_string();
-        let relative = strip_top_dir(&raw_path);
+        let relative = strip_top_dir(&raw_path).to_string();
         if relative.is_empty() {
             continue;
         }
-        let out_path = dest_dir.join(relative);
+        let out_path = dest_dir.join(&relative);
         if let Some(parent) = out_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+
+        // Symlink entries (whisper.cpp's shared-library archives ship
+        // versioned .so symlinks, e.g. libwhisper.so -> libwhisper.so.1) carry
+        // zero data bytes. `entry.unpack()` was writing these as empty/garbage
+        // regular files instead of real symlinks, so the dynamic linker could
+        // never resolve `libwhisper.so` to the versioned library at runtime.
+        // Mirror the working logic in server/downloader.rs::extract_targz.
+        #[cfg(unix)]
+        if entry.header().entry_type() == tar::EntryType::Symlink {
+            if let Ok(Some(link_target)) = entry.link_name() {
+                if out_path.symlink_metadata().is_ok() {
+                    let _ = std::fs::remove_file(&out_path);
+                }
+                std::os::unix::fs::symlink(&link_target, &out_path).with_context(|| {
+                    format!("Failed to create symlink {:?} -> {:?}", out_path, link_target)
+                })?;
+                continue;
+            }
+        }
+
         entry.unpack(&out_path)?;
     }
 

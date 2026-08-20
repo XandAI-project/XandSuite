@@ -121,6 +121,7 @@ export function ChatView() {
   const panelOpen      = useArtifactStore((s) => s.panelOpen);
   const fetchArtifacts = useArtifactStore((s) => s.fetchArtifacts);
   const clearArtifacts = useArtifactStore((s) => s.clearArtifacts);
+  const flashAiEdited  = useArtifactStore((s) => s.flashAiEdited);
 
   // galleryStore
   const galleryOpen          = useGalleryStore((s) => s.galleryOpen);
@@ -235,17 +236,36 @@ export function ChatView() {
   // Re-fetch artifacts immediately whenever one is updated in-place
   // (i.e. the user asked to edit an existing artifact).
   useEffect(() => {
+    let cancelled = false;
     let unlisten: (() => void) | undefined;
-    listen<{ conversation_id: string }>("artifact_updated", (event) => {
+    // Single app-wide listener for "artifact_updated" — it used to be
+    // registered here AND in ArtifactPanel, which is mounted as a child of
+    // this component. Two IPC listeners for the same event meant every
+    // artifact_editor mutation and every LLM-authored artifact both fired
+    // twice. This one handles both payload shapes: `{conversation_id,
+    // artifact_id}` from a full artifact re-parse (chat.rs) triggers a
+    // refetch, and `{source: "artifact_editor"}` from an in-place tool edit
+    // (executor.rs) flashes the "AI edited" badge via the artifact store.
+    listen<{ conversation_id?: string; source?: string }>("artifact_updated", (event) => {
       if (
+        event.payload.conversation_id &&
         activeConversation?.id &&
         event.payload.conversation_id === activeConversation.id
       ) {
         fetchArtifacts(activeConversation.id);
       }
-    }).then((fn) => { unlisten = fn; });
-    return () => { unlisten?.(); };
-  }, [activeConversation?.id]);
+      if (event.payload.source === "artifact_editor") {
+        flashAiEdited();
+      }
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [activeConversation?.id, fetchArtifacts, flashAiEdited]);
 
   // Re-fetch gallery whenever a new image is saved (e.g. from ComfyUI generation).
   // Debounced so rapid back-to-back events only trigger one fetch.

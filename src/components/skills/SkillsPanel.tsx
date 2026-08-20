@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { RefreshCw, Wrench, Server, ChevronDown, ChevronRight, Play, Loader2, AlertCircle } from "lucide-react";
+import { useShallow } from "zustand/react/shallow";
 import { useSkillsStore } from "@/stores/skillsStore";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -8,8 +9,23 @@ import { invoke } from "@/lib/tauri";
 import { McpServerManager } from "./McpServerManager";
 
 export function SkillsPanel() {
+  // Selecting just these fields (with useShallow) avoids re-rendering the
+  // whole servers/tools panel on every `activeToolSteps` update — the same
+  // whole-store subscription problem fixed in InputBar.
   const { servers, tools, isLoading, error, fetchServers, fetchTools, removeMcpServer, reloadBuiltins, clearError } =
-    useSkillsStore();
+    useSkillsStore(
+      useShallow((s) => ({
+        servers: s.servers,
+        tools: s.tools,
+        isLoading: s.isLoading,
+        error: s.error,
+        fetchServers: s.fetchServers,
+        fetchTools: s.fetchTools,
+        removeMcpServer: s.removeMcpServer,
+        reloadBuiltins: s.reloadBuiltins,
+        clearError: s.clearError,
+      }))
+    );
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [showAddDialog, setShowAddDialog] = useState(false);
   const [testResult, setTestResult] = useState<Record<string, string>>({});

@@ -23,6 +23,7 @@ import {
 import { useNavigate } from "react-router-dom";
 import { readFile } from "@tauri-apps/plugin-fs";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { useShallow } from "zustand/react/shallow";
 import { useChatStore } from "@/stores/chatStore";
 import { useSkillsStore } from "@/stores/skillsStore";
 import { useServerStore } from "@/stores/serverStore";
@@ -105,15 +106,42 @@ export function InputBar({ collections, disabled }: Props) {
   const sendMessage = useChatStore((s) => s.sendMessage);
   const stopGeneration = useChatStore((s) => s.stopGeneration);
   const isStreaming = useChatStore((s) => s.isStreaming);
-  const { tools, skillsEnabled, toggleSkills, clearToolSteps } = useSkillsStore();
-  const { templates, fetchTemplates, incrementUse } = useTemplateStore();
+  // Selecting only the fields InputBar actually renders (with useShallow so
+  // the returned object is stable across renders where those fields didn't
+  // change) instead of subscribing to the whole store. `useSkillsStore()`
+  // previously re-rendered InputBar on every `activeToolSteps` update — i.e.
+  // on every streamed tool-call chunk — even though InputBar never reads
+  // that field.
+  const { tools, skillsEnabled, toggleSkills, clearToolSteps } = useSkillsStore(
+    useShallow((s) => ({
+      tools: s.tools,
+      skillsEnabled: s.skillsEnabled,
+      toggleSkills: s.toggleSkills,
+      clearToolSteps: s.clearToolSteps,
+    }))
+  );
+  const { templates, fetchTemplates, incrementUse } = useTemplateStore(
+    useShallow((s) => ({
+      templates: s.templates,
+      fetchTemplates: s.fetchTemplates,
+      incrementUse: s.incrementUse,
+    }))
+  );
   const navigate = useNavigate();
 
   // Server / model state
-  const { status, isStarting, engineMode, lastModel, startServer } = useServerStore();
+  const { status, isStarting, engineMode, lastModel, startServer } = useServerStore(
+    useShallow((s) => ({
+      status: s.status,
+      isStarting: s.isStarting,
+      engineMode: s.engineMode,
+      lastModel: s.lastModel,
+      startServer: s.startServer,
+    }))
+  );
 
   // Voice input (Whisper) + TTS
-  const { settings } = useSettingsStore();
+  const { settings } = useSettingsStore(useShallow((s) => ({ settings: s.settings })));
   const whisperEnabled = settings?.whisper_enabled ?? false;
   const ttsEnabled = settings?.tts_enabled ?? false;
   const [micError, setMicError] = useState<string | null>(null);

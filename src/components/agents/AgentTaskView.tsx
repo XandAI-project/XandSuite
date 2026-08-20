@@ -4,6 +4,7 @@ import {
   CheckCircle, XCircle, Loader2, Trash2, StopCircle, Zap, AlertCircle,
   FolderOpen, Download, FileText,
 } from "lucide-react";
+import { useShallow } from "zustand/react/shallow";
 import { useAgentStore } from "@/stores/agentStore";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
@@ -47,6 +48,10 @@ const EXAMPLE_TASKS = [
 ];
 
 export function AgentTaskView() {
+  // Selecting the exact fields used here (with useShallow) instead of the
+  // whole store — a plain `useAgentStore()` call re-renders on every `set()`
+  // in the store, including fields this component never reads (e.g. from
+  // `isRunning`/`clearError` callers elsewhere).
   const {
     tasks,
     activeTask,
@@ -59,7 +64,21 @@ export function AgentTaskView() {
     setActiveTask,
     listenToEvents,
     error,
-  } = useAgentStore();
+  } = useAgentStore(
+    useShallow((s) => ({
+      tasks: s.tasks,
+      activeTask: s.activeTask,
+      runningTaskIds: s.runningTaskIds,
+      liveEventsByTask: s.liveEventsByTask,
+      fetchTasks: s.fetchTasks,
+      runTask: s.runTask,
+      deleteTask: s.deleteTask,
+      cancelTask: s.cancelTask,
+      setActiveTask: s.setActiveTask,
+      listenToEvents: s.listenToEvents,
+      error: s.error,
+    }))
+  );
 
   const [taskDescription, setTaskDescription] = useState("");
   const eventsEndRef = useRef<HTMLDivElement>(null);

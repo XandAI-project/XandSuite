@@ -15,6 +15,9 @@ interface ArtifactStore {
   artifacts: Artifact[];
   activeArtifactId: string | null;
   panelOpen: boolean;
+  /** True for ~3s right after an `artifact_editor` tool call mutates the
+   *  active artifact, so ArtifactPanel can flash an "AI edited" badge. */
+  aiEdited: boolean;
 
   fetchArtifacts: (conversationId: string) => Promise<void>;
   fetchAllArtifacts: () => Promise<Artifact[]>;
@@ -26,12 +29,19 @@ interface ArtifactStore {
   dismissArtifact: (id: string) => void;
   closePanel: () => void;
   clearArtifacts: () => void;
+  /** Briefly set `aiEdited`, auto-clearing after 3s. */
+  flashAiEdited: () => void;
 }
+
+// Module-scoped so a rapid run of artifact_editor calls resets the same
+// timer instead of racing multiple independent setTimeout callbacks.
+let aiEditedTimer: ReturnType<typeof setTimeout> | null = null;
 
 export const useArtifactStore = create<ArtifactStore>((set) => ({
   artifacts: [],
   activeArtifactId: null,
   panelOpen: false,
+  aiEdited: false,
 
   fetchArtifacts: async (conversationId: string) => {
     try {
@@ -113,5 +123,14 @@ export const useArtifactStore = create<ArtifactStore>((set) => ({
     // panel while the list is empty, and it reappears automatically once the
     // new conversation's artifacts are loaded.
     set({ artifacts: [], activeArtifactId: null });
+  },
+
+  flashAiEdited: () => {
+    if (aiEditedTimer) clearTimeout(aiEditedTimer);
+    set({ aiEdited: true });
+    aiEditedTimer = setTimeout(() => {
+      aiEditedTimer = null;
+      set({ aiEdited: false });
+    }, 3000);
   },
 }));
