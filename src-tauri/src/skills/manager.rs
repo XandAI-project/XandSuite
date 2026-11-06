@@ -60,6 +60,10 @@ pub struct SkillsManager {
     workspace_dir: PathBuf,
     /// server_id → connected session
     servers: RwLock<HashMap<String, ConnectedServer>>,
+    /// IDs the user switched off (persisted by the caller). Disabled servers
+    /// are never started; their config is parked so the UI can still list them.
+    disabled: std::sync::RwLock<std::collections::HashSet<String>>,
+    parked: RwLock<HashMap<String, McpServerConfig>>,
 }
 
 impl SkillsManager {
@@ -68,7 +72,45 @@ impl SkillsManager {
             tools_dir,
             workspace_dir,
             servers: RwLock::new(HashMap::new()),
+            disabled: std::sync::RwLock::new(std::collections::HashSet::new()),
+            parked: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Replace the set of user-disabled server IDs (called once at startup).
+    pub fn set_disabled_ids(&self, ids: impl IntoIterator<Item = String>) {
+        *self.disabled.write().unwrap() = ids.into_iter().collect();
+    }
+
+    pub fn disabled_ids(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.disabled.read().unwrap().iter().cloned().collect();
+        v.sort();
+        v
+    }
+
+    /// Switch a server on or off at runtime. Disabling stops the process and
+    /// parks the config; enabling reconnects it. The caller persists
+    /// `disabled_ids()`.
+    pub async fn set_server_enabled(&self, server_id: &str, enabled: bool) -> Result<()> {
+        if enabled {
+            self.disabled.write().unwrap().remove(server_id);
+            let cfg = self.parked.write().await.remove(server_id);
+            if let Some(cfg) = cfg {
+                if let Err(e) = self.connect_server(cfg.clone()).await {
+                    // Keep it parked and disabled so the config isn't lost.
+                    self.disabled.write().unwrap().insert(server_id.to_string());
+                    self.parked.write().await.insert(server_id.to_string(), cfg);
+                    return Err(e);
+                }
+            }
+        } else {
+            self.disabled.write().unwrap().insert(server_id.to_string());
+            let removed = self.servers.write().await.remove(server_id);
+            if let Some(srv) = removed {
+                self.parked.write().await.insert(server_id.to_string(), srv.config);
+            }
+        }
+        Ok(())
     }
 
     // ── Tool-dir template expansion ────────────────────────────────────────
@@ -84,6 +126,10 @@ impl SkillsManager {
 
     pub async fn connect_server(&self, cfg: McpServerConfig) -> Result<()> {
         if !cfg.enabled {
+            return Ok(());
+        }
+        if self.disabled.read().unwrap().contains(&cfg.id) {
+            self.parked.write().await.insert(cfg.id.clone(), cfg);
             return Ok(());
         }
         let workspace_env = vec![(
@@ -133,6 +179,8 @@ impl SkillsManager {
     pub async fn disconnect_server(&self, server_id: &str) {
         let mut guard = self.servers.write().await;
         guard.remove(server_id);
+        self.parked.write().await.remove(server_id);
+        self.disabled.write().unwrap().remove(server_id);
     }
 
     // ── Tool discovery ─────────────────────────────────────────────────────
@@ -155,14 +203,25 @@ impl SkillsManager {
     /// Connected server configurations with connection status.
     pub async fn server_statuses(&self) -> Vec<ServerStatus> {
         let guard = self.servers.read().await;
-        guard
+        let parked = self.parked.read().await;
+        let mut out: Vec<ServerStatus> = guard
             .values()
             .map(|s| ServerStatus {
                 config: s.config.clone(),
                 connected: true,
                 tool_count: s.tools.len(),
             })
-            .collect()
+            .collect();
+        out.extend(parked.values().map(|c| ServerStatus {
+            config: c.clone(),
+            connected: false,
+            tool_count: 0,
+        }));
+        // HashMap iteration order is arbitrary and changes whenever a server
+        // moves between connected and parked, which made rows jump around in
+        // the UI. Keep a stable order.
+        out.sort_by(|a, b| a.config.id.cmp(&b.config.id));
+        out
     }
 
     // ── Tool execution ─────────────────────────────────────────────────────
