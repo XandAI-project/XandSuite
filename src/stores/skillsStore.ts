@@ -45,6 +45,8 @@ interface SkillsStore {
   fetchTools: () => Promise<void>;
   addMcpServer: (req: AddServerRequest) => Promise<void>;
   removeMcpServer: (serverId: string) => Promise<void>;
+  /** Switch a tool server / package on or off without uninstalling it. */
+  setServerEnabled: (serverId: string, enabled: boolean) => Promise<void>;
   reloadBuiltins: () => Promise<void>;
   toggleSkills: () => void;
   /** Snapshot activeToolSteps into completedToolSteps (called when streaming ends). */
@@ -204,6 +206,17 @@ export const useSkillsStore = create<SkillsStore>((set, get) => {
         await get().fetchTools();
       } catch (e) {
         set({ error: String(e) });
+      }
+    },
+
+    setServerEnabled: async (serverId: string, enabled: boolean) => {
+      try {
+        await invoke("set_server_enabled", { serverId, enabled });
+        await get().fetchServers();
+        await get().fetchTools();
+      } catch (e) {
+        set({ error: String(e) });
+        await get().fetchServers();
       }
     },
 

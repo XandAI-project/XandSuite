@@ -218,6 +218,17 @@ pub fn run() {
             let workspace_dir = data_dir.join("agent_workspace");
             let tools_dir = crate::paths::resolve_tools_dir();
             let skills = Arc::new(SkillsManager::new(tools_dir, workspace_dir.clone()));
+            // Restore which tool servers / packages the user switched off.
+            {
+                let db_guard = db.lock().unwrap();
+                let ids: Vec<String> = db_guard
+                    .get_setting("disabled_servers")
+                    .ok()
+                    .flatten()
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default();
+                skills.set_disabled_ids(ids);
+            }
 
             // Spawn background task to connect builtin + user MCP servers.
             // Extract user server configs synchronously (no Send issues) before spawning.
@@ -446,6 +457,7 @@ pub fn run() {
             commands::skills::list_skill_servers,
             commands::skills::add_mcp_server,
             commands::skills::remove_mcp_server,
+            commands::skills::set_server_enabled,
             commands::skills::reload_builtin_servers,
             commands::skills::call_tool_direct,
             commands::artifacts::save_artifact,

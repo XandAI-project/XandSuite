@@ -68,6 +68,15 @@ pub async fn add_mcp_server(
         icon: request.icon.unwrap_or_else(|| "Plug".to_string()),
     };
 
+    // A newly added skill always starts switched on.
+    let _ = state.skills.set_server_enabled(&cfg.id, true).await;
+    {
+        if let Ok(json) = serde_json::to_string(&state.skills.disabled_ids()) {
+            let db = state.db.lock().unwrap();
+            let _ = db.set_setting("disabled_servers", &json);
+        }
+    }
+
     // Persist to DB
     persist_servers_config(&state, Some(cfg.clone()), None).await?;
 
@@ -100,6 +109,29 @@ pub async fn remove_mcp_server(
     state.skills.disconnect_server(&server_id).await;
     persist_servers_config(&state, None, Some(&server_id)).await?;
     Ok(())
+}
+
+// ── set_server_enabled ────────────────────────────────────────────────────
+
+/// Switch a tool server / package on or off without uninstalling it.
+/// The choice is persisted and survives restarts.
+#[tauri::command]
+pub async fn set_server_enabled(
+    server_id: String,
+    enabled: bool,
+    state: State<'_, AppState>,
+) -> Result<Vec<ServerStatus>, String> {
+    state
+        .skills
+        .set_server_enabled(&server_id, enabled)
+        .await
+        .map_err(|e| e.to_string())?;
+    {
+        let json = serde_json::to_string(&state.skills.disabled_ids()).map_err(|e| e.to_string())?;
+        let db = state.db.lock().unwrap();
+        db.set_setting("disabled_servers", &json).map_err(|e| e.to_string())?;
+    }
+    Ok(state.skills.server_statuses().await)
 }
 
 // ── reload_builtin_servers ────────────────────────────────────────────────

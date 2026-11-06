@@ -12,7 +12,7 @@ export function SkillsPanel() {
   // Selecting just these fields (with useShallow) avoids re-rendering the
   // whole servers/tools panel on every `activeToolSteps` update — the same
   // whole-store subscription problem fixed in InputBar.
-  const { servers, tools, isLoading, error, fetchServers, fetchTools, removeMcpServer, reloadBuiltins, clearError } =
+  const { servers, tools, isLoading, error, fetchServers, fetchTools, removeMcpServer, setServerEnabled, reloadBuiltins, clearError } =
     useSkillsStore(
       useShallow((s) => ({
         servers: s.servers,
@@ -22,6 +22,7 @@ export function SkillsPanel() {
         fetchServers: s.fetchServers,
         fetchTools: s.fetchTools,
         removeMcpServer: s.removeMcpServer,
+        setServerEnabled: s.setServerEnabled,
         reloadBuiltins: s.reloadBuiltins,
         clearError: s.clearError,
       }))
@@ -124,22 +125,39 @@ export function SkillsPanel() {
                 >
                   <div className={cn(
                     "w-2 h-2 rounded-full shrink-0",
-                    srv.connected ? "bg-emerald-400" : "bg-red-400"
+                    srv.connected ? "bg-emerald-400" : "bg-muted-foreground/40"
                   )} />
                   <Server className="w-3.5 h-3.5 text-muted-foreground shrink-0" />
                   <div className="flex-1 min-w-0">
                     <div className="text-xs font-semibold truncate">{srv.config.name}</div>
                     <div className="text-[10px] text-muted-foreground truncate">{srv.config.description}</div>
                   </div>
-                  <span className="text-[10px] text-muted-foreground shrink-0">{serverTools.length} tool{serverTools.length !== 1 ? "s" : ""}</span>
-                  {srv.config.builtin ? null : (
-                    <button
-                      onClick={(e) => { e.stopPropagation(); removeMcpServer(srv.config.id); }}
-                      className="text-[10px] text-destructive opacity-70 hover:opacity-100 px-1 shrink-0"
-                    >
-                      Remove
-                    </button>
-                  )}
+                  <span className="text-[10px] text-muted-foreground shrink-0 w-14 text-right">{serverTools.length} tool{serverTools.length !== 1 ? "s" : ""}</span>
+                  <span
+                    role="switch"
+                    aria-checked={srv.connected}
+                    title={srv.connected ? "On: click to switch off" : "Off: click to switch on"}
+                    onClick={(e) => { e.stopPropagation(); void setServerEnabled(srv.config.id, !srv.connected); }}
+                    className={cn(
+                      "relative inline-flex h-4 w-7 shrink-0 cursor-pointer items-center rounded-full transition-colors",
+                      srv.connected ? "bg-emerald-500" : "bg-muted-foreground/30"
+                    )}
+                  >
+                    <span className={cn(
+                      "inline-block h-3 w-3 rounded-full bg-white transition-transform",
+                      srv.connected ? "translate-x-3.5" : "translate-x-0.5"
+                    )} />
+                  </span>
+                  <span className="w-14 shrink-0 text-center">
+                    {srv.config.builtin ? null : (
+                      <button
+                        onClick={(e) => { e.stopPropagation(); removeMcpServer(srv.config.id); }}
+                        className="text-[10px] text-destructive opacity-70 hover:opacity-100 px-1"
+                      >
+                        Remove
+                      </button>
+                    )}
+                  </span>
                   {isOpen ? <ChevronDown className="w-3 h-3 shrink-0" /> : <ChevronRight className="w-3 h-3 shrink-0" />}
                 </button>
 
